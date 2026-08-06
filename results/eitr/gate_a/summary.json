@@ -1,0 +1,363 @@
+{
+  "scope": "NQ single-query Gate-A pilot; not multi-dataset paper evidence",
+  "state_count": 1000,
+  "state_count_with_pairs": 1000,
+  "valid_query_count": 7595,
+  "unique_document_count": 8719,
+  "pair_count": 25175,
+  "mean_pairs_per_state": 25.175,
+  "correlations": {
+    "policy_embedding_distance": {
+      "evidence_embedding_distance": {
+        "overall_spearman": 0.47301986197065127,
+        "state_cluster_bootstrap_95_ci": [
+          0.45300852105151773,
+          0.49194081287567176
+        ],
+        "state_spearman_median": 0.43717605365781875,
+        "state_spearman_iqr": [
+          0.20412914940445798,
+          0.6523996361944245
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 1000
+      },
+      "document_jaccard_distance": {
+        "overall_spearman": 0.4350221945623782,
+        "state_cluster_bootstrap_95_ci": [
+          0.414556744241921,
+          0.4552441592546617
+        ],
+        "state_spearman_median": 0.3996468203019802,
+        "state_spearman_iqr": [
+          0.1961103334395146,
+          0.6316712801639284
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 960
+      },
+      "rbo_distance": {
+        "overall_spearman": 0.44401168822994386,
+        "state_cluster_bootstrap_95_ci": [
+          0.4229354577979008,
+          0.464711590432426
+        ],
+        "state_spearman_median": 0.40419320268441306,
+        "state_spearman_iqr": [
+          0.20656736980003584,
+          0.6341142171061412
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 985
+      },
+      "retrieval_score_js_distance": {
+        "overall_spearman": 0.45153920387619095,
+        "state_cluster_bootstrap_95_ci": [
+          0.43151761539142497,
+          0.47164794662154
+        ],
+        "state_spearman_median": 0.40725598585721107,
+        "state_spearman_iqr": [
+          0.21074822933670528,
+          0.6209572150145861
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 999
+      }
+    },
+    "token_jaccard_distance": {
+      "evidence_embedding_distance": {
+        "overall_spearman": 0.7737584271581723,
+        "state_cluster_bootstrap_95_ci": [
+          0.7611849053555866,
+          0.7865080188158756
+        ],
+        "state_spearman_median": 0.7378643404615137,
+        "state_spearman_iqr": [
+          0.5806733518152164,
+          0.8615526311842918
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 994
+      },
+      "document_jaccard_distance": {
+        "overall_spearman": 0.7433740628889647,
+        "state_cluster_bootstrap_95_ci": [
+          0.7300764425265935,
+          0.7555736632095074
+        ],
+        "state_spearman_median": 0.7366342783395528,
+        "state_spearman_iqr": [
+          0.5531848224005427,
+          0.839380706560761
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 958
+      },
+      "rbo_distance": {
+        "overall_spearman": 0.7570677383849191,
+        "state_cluster_bootstrap_95_ci": [
+          0.7446531746817697,
+          0.7685334599794212
+        ],
+        "state_spearman_median": 0.7334991893759875,
+        "state_spearman_iqr": [
+          0.5586156272150329,
+          0.8528684938744987
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 979
+      },
+      "retrieval_score_js_distance": {
+        "overall_spearman": 0.7614995551720019,
+        "state_cluster_bootstrap_95_ci": [
+          0.7492829800757272,
+          0.7738943840414398
+        ],
+        "state_spearman_median": 0.7225434795189696,
+        "state_spearman_iqr": [
+          0.5532727270280268,
+          0.8519640230838469
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 993
+      }
+    },
+    "normalized_edit_distance": {
+      "evidence_embedding_distance": {
+        "overall_spearman": 0.7414009187659331,
+        "state_cluster_bootstrap_95_ci": [
+          0.727554596900195,
+          0.7552614159559428
+        ],
+        "state_spearman_median": 0.7150404408328134,
+        "state_spearman_iqr": [
+          0.5107024711415958,
+          0.8446540889386602
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 994
+      },
+      "document_jaccard_distance": {
+        "overall_spearman": 0.7075340088523376,
+        "state_cluster_bootstrap_95_ci": [
+          0.6936636552905809,
+          0.7218139953415712
+        ],
+        "state_spearman_median": 0.6945543360750176,
+        "state_spearman_iqr": [
+          0.49756541528508014,
+          0.827049840999811
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 958
+      },
+      "rbo_distance": {
+        "overall_spearman": 0.7234378970225345,
+        "state_cluster_bootstrap_95_ci": [
+          0.7091610213670518,
+          0.7370918477725802
+        ],
+        "state_spearman_median": 0.7030508474576272,
+        "state_spearman_iqr": [
+          0.500255153175024,
+          0.8351060575246434
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 979
+      },
+      "retrieval_score_js_distance": {
+        "overall_spearman": 0.7283578860860701,
+        "state_cluster_bootstrap_95_ci": [
+          0.7151250241761661,
+          0.7413426306403169
+        ],
+        "state_spearman_median": 0.6859048182858293,
+        "state_spearman_iqr": [
+          0.4881172779818451,
+          0.8311497116352993
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 993
+      }
+    },
+    "normalized_logprob_gap": {
+      "evidence_embedding_distance": {
+        "overall_spearman": 0.597198717556245,
+        "state_cluster_bootstrap_95_ci": [
+          0.5812869707661441,
+          0.6126813455073168
+        ],
+        "state_spearman_median": 0.5514507118182645,
+        "state_spearman_iqr": [
+          0.2559986884470727,
+          0.7138752052545154
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 1000
+      },
+      "document_jaccard_distance": {
+        "overall_spearman": 0.5615739045167508,
+        "state_cluster_bootstrap_95_ci": [
+          0.5452242548380137,
+          0.5782241156729439
+        ],
+        "state_spearman_median": 0.5339290715117285,
+        "state_spearman_iqr": [
+          0.26531011493064904,
+          0.7284259225674632
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 960
+      },
+      "rbo_distance": {
+        "overall_spearman": 0.5729234694375005,
+        "state_cluster_bootstrap_95_ci": [
+          0.5552243276654627,
+          0.5889514657645891
+        ],
+        "state_spearman_median": 0.5241322645483468,
+        "state_spearman_iqr": [
+          0.25826041720981896,
+          0.711750772786076
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 985
+      },
+      "retrieval_score_js_distance": {
+        "overall_spearman": 0.5818332611367457,
+        "state_cluster_bootstrap_95_ci": [
+          0.5651463464481508,
+          0.5973697529794645
+        ],
+        "state_spearman_median": 0.5324570408858383,
+        "state_spearman_iqr": [
+          0.2454988501359732,
+          0.710753101260547
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 999
+      }
+    },
+    "retriever_query_embedding_distance": {
+      "evidence_embedding_distance": {
+        "overall_spearman": 0.8551748691274259,
+        "state_cluster_bootstrap_95_ci": [
+          0.8436588503077782,
+          0.8663466778138457
+        ],
+        "state_spearman_median": 0.8307364434992508,
+        "state_spearman_iqr": [
+          0.6996753246753247,
+          0.923684210526316
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 1000
+      },
+      "document_jaccard_distance": {
+        "overall_spearman": 0.8166168062802831,
+        "state_cluster_bootstrap_95_ci": [
+          0.8056292299741594,
+          0.8267738639652676
+        ],
+        "state_spearman_median": 0.7978425700962548,
+        "state_spearman_iqr": [
+          0.6757358463200107,
+          0.890945584226227
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 960
+      },
+      "rbo_distance": {
+        "overall_spearman": 0.8316580383030705,
+        "state_cluster_bootstrap_95_ci": [
+          0.8206063439220624,
+          0.841118383210957
+        ],
+        "state_spearman_median": 0.8067884871043688,
+        "state_spearman_iqr": [
+          0.6705567856854312,
+          0.9007292498814099
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 985
+      },
+      "retrieval_score_js_distance": {
+        "overall_spearman": 0.8390820273249758,
+        "state_cluster_bootstrap_95_ci": [
+          0.8285973756484043,
+          0.84904634111125
+        ],
+        "state_spearman_median": 0.8172178432945822,
+        "state_spearman_iqr": [
+          0.6594064302834166,
+          0.9064413345984244
+        ],
+        "pair_count": 25175,
+        "state_count_with_defined_rho": 999
+      }
+    }
+  },
+  "primary_metric_pair": [
+    "policy_embedding_distance",
+    "document_jaccard_distance"
+  ],
+  "primary_result": {
+    "overall_spearman": 0.4350221945623782,
+    "state_cluster_bootstrap_95_ci": [
+      0.414556744241921,
+      0.4552441592546617
+    ],
+    "state_spearman_median": 0.3996468203019802,
+    "state_spearman_iqr": [
+      0.1961103334395146,
+      0.6316712801639284
+    ],
+    "pair_count": 25175,
+    "state_count_with_defined_rho": 960
+  },
+  "quartile_thresholds": {
+    "policy_embedding_distance_q25_q75": [
+      0.019808949220713967,
+      0.07718742813940827
+    ],
+    "document_jaccard_distance_q25_q75": [
+      0.0,
+      1.0
+    ]
+  },
+  "type_a_high_language_low_environment": {
+    "count": 944,
+    "rate": 0.03749751737835154
+  },
+  "type_b_low_language_high_environment": {
+    "count": 278,
+    "rate": 0.011042701092353526
+  },
+  "concrete_type_a_token_far_same_doc_set": {
+    "count": 870,
+    "rate": 0.03455809334657398
+  },
+  "concrete_type_b_token_close_doc_far": {
+    "count": 906,
+    "rate": 0.03598808341608739
+  },
+  "same_document_set_rate": 0.2962859980139027,
+  "same_ranked_documents_rate": 0.22709036742800398,
+  "nearest_neighbor": {
+    "eligible_anchors": 7323,
+    "nearest_neighbor_agreement_rate_allowing_behavior_ties": 0.6962993308753244,
+    "language_nn_median_rank_in_document_space": 1.0,
+    "random_agreement_reference": 0.14285714285714285
+  },
+  "preliminary_gate_a_pass": false,
+  "pass_rule": {
+    "max_abs_primary_rho": 0.3,
+    "max_abs_primary_bootstrap_ci_endpoint": 0.4
+  },
+  "important_limit": "The normalized logprob gap is a sampled sequence-probability proxy, not an old-vs-new policy KL. A checkpoint-pair experiment is still required.",
+  "artifacts": {
+    "input": "outputs/eitr_nq_gate_a/pilot_1000/states.jsonl",
+    "pairs": "outputs/eitr_nq_gate_a/pilot_1000/analysis/pairs.jsonl"
+  }
+}

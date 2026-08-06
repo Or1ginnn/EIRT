@@ -120,3 +120,16 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 log/
 
 **logs
+
+# EITR local runtime artifacts and secrets
+.env
+.env.*
+!.env.example
+models/
+verl_checkpoints/
+trajectory/
+ray_tmp/
+ray_spill/
+output/
+outputs/
+wandb/

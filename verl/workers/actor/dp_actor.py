@@ -24,6 +24,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.eitr import EITR_BATCH_KEYS, induced_js_from_cached_effects, update_dual_beta
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
@@ -53,9 +54,13 @@ class DataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
+        self.eitr_config = self.config.get('eitr', {})
+        self.eitr_enabled = bool(self.eitr_config.get('enabled', False))
+        self.eitr_beta = float(self.eitr_config.get('initial_beta', 0.1))
+
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, compute_entropy=True) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
@@ -100,7 +105,11 @@ class DataParallelPPOActor(BasePPOActor):
                 logits_rmpad.div_(temperature)
 
                 # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                entropy_rmpad = (
+                    self.compute_entropy_from_logits(logits_rmpad)
+                    if compute_entropy
+                    else None
+                )
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -109,22 +118,28 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_ulysses_sp:
                     # gather and unpad for the ulysses sp
                     log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                    entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
-                                                            gather_dim=0,
-                                                            unpad_dim=0,
-                                                            padding_size=pad_size)
+                    if compute_entropy:
+                        entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
+                                                                gather_dim=0,
+                                                                unpad_dim=0,
+                                                                padding_size=pad_size)
                 # pad back to (bsz, seqlen)
-                full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
-                                         indices=indices,
-                                         batch=batch_size,
-                                         seqlen=seqlen)
+                if compute_entropy:
+                    full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
+                                             indices=indices,
+                                             batch=batch_size,
+                                             seqlen=seqlen)
                 full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
                                            indices=indices,
                                            batch=batch_size,
                                            seqlen=seqlen)
 
                 # only return response part:
-                entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                entropy = (
+                    full_entropy.squeeze(-1)[:, -response_length - 1:-1]
+                    if compute_entropy
+                    else None
+                )
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -136,7 +151,7 @@ class DataParallelPPOActor(BasePPOActor):
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                entropy = verl_F.entropy_from_logits(logits) if compute_entropy else None
 
             return entropy, log_probs
 
@@ -200,6 +215,65 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def _compute_eitr_micro_batch(self, data, temperature):
+        """Run cached same-state probes and return a differentiable induced-JS mean."""
+        state_slot = data['eitr_state_slot'].bool()
+        slot_count = int(state_slot.sum().item())
+        if slot_count == 0:
+            return None
+
+        probe_valid = data['eitr_probe_valid'][state_slot].bool()
+        state_valid = data['eitr_state_valid'][state_slot].bool()
+        probe_count = probe_valid.size(1)
+
+        probe_batch = {
+            'input_ids': data['eitr_probe_input_ids'][state_slot].flatten(0, 1),
+            'attention_mask': data['eitr_probe_attention_mask'][state_slot].flatten(0, 1),
+            'position_ids': data['eitr_probe_position_ids'][state_slot].flatten(0, 1),
+            'responses': data['eitr_probe_responses'][state_slot].flatten(0, 1),
+        }
+        _, token_log_probs = self._forward_micro_batch(
+            micro_batch=probe_batch,
+            temperature=temperature,
+            compute_entropy=False,
+        )
+        response_mask = data['eitr_probe_response_mask'][state_slot].flatten(0, 1).float()
+        current_seq_logp = (token_log_probs.float() * response_mask).sum(dim=-1).view(
+            slot_count, probe_count
+        )
+
+        if not state_valid.any():
+            # Preserve identical FSDP forward/backward call structure while an
+            # ineligible group contributes exactly zero gradient.
+            zero = current_seq_logp.sum() * 0.0
+            return {
+                'loss': zero,
+                'valid_state_count': 0,
+                'js_sum': 0.0,
+                'js_mean': 0.0,
+                'ess_mean': 0.0,
+                'log_ratio_abs_max': 0.0,
+                'log_ratio_clipfrac': 0.0,
+            }
+
+        estimates = induced_js_from_cached_effects(
+            current_seq_logp=current_seq_logp[state_valid],
+            old_seq_logp=data['eitr_probe_old_seq_logp'][state_slot][state_valid],
+            doc_probs=data['eitr_probe_doc_probs'][state_slot][state_valid],
+            probe_mask=probe_valid[state_valid],
+            log_ratio_clip=float(self.eitr_config.get('log_ratio_clip', 10.0)),
+        )
+        js = estimates['js']
+        return {
+            'loss': js.mean(),
+            'valid_state_count': int(js.numel()),
+            'js_sum': float(js.detach().sum().item()),
+            'js_mean': float(js.detach().mean().item()),
+            'ess_mean': float(estimates['ess'].detach().mean().item()),
+            'log_ratio_abs_max': float(estimates['log_ratio_abs_max'].detach().max().item()),
+            'log_ratio_clipfrac': float(estimates['log_ratio_clipfrac'].detach().mean().item()),
+        }
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
@@ -213,6 +287,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('loss_mask')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if self.eitr_enabled:
+            select_keys.extend(EITR_BATCH_KEYS)
         batch = data.select(batch_keys=select_keys).batch
 
         # Split to make minibatch iterator for updating the actor
@@ -220,6 +296,8 @@ class DataParallelPPOActor(BasePPOActor):
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        eitr_js_sum = 0.0
+        eitr_valid_state_count = 0
         for batch_idx, data in enumerate(dataloader):
             # split batch into micro_batches
             mini_batch = data
@@ -229,6 +307,23 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 # split batch into micro_batches
                 micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
+
+            mini_eitr_state_count = (
+                int(mini_batch['eitr_state_valid'].sum().item())
+                if self.eitr_enabled
+                else 0
+            )
+            mini_eitr_global_state_count = mini_eitr_state_count
+            eitr_world_size = 1
+            if self.eitr_enabled and torch.distributed.is_available() and torch.distributed.is_initialized():
+                eitr_world_size = torch.distributed.get_world_size()
+                global_count = torch.tensor(
+                    float(mini_eitr_state_count),
+                    dtype=torch.float64,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_reduce(global_count, op=torch.distributed.ReduceOp.SUM)
+                mini_eitr_global_state_count = int(global_count.item())
 
             self.actor_optimizer.zero_grad()
 
@@ -273,6 +368,32 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
                 loss = policy_loss / self.gradient_accumulation
+                if self.eitr_enabled:
+                    eitr_result = self._compute_eitr_micro_batch(data, temperature)
+                    if eitr_result is not None:
+                        valid_state_count = eitr_result['valid_state_count']
+                        if valid_state_count > 0:
+                            # FSDP averages gradients across ranks. Multiplying by
+                            # world_size yields one global per-state mean even when
+                            # probe coverage differs between ranks.
+                            state_weight = (
+                                valid_state_count
+                                * eitr_world_size
+                                / max(mini_eitr_global_state_count, 1)
+                            )
+                            loss = loss + self.eitr_beta * eitr_result['loss'] * state_weight
+                            eitr_js_sum += eitr_result['js_sum']
+                            eitr_valid_state_count += valid_state_count
+                        else:
+                            # Keep the dummy probe graph in backward so FSDP ranks
+                            # execute the same collective sequence.
+                            loss = loss + eitr_result['loss']
+                        append_to_dict(metrics, {
+                            'actor/eitr_induced_js': eitr_result['js_mean'],
+                            'actor/eitr_probe_ess': eitr_result['ess_mean'],
+                            'actor/eitr_log_ratio_abs_max': eitr_result['log_ratio_abs_max'],
+                            'actor/eitr_log_ratio_clipfrac': eitr_result['log_ratio_clipfrac'],
+                        })
                 loss.backward()
 
                 data = {
@@ -287,4 +408,32 @@ class DataParallelPPOActor(BasePPOActor):
             data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+
+        if self.eitr_enabled:
+            global_stats = torch.tensor(
+                [eitr_js_sum, float(eitr_valid_state_count)],
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(global_stats, op=torch.distributed.ReduceOp.SUM)
+            global_state_count = max(float(global_stats[1].item()), 1.0)
+            global_mean_js = float(global_stats[0].item() / global_state_count)
+            target_js = float(self.eitr_config.get('target_js', 0.01))
+            beta_before = self.eitr_beta
+            self.eitr_beta = update_dual_beta(
+                beta=self.eitr_beta,
+                mean_js=global_mean_js,
+                target_js=target_js,
+                dual_lr=float(self.eitr_config.get('dual_lr', 0.05)),
+                beta_max=float(self.eitr_config.get('beta_max', 10.0)),
+            )
+            append_to_dict(metrics, {
+                'actor/eitr_global_induced_js': global_mean_js,
+                'actor/eitr_target_js': target_js,
+                'actor/eitr_constraint_violation': global_mean_js - target_js,
+                'actor/eitr_beta_before': beta_before,
+                'actor/eitr_beta': self.eitr_beta,
+                'actor/eitr_valid_state_count': float(global_stats[1].item()),
+            })
         return metrics

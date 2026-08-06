@@ -414,6 +414,10 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            data.meta_info.setdefault('micro_batch_size', self.config.rollout.log_prob_micro_batch_size)
+            data.meta_info.setdefault('max_token_len', self.config.rollout.log_prob_max_token_len_per_gpu)
+            data.meta_info.setdefault('use_dynamic_bsz', self.config.rollout.log_prob_use_dynamic_bsz)
+            data.meta_info.setdefault('temperature', self.config.rollout.temperature)
             old_log_probs = self.actor.compute_log_prob(data=data)
             output = DataProto.from_dict(tensors={'old_log_probs': old_log_probs})
             output = self.ulysses_sharding_manager.postprocess_data(output)
@@ -447,7 +451,8 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            sampling_params = prompts.meta_info.get('sampling_params', {})
+            output = self.rollout.generate_sequences(prompts=prompts, **sampling_params)
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 

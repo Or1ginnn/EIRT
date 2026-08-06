@@ -36,6 +36,25 @@ actor_rollout_ref:
     use_kl_loss: False # True for GRPO
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
+    # Environment-induced trust region (Gate C). Disabled means exact legacy path.
+    eitr:
+      enabled: False
+      probe_source: online_same_state
+      probe_count: 4
+      probe_oversample: 2
+      max_query_tokens: 96
+      probe_seed: 20260805
+      max_action_tokens: 128
+      max_probe_prompt_tokens: 2304
+      max_doc_support: 32
+      retrieval_score_temperature: 0.1
+      require_empty_prefix: False
+      min_state_coverage: 0.0
+      target_js: 0.01
+      initial_beta: 0.1
+      dual_lr: 0.05
+      beta_max: 10.0
+      log_ratio_clip: 10.0
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size

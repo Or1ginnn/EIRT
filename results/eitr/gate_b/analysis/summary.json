@@ -1,0 +1,374 @@
+{
+  "scope": "NQ single-query Gate-B branch-to-terminal diagnostic",
+  "protocol": "same fixed state and sampled query, cached top-k retrieval, greedy continuation to answer",
+  "outcome_count": 7595,
+  "joined_pair_count": 25175,
+  "discordant_return_pair_count": 4636,
+  "discordant_return_pair_rate": 0.18415094339622642,
+  "outcome_summary": {
+    "selected_state_count": 1000,
+    "expected_valid_branches": 7595,
+    "completed_branches": 7595,
+    "answer_count": 6248,
+    "answer_rate": 0.8226464779460171,
+    "answer_em_count": 2618,
+    "answer_em_rate": 0.34470046082949307,
+    "answer_subem_count": 2809,
+    "strict_tag_answer_count": 4517,
+    "strict_tag_answer_rate": 0.5947333772218565,
+    "strict_tag_answer_em_count": 1815,
+    "strict_tag_answer_em_rate": 0.238973008558262,
+    "second_search_count": 1254,
+    "second_search_rate": 0.1651086240947992,
+    "clipped_count": 0,
+    "clipped_rate": 0.0
+  },
+  "state_summary": {
+    "state_count": 1000,
+    "states_with_at_least_two_branches": 1000,
+    "states_with_return_variation": 452,
+    "return_variation_state_rate": 0.452,
+    "mean_branch_em": 0.34470046082949307,
+    "mean_branch_answer_rate": 0.8226464779460171,
+    "mean_branch_strict_tag_answer_rate": 0.5947333772218565,
+    "mean_branch_strict_tag_em": 0.238973008558262,
+    "mean_within_state_reward_std": 0.18780733531368426
+  },
+  "primary_comparison": {
+    "environment_predictor": "retrieval_score_js_distance",
+    "language_predictor": "policy_embedding_distance",
+    "environment_metrics": {
+      "pair_count": 25175,
+      "positive_count": 4636,
+      "positive_rate": 0.18415094339622642,
+      "spearman": 0.21593668070964542,
+      "auroc": 0.659854307768873,
+      "average_precision": 0.2672987198660361
+    },
+    "language_metrics": {
+      "pair_count": 25175,
+      "positive_count": 4636,
+      "positive_rate": 0.18415094339622642,
+      "spearman": 0.12666048154240298,
+      "auroc": 0.5943242418797867,
+      "average_precision": 0.22263564406554615
+    },
+    "auroc_gain_environment_minus_language": 0.06553006588908628,
+    "average_precision_gain_environment_minus_language": 0.04466307580048995,
+    "spearman_gain_environment_minus_language": 0.08927619916724244,
+    "state_cluster_bootstrap_auroc_gain": {
+      "estimate_count": 500,
+      "mean": 0.06653019672028501,
+      "95_ci": [
+        0.047718923734175064,
+        0.08779287104217237
+      ],
+      "p_gt_zero": 1.0
+    }
+  },
+  "exploratory_best_predictors": {
+    "best_language": "normalized_edit_distance",
+    "best_language_metrics": {
+      "pair_count": 25175,
+      "positive_count": 4636,
+      "positive_rate": 0.18415094339622642,
+      "spearman": 0.1757668402796346,
+      "auroc": 0.6301992881574106,
+      "average_precision": 0.24732511777915323
+    },
+    "best_environment": "retrieval_score_js_distance",
+    "best_environment_metrics": {
+      "pair_count": 25175,
+      "positive_count": 4636,
+      "positive_rate": 0.18415094339622642,
+      "spearman": 0.21593668070964542,
+      "auroc": 0.659854307768873,
+      "average_precision": 0.2672987198660361
+    },
+    "auroc_gain_best_environment_minus_best_language": 0.02965501961146244,
+    "state_cluster_bootstrap_auroc_gain": {
+      "estimate_count": 300,
+      "mean": 0.029504927643623297,
+      "95_ci": [
+        0.009896712258444178,
+        0.04464700227698145
+      ],
+      "p_gt_zero": 1.0
+    }
+  },
+  "robustness": {
+    "both_branches_have_semantic_answer": {
+      "pair_count": 18472,
+      "discordant_return_pair_count": 2800,
+      "environment_predictor": "retrieval_score_js_distance",
+      "environment_metrics": {
+        "pair_count": 18472,
+        "positive_count": 2800,
+        "positive_rate": 0.151580770896492,
+        "spearman": 0.3006842258484047,
+        "auroc": 0.7409947905272369,
+        "average_precision": 0.2945597030191506
+      },
+      "strongest_language_predictor_on_full_data": "normalized_edit_distance",
+      "language_metrics": {
+        "pair_count": 18472,
+        "positive_count": 2800,
+        "positive_rate": 0.151580770896492,
+        "spearman": 0.22843686819048242,
+        "auroc": 0.6821982903996208,
+        "average_precision": 0.2503043594186832
+      },
+      "auroc_gain_environment_minus_language": 0.05879650012761617,
+      "state_cluster_bootstrap_auroc_gain": {
+        "estimate_count": 300,
+        "mean": 0.05902350323832411,
+        "95_ci": [
+          0.03591852209060115,
+          0.08296636153936213
+        ],
+        "p_gt_zero": 1.0
+      }
+    },
+    "both_branches_have_strict_answer_tag": {
+      "pair_count": 10604,
+      "discordant_return_pair_count": 1547,
+      "environment_predictor": "retrieval_score_js_distance",
+      "environment_metrics": {
+        "pair_count": 10604,
+        "positive_count": 1547,
+        "positive_rate": 0.1458883440211241,
+        "spearman": 0.3063678949218256,
+        "auroc": 0.748999602388921,
+        "average_precision": 0.2772333846118699
+      },
+      "strongest_language_predictor_on_full_data": "normalized_edit_distance",
+      "language_metrics": {
+        "pair_count": 10604,
+        "positive_count": 1547,
+        "positive_rate": 0.1458883440211241,
+        "spearman": 0.23383650033760195,
+        "auroc": 0.6887228762119162,
+        "average_precision": 0.2344548086253444
+      },
+      "auroc_gain_environment_minus_language": 0.06027672617700486,
+      "state_cluster_bootstrap_auroc_gain": {
+        "estimate_count": 300,
+        "mean": 0.060575838699459164,
+        "95_ci": [
+          0.039555017513361976,
+          0.08315182467685603
+        ],
+        "p_gt_zero": 1.0
+      }
+    },
+    "note": "These conditioned subsets remove termination and format failures but can condition on a mediator, so they are robustness checks rather than the primary causal estimand."
+  },
+  "predictor_metrics": {
+    "return_difference": {
+      "policy_embedding_distance": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.12666048154240298,
+        "auroc": 0.5943242418797867,
+        "average_precision": 0.22263564406554615
+      },
+      "token_jaccard_distance": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.17257777681902953,
+        "auroc": 0.6277552488476961,
+        "average_precision": 0.24403300929896696
+      },
+      "normalized_edit_distance": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.1757668402796346,
+        "auroc": 0.6301992881574106,
+        "average_precision": 0.24732511777915323
+      },
+      "normalized_logprob_gap": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.15146219997409865,
+        "auroc": 0.612802839867638,
+        "average_precision": 0.2409214030505048
+      },
+      "retrieval_score_js_distance": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.21593668070964542,
+        "auroc": 0.659854307768873,
+        "average_precision": 0.2672987198660361
+      },
+      "document_jaccard_distance": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.2021281696656977,
+        "auroc": 0.6451794175024504,
+        "average_precision": 0.2517023274041304
+      },
+      "rbo_distance": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.21370073213033547,
+        "auroc": 0.6561220722747159,
+        "average_precision": 0.25973167487241827
+      },
+      "evidence_embedding_distance": {
+        "pair_count": 25175,
+        "positive_count": 4636,
+        "positive_rate": 0.18415094339622642,
+        "spearman": 0.20735713327026403,
+        "auroc": 0.6542933893603621,
+        "average_precision": 0.26410298800594967
+      }
+    },
+    "answer_disagreement": {
+      "policy_embedding_distance": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.27449042437680726,
+        "auroc": 0.6585510551590517,
+        "average_precision": 0.6044841974830356
+      },
+      "token_jaccard_distance": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.41375956781796325,
+        "auroc": 0.7375755160348202,
+        "average_precision": 0.6948433312451423
+      },
+      "normalized_edit_distance": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.40597925312304756,
+        "auroc": 0.7332573052043851,
+        "average_precision": 0.6807489373440333
+      },
+      "normalized_logprob_gap": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.31971128552851835,
+        "auroc": 0.6846857931959579,
+        "average_precision": 0.6501526333433001
+      },
+      "retrieval_score_js_distance": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.5179594468383867,
+        "auroc": 0.7974085370823502,
+        "average_precision": 0.7510873520162699
+      },
+      "document_jaccard_distance": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.5046172606431985,
+        "auroc": 0.7811253812147472,
+        "average_precision": 0.7183628955305253
+      },
+      "rbo_distance": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.5229138497922889,
+        "auroc": 0.7963112845883411,
+        "average_precision": 0.7415265268533916
+      },
+      "evidence_embedding_distance": {
+        "pair_count": 25175,
+        "positive_count": 12171,
+        "positive_rate": 0.48345580933465737,
+        "spearman": 0.511696267010726,
+        "auroc": 0.7953250848079686,
+        "average_precision": 0.7538256435052946
+      }
+    },
+    "evidence_hit_difference": {
+      "policy_embedding_distance": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.2264359521919921,
+        "auroc": 0.6625257813888079,
+        "average_precision": 0.3031615924718428
+      },
+      "token_jaccard_distance": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.37635835774255,
+        "auroc": 0.7685283470304004,
+        "average_precision": 0.43153580536731634
+      },
+      "normalized_edit_distance": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.356733394385263,
+        "auroc": 0.7546889611266626,
+        "average_precision": 0.4061035058635671
+      },
+      "normalized_logprob_gap": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.3125487792841482,
+        "auroc": 0.7243511351303595,
+        "average_precision": 0.40828884354531975
+      },
+      "retrieval_score_js_distance": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.48284277798064196,
+        "auroc": 0.8445072407981422,
+        "average_precision": 0.48531051382942736
+      },
+      "document_jaccard_distance": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.4860657807541314,
+        "auroc": 0.8364867328357598,
+        "average_precision": 0.4616161324835377
+      },
+      "rbo_distance": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.4823429822752112,
+        "auroc": 0.8396322739730283,
+        "average_precision": 0.47239420443132735
+      },
+      "evidence_embedding_distance": {
+        "pair_count": 25175,
+        "positive_count": 5108,
+        "positive_rate": 0.20289970208540217,
+        "spearman": 0.48536083243856853,
+        "auroc": 0.8480869627078184,
+        "average_precision": 0.5283382114394697
+      }
+    }
+  },
+  "predeclared_gate": {
+    "min_variable_states": 100,
+    "min_discordant_pairs": 500,
+    "min_primary_auc_gain": 0.03,
+    "requires_cluster_bootstrap_95_ci_lower_gt_zero": true,
+    "data_sufficient": true,
+    "gate_b_pass": true
+  }
+}

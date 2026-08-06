@@ -37,6 +37,13 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.eitr import (
+    assign_probe_old_log_probs,
+    attach_eitr_probe_tensors,
+    flatten_probe_logprob_inputs,
+    validate_eitr_config,
+    validate_sibling_group_layout,
+)
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
@@ -672,6 +679,22 @@ class RayPPOTrainer(object):
         # we start from step 1
         self.global_steps += 1
 
+        eitr_config = self.config.actor_rollout_ref.actor.get('eitr', {})
+        eitr_enabled = bool(eitr_config.get('enabled', False))
+        if eitr_enabled:
+            if not self.config.do_search or self.config.algorithm.adv_estimator != 'grpo':
+                raise ValueError('EITR Gate C requires do_search=true and algorithm.adv_estimator=grpo')
+            if self.config.actor_rollout_ref.actor.get('use_dynamic_bsz', False):
+                raise ValueError('EITR Gate C currently requires actor.use_dynamic_bsz=false')
+            if int(self.config.data.train_batch_size) % int(self.actor_rollout_wg.world_size) != 0:
+                raise ValueError('EITR train_batch_size must be divisible by the actor world size')
+            validate_eitr_config(
+                eitr_config,
+                n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
+                max_queries_per_turn=1,
+                rollout_n=int(self.config.actor_rollout_ref.rollout.n),
+            )
+
         # Agent config preparation
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -683,6 +706,12 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
+            collect_eitr_probes=eitr_enabled,
+            eitr_probe_count=int(eitr_config.get('probe_count', 4)),
+            eitr_n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
+            eitr_probe_oversample=int(eitr_config.get('probe_oversample', 2)),
+            eitr_max_query_tokens=int(eitr_config.get('max_query_tokens', 96)),
+            eitr_probe_seed=int(eitr_config.get('probe_seed', 20260805)),
         )
 
         generation_manager = LLMGenerationManager(
@@ -697,6 +726,7 @@ class RayPPOTrainer(object):
                 print(f'epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}
+                eitr_rollout_meta = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
@@ -731,6 +761,15 @@ class RayPPOTrainer(object):
                                 initial_input_ids=first_input_ids,
                             )
 
+                        if eitr_enabled:
+                            for key in (
+                                'eitr_probe_groups',
+                                'eitr_first_search_records',
+                                'eitr_probe_collection_stats',
+                            ):
+                                if key in final_gen_batch_output.meta_info:
+                                    eitr_rollout_meta[key] = final_gen_batch_output.meta_info.pop(key)
+
                         # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
                         for key in final_gen_batch_output.batch.keys():
                             final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
@@ -746,6 +785,12 @@ class RayPPOTrainer(object):
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(final_gen_batch_output)
+                        if eitr_enabled:
+                            validate_sibling_group_layout(
+                                batch.non_tensor_batch['uid'],
+                                n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
+                                world_size=int(self.actor_rollout_wg.world_size),
+                            )
 
                     ####################
                     ####################
@@ -753,14 +798,25 @@ class RayPPOTrainer(object):
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
+                    if eitr_enabled:
+                        # Keep contiguous sibling groups so every FSDP rank executes
+                        # the same number of probe forwards. Probe groups themselves
+                        # remain self-contained tensors on representative rows.
+                        metrics['eitr/sequence_balance_disabled'] = 1.0
+                    else:
+                        self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # batch.batch.apply(lambda x, key: x.long() if key != "old_log_probs" else x, inplace=True, key=True)
+                    float_batch_keys = {
+                        'old_log_probs',
+                        'eitr_probe_old_seq_logp',
+                        'eitr_probe_doc_probs',
+                    }
                     for key in batch.batch.keys():
-                        if key != 'old_log_probs':
+                        if key not in float_batch_keys:
                             batch.batch[key] = batch.batch[key].long()
 
                     if self.use_reference_policy:
@@ -814,6 +870,26 @@ class RayPPOTrainer(object):
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        if eitr_enabled:
+                            with _timer('eitr_probe_prepare', timing_raw):
+                                batch.meta_info.update(eitr_rollout_meta)
+                                batch, eitr_probe_metrics = attach_eitr_probe_tensors(
+                                    batch,
+                                    eitr_config,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                )
+                                probe_logprob_tensors, probe_response_mask = flatten_probe_logprob_inputs(batch)
+                                probe_logprob_batch = DataProto.from_dict(probe_logprob_tensors)
+                                with torch.no_grad():
+                                    probe_logprob_output = self.actor_rollout_wg.compute_log_prob(
+                                        probe_logprob_batch
+                                    )
+                                batch = assign_probe_old_log_probs(
+                                    batch,
+                                    probe_logprob_output.batch['old_log_probs'],
+                                    probe_response_mask,
+                                )
+                                metrics.update(eitr_probe_metrics)
                         with _timer('update_actor', timing_raw):
                             if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)

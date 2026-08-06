@@ -1,0 +1,19 @@
+{
+  "protocol": "same deterministic prefix ending at <search>; K independent single-query continuations",
+  "model": "parallel_search_qwen25_3b_step900",
+  "input_parquet": "data/nq_search/test.parquet",
+  "retriever_url": "http://127.0.0.1:8000/retrieve",
+  "num_states": 1000,
+  "samples_per_state": 8,
+  "expected_queries": 8000,
+  "valid_queries": 7595,
+  "invalid_queries": 405,
+  "mean_unique_queries_per_state": 5.128,
+  "gold_evidence_hit_rate": 0.6119815668202765,
+  "skipped_prefix_states": [],
+  "topk": 3,
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "seed": 20260805,
+  "output_jsonl": "outputs/eitr_nq_gate_a/pilot_1000/states.jsonl"
+}
