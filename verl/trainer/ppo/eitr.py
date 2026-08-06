@@ -40,9 +40,29 @@ def _config_value(config: Any, key: str, default: Any) -> Any:
     return getattr(config, key, default)
 
 
-def validate_eitr_config(config: Any, *, n_agent: int, max_queries_per_turn: int, rollout_n: int) -> None:
+def validate_eitr_config(
+    config: Any,
+    *,
+    n_agent: int,
+    max_queries_per_turn: int,
+    rollout_n: int,
+    max_prompt_length: Optional[int] = None,
+) -> None:
     """Fail early when the Gate C probe estimator's assumptions do not hold."""
     probe_count = int(_config_value(config, "probe_count", 4))
+    probe_oversample = int(_config_value(config, "probe_oversample", 2))
+    max_query_tokens = int(_config_value(config, "max_query_tokens", 96))
+    max_action_tokens = int(_config_value(config, "max_action_tokens", 128))
+    max_probe_prompt_tokens = int(_config_value(config, "max_probe_prompt_tokens", 4096))
+    max_doc_support = int(_config_value(config, "max_doc_support", 32))
+    score_temperature = float(_config_value(config, "retrieval_score_temperature", 0.1))
+    min_state_coverage = float(_config_value(config, "min_state_coverage", 0.0))
+    target_js = float(_config_value(config, "target_js", 0.01))
+    initial_beta = float(_config_value(config, "initial_beta", 0.1))
+    dual_lr = float(_config_value(config, "dual_lr", 0.05))
+    beta_max = float(_config_value(config, "beta_max", 10.0))
+    log_ratio_clip = float(_config_value(config, "log_ratio_clip", 10.0))
+
     if probe_count < 2:
         raise ValueError("EITR requires probe_count >= 2")
     if n_agent < probe_count:
@@ -55,6 +75,26 @@ def validate_eitr_config(config: Any, *, n_agent: int, max_queries_per_turn: int
         )
     if rollout_n != 1:
         raise ValueError("The Gate C estimator currently requires rollout.n=1")
+    if probe_oversample < 0:
+        raise ValueError("EITR probe_oversample must be non-negative")
+    if min(max_query_tokens, max_action_tokens, max_probe_prompt_tokens, max_doc_support) <= 0:
+        raise ValueError("EITR token limits and max_doc_support must be positive")
+    if max_prompt_length is not None and max_probe_prompt_tokens < int(max_prompt_length):
+        raise ValueError(
+            "EITR max_probe_prompt_tokens must be at least data.max_prompt_length so probe "
+            "generation and probe log-prob computation use the exact same state; "
+            f"got {max_probe_prompt_tokens} < {int(max_prompt_length)}"
+        )
+    if score_temperature <= 0:
+        raise ValueError("EITR retrieval_score_temperature must be positive")
+    if not 0.0 <= min_state_coverage <= 1.0:
+        raise ValueError("EITR min_state_coverage must be in [0, 1]")
+    if target_js < 0 or initial_beta < 0 or dual_lr < 0 or beta_max < 0:
+        raise ValueError("EITR target_js, beta values, and dual_lr must be non-negative")
+    if initial_beta > beta_max:
+        raise ValueError("EITR initial_beta cannot exceed beta_max")
+    if log_ratio_clip <= 0:
+        raise ValueError("EITR log_ratio_clip must be positive")
 
 
 def validate_sibling_group_layout(uids: Sequence[Any], *, n_agent: int, world_size: int) -> None:
@@ -373,7 +413,7 @@ def build_online_probe_tensors(
         )
     probe_count = int(_config_value(config, "probe_count", 4))
     max_action_tokens = int(_config_value(config, "max_action_tokens", 128))
-    max_prompt_tokens = int(_config_value(config, "max_probe_prompt_tokens", 2304))
+    max_prompt_tokens = int(_config_value(config, "max_probe_prompt_tokens", 4096))
     max_doc_support = int(_config_value(config, "max_doc_support", 32))
     score_temperature = float(_config_value(config, "retrieval_score_temperature", 0.1))
     min_state_coverage = float(_config_value(config, "min_state_coverage", 0.0))
@@ -461,6 +501,12 @@ def build_online_probe_tensors(
             rejection_counts["missing_online_probe_group"] += 1
             continue
         state_ids = list(group.get("state_prompt_token_ids") or [])
+        if len(state_ids) > max_prompt_tokens:
+            # Never silently shorten a probe state. The cached actions and
+            # retrieval effects were sampled under the full prefix, so scoring
+            # them under a shorter prefix would invalidate the importance ratio.
+            rejection_counts["state_prompt_too_long"] += 1
+            continue
         probes = list(group.get("probes") or [])
         eligible_probes = [
             probe

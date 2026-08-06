@@ -693,6 +693,7 @@ class RayPPOTrainer(object):
                 n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
                 max_queries_per_turn=1,
                 rollout_n=int(self.config.actor_rollout_ref.rollout.n),
+                max_prompt_length=int(self.config.data.max_prompt_length),
             )
 
         # Agent config preparation

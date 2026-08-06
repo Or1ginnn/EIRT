@@ -15,6 +15,17 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-gate-c-smoke}"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-11}"
+TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-32}"
+VAL_DATA_NUM="${VAL_DATA_NUM:-64}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
+PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
+MAX_PROBE_PROMPT_TOKENS="${MAX_PROBE_PROMPT_TOKENS:-$MAX_PROMPT_LENGTH}"
+SAVE_FREQ="${SAVE_FREQ:--1}"
+TEST_FREQ="${TEST_FREQ:-5}"
+CHECK_ONLY="${CHECK_ONLY:-false}"
 
 case "$BASE_MODEL" in
     *parallel_search*|*parallel-search*|*finance*)
@@ -23,18 +34,37 @@ case "$BASE_MODEL" in
         ;;
 esac
 
+if [[ ! -f "$DATA_DIR/train.parquet" || ! -f "$DATA_DIR/test.parquet" ]]; then
+    echo "Gate C requires $DATA_DIR/train.parquet and $DATA_DIR/test.parquet" >&2
+    exit 2
+fi
+
+if (( MAX_PROBE_PROMPT_TOKENS < MAX_PROMPT_LENGTH )); then
+    echo "MAX_PROBE_PROMPT_TOKENS must be >= MAX_PROMPT_LENGTH for exact same-state probes" >&2
+    exit 2
+fi
+
+if [[ "$CHECK_ONLY" == "true" ]]; then
+    curl --fail --silent --show-error \
+        --header 'Content-Type: application/json' \
+        --data '{"queries":["who wrote Hamlet"],"topk":3,"return_scores":true}' \
+        "$RETRIEVER_URL" >/dev/null
+    echo "Gate C preflight passed: data files, clean model path, prompt limit, and retriever are ready."
+    exit 0
+fi
+
 RAY_TMPDIR="${RAY_TMPDIR:-ray_tmp/eitr_gate_c_smoke}"
 mkdir -p "$RAY_TMPDIR"
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files="$DATA_DIR/train.parquet" \
     data.val_files="$DATA_DIR/test.parquet" \
-    data.train_data_num=32 \
-    data.val_data_num=64 \
-    data.train_batch_size=32 \
-    data.val_batch_size=32 \
+    data.train_data_num="$TRAIN_DATA_NUM" \
+    data.val_data_num="$VAL_DATA_NUM" \
+    data.train_batch_size="$TRAIN_BATCH_SIZE" \
+    data.val_batch_size="$VAL_BATCH_SIZE" \
     data.max_start_length=2048 \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length="$MAX_PROMPT_LENGTH" \
     data.max_response_length=500 \
     data.max_obs_length=500 \
     data.shuffle_train_dataloader=false \
@@ -47,8 +77,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
+    actor_rollout_ref.actor.ppo_micro_batch_size="$PPO_MICRO_BATCH_SIZE" \
     actor_rollout_ref.actor.use_dynamic_bsz=false \
     actor_rollout_ref.actor.state_masking=true \
     actor_rollout_ref.actor.fsdp_config.param_offload=false \
@@ -61,7 +91,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.eitr.max_query_tokens=96 \
     actor_rollout_ref.actor.eitr.probe_seed=20260805 \
     actor_rollout_ref.actor.eitr.max_action_tokens=128 \
-    actor_rollout_ref.actor.eitr.max_probe_prompt_tokens=2304 \
+    actor_rollout_ref.actor.eitr.max_probe_prompt_tokens="$MAX_PROBE_PROMPT_TOKENS" \
     actor_rollout_ref.actor.eitr.retrieval_score_temperature=0.1 \
     actor_rollout_ref.actor.eitr.min_state_coverage=0.5 \
     actor_rollout_ref.actor.eitr.target_js=0.01 \
@@ -83,8 +113,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +trainer.val_only=false \
     trainer.n_gpus_per_node="$NUM_GPUS" \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=5 \
+    trainer.save_freq="$SAVE_FREQ" \
+    trainer.test_freq="$TEST_FREQ" \
     trainer.total_epochs="$TOTAL_EPOCHS" \
     trainer.total_training_steps="$TOTAL_TRAINING_STEPS" \
     trainer.project_name="$WANDB_PROJECT" \

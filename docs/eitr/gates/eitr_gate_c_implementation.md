@@ -74,11 +74,18 @@ EITR 默认关闭；关闭后 rollout 不采 probe，actor 不增加额外 forwa
 - `verl/workers/actor/dp_actor.py`：EITR loss、W&B 指标和 beta 更新；
 - `verl/workers/fsdp_workers.py`：probe sampling 参数及 log-prob 默认元信息；
 - `scripts/train/train_eitr_nq_gate_c_smoke.sh`：同一脚本运行 baseline/EITR smoke；
+- `scripts/train/train_eitr_nq_gate_c_full.sh`：显式指定训练预算后运行正式 Gate C；
 - `tests/test_eitr.py`：数学、梯度、probe 对齐和多卡布局单测。
 
 ## 4. Smoke 运行
 
 先准备原 Search-R1 `base` prompt 的 NQ parquet，并确认 retriever 可用。脚本顶部只需设置模型、数据、GPU 和 retriever 路径。
+
+只做预检、不启动训练：
+
+```bash
+CHECK_ONLY=true bash scripts/train/train_eitr_nq_gate_c_smoke.sh
+```
 
 EITR smoke：
 
@@ -95,6 +102,16 @@ bash scripts/train/train_eitr_nq_gate_c_smoke.sh
 ```
 
 脚本设置 `total_training_steps=11`，对应当前 trainer 计数逻辑下的 10 次实际 update。
+
+Smoke 通过后，正式训练必须显式给出与 baseline 对齐的 update 预算，避免误用 smoke 默认值：
+
+```bash
+TOTAL_TRAINING_STEPS=1005 \
+bash scripts/train/train_eitr_nq_gate_c_full.sh
+```
+
+在线 probe 的生成状态与计算 log-prob 的状态必须逐 token 相同。因此
+`max_probe_prompt_tokens` 不得小于 `data.max_prompt_length`；配置和运行脚本会在启动前拒绝不一致设置，不再静默截断状态。
 
 ## 5. Smoke 验收门槛
 

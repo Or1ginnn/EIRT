@@ -126,9 +126,23 @@ class EITRProbeBatchTest(unittest.TestCase):
         validate_sibling_group_layout(["a"] * 5 + ["b"] * 5, n_agent=5, world_size=2)
         with self.assertRaises(ValueError):
             validate_sibling_group_layout(["a", "b"] * 5, n_agent=5, world_size=2)
-        validate_eitr_config({}, n_agent=5, max_queries_per_turn=1, rollout_n=1)
+        validate_eitr_config(
+            {"max_probe_prompt_tokens": 16},
+            n_agent=5,
+            max_queries_per_turn=1,
+            rollout_n=1,
+            max_prompt_length=16,
+        )
         with self.assertRaises(ValueError):
             validate_eitr_config({}, n_agent=3, max_queries_per_turn=1, rollout_n=1)
+        with self.assertRaisesRegex(ValueError, "exact same state"):
+            validate_eitr_config(
+                {"max_probe_prompt_tokens": 15},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+                max_prompt_length=16,
+            )
 
     def test_online_probes_share_one_fixed_state(self):
         prompts = torch.tensor([[0, 11, 12, 13]] * 5)
@@ -161,6 +175,37 @@ class EITRProbeBatchTest(unittest.TestCase):
         self.assertEqual(tensors["eitr_state_valid"].nonzero().flatten().tolist(), [0])
         state_prefixes = tensors["eitr_probe_input_ids"][0, :, :4]
         self.assertTrue(torch.equal(state_prefixes, state_prefixes[0].expand_as(state_prefixes)))
+
+    def test_online_probe_state_is_never_silently_truncated(self):
+        groups = [{
+            "state_prompt_token_ids": [11, 12, 13, 14, 15],
+            "extra_retrieval_calls": 3,
+            "probes": [
+                {
+                    "query": f"q{index}",
+                    "action_token_ids": [60 + index, 70],
+                    "retrieval_effect": [{"doc_id": f"doc-{index}", "score": 1.0}],
+                }
+                for index in range(4)
+            ],
+        }] + [None] * 4
+
+        with self.assertRaisesRegex(RuntimeError, "state_prompt_too_long"):
+            build_online_probe_tensors(
+                prompts=torch.tensor([[0, 11, 12, 13]] * 5),
+                attention_mask=torch.ones(5, 10, dtype=torch.long),
+                responses=torch.tensor([[51, 52, 0, 0, 0, 0]] * 5),
+                uids=["q0"] * 5,
+                probe_groups=groups,
+                pad_token_id=0,
+                config={
+                    "probe_count": 4,
+                    "max_action_tokens": 8,
+                    "max_doc_support": 8,
+                    "max_probe_prompt_tokens": 4,
+                    "min_state_coverage": 1.0,
+                },
+            )
 
 
 class SearchR1CompatibilityTest(unittest.TestCase):

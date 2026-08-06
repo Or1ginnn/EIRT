@@ -45,7 +45,9 @@ actor_rollout_ref:
       max_query_tokens: 96
       probe_seed: 20260805
       max_action_tokens: 128
-      max_probe_prompt_tokens: 2304
+      # Must cover the complete rolling search state. Silent truncation would
+      # make probe sampling and probe log-prob scoring condition on different states.
+      max_probe_prompt_tokens: 4096
       max_doc_support: 32
       retrieval_score_temperature: 0.1
       require_empty_prefix: False
