@@ -29,6 +29,7 @@ SPEC.loader.exec_module(EITR)
 build_sibling_probe_tensors = EITR.build_sibling_probe_tensors
 build_online_probe_tensors = EITR.build_online_probe_tensors
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
+probe_effect_diversity = EITR.probe_effect_diversity
 update_dual_beta = EITR.update_dual_beta
 validate_eitr_config = EITR.validate_eitr_config
 validate_sibling_group_layout = EITR.validate_sibling_group_layout
@@ -143,6 +144,13 @@ class EITRProbeBatchTest(unittest.TestCase):
                 rollout_n=1,
                 max_prompt_length=16,
             )
+        with self.assertRaisesRegex(ValueError, "min_informative_state_rate"):
+            validate_eitr_config(
+                {"min_informative_state_rate": 1.1},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
 
     def test_online_probes_share_one_fixed_state(self):
         prompts = torch.tensor([[0, 11, 12, 13]] * 5)
@@ -171,6 +179,9 @@ class EITRProbeBatchTest(unittest.TestCase):
         )
         self.assertEqual(metrics["eitr/probe_state_coverage"], 1.0)
         self.assertEqual(metrics["eitr/probe_retrieval_call_count"], 3.0)
+        self.assertEqual(metrics["eitr/informative_probe_state_rate"], 1.0)
+        self.assertEqual(metrics["eitr/probe_effect_top1_disagreement_rate"], 1.0)
+        self.assertGreater(metrics["eitr/probe_effect_pairwise_js_max"], 0.0)
         self.assertEqual(tensors["eitr_state_slot"].nonzero().flatten().tolist(), [0])
         self.assertEqual(tensors["eitr_state_valid"].nonzero().flatten().tolist(), [0])
         state_prefixes = tensors["eitr_probe_input_ids"][0, :, :4]
@@ -204,6 +215,49 @@ class EITRProbeBatchTest(unittest.TestCase):
                     "max_doc_support": 8,
                     "max_probe_prompt_tokens": 4,
                     "min_state_coverage": 1.0,
+                },
+            )
+
+    def test_identical_retrieval_effects_are_not_informative(self):
+        documents = torch.tensor([[[0.8, 0.2], [0.8, 0.2], [0.8, 0.2], [0.8, 0.2]]])
+        result = probe_effect_diversity(
+            documents,
+            torch.ones(1, 4, dtype=torch.bool),
+            informative_js_threshold=0.01,
+        )
+        self.assertFalse(result["informative"].item())
+        self.assertAlmostEqual(result["state_max_js"].item(), 0.0, places=7)
+        self.assertEqual(result["top1_disagreement"].item(), 0.0)
+
+        probes = [
+            {
+                "query": f"paraphrase {index}",
+                "action_token_ids": [60 + index, 70],
+                "retrieval_effect": [
+                    {"doc_id": "same-a", "score": 1.0},
+                    {"doc_id": "same-b", "score": 0.5},
+                ],
+            }
+            for index in range(4)
+        ]
+        groups = [{
+            "state_prompt_token_ids": [11, 12, 13, 50],
+            "extra_retrieval_calls": 3,
+            "probes": probes,
+        }] + [None] * 4
+        with self.assertRaisesRegex(RuntimeError, "retrieval-effect diversity is too low"):
+            build_online_probe_tensors(
+                prompts=torch.tensor([[0, 11, 12, 13]] * 5),
+                attention_mask=torch.ones(5, 10, dtype=torch.long),
+                responses=torch.tensor([[51, 52, 0, 0, 0, 0]] * 5),
+                uids=["q0"] * 5,
+                probe_groups=groups,
+                pad_token_id=0,
+                config={
+                    "probe_count": 4,
+                    "max_action_tokens": 8,
+                    "max_doc_support": 8,
+                    "min_informative_state_rate": 0.1,
                 },
             )
 

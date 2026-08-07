@@ -62,6 +62,10 @@ def validate_eitr_config(
     dual_lr = float(_config_value(config, "dual_lr", 0.05))
     beta_max = float(_config_value(config, "beta_max", 10.0))
     log_ratio_clip = float(_config_value(config, "log_ratio_clip", 10.0))
+    informative_js_threshold = float(_config_value(config, "informative_js_threshold", 0.01))
+    min_informative_state_rate = float(
+        _config_value(config, "min_informative_state_rate", 0.0)
+    )
 
     if probe_count < 2:
         raise ValueError("EITR requires probe_count >= 2")
@@ -95,6 +99,10 @@ def validate_eitr_config(
         raise ValueError("EITR initial_beta cannot exceed beta_max")
     if log_ratio_clip <= 0:
         raise ValueError("EITR log_ratio_clip must be positive")
+    if informative_js_threshold < 0:
+        raise ValueError("EITR informative_js_threshold must be non-negative")
+    if not 0.0 <= min_informative_state_rate <= 1.0:
+        raise ValueError("EITR min_informative_state_rate must be in [0, 1]")
 
 
 def validate_sibling_group_layout(uids: Sequence[Any], *, n_agent: int, world_size: int) -> None:
@@ -165,6 +173,131 @@ def _effect_distribution(
     if total > 0:
         distribution /= total
     return distribution
+
+
+def probe_effect_diversity(
+    doc_probs: torch.Tensor,
+    probe_mask: torch.Tensor,
+    *,
+    informative_js_threshold: float = 0.01,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """Measure whether same-state probes induce meaningfully different retrievals."""
+    documents = doc_probs.float()
+    mask = probe_mask.bool()
+    if documents.ndim != 3 or mask.shape != documents.shape[:2]:
+        raise ValueError("Expected doc_probs [states, probes, docs] and matching probe_mask")
+
+    state_max_js = []
+    state_mean_js = []
+    state_top1_disagreement = []
+    for state_documents, state_mask in zip(documents, mask):
+        valid_documents = state_documents[state_mask]
+        if valid_documents.size(0) < 2:
+            state_max_js.append(documents.new_tensor(0.0))
+            state_mean_js.append(documents.new_tensor(0.0))
+            state_top1_disagreement.append(documents.new_tensor(0.0))
+            continue
+
+        valid_documents = valid_documents / valid_documents.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(eps)
+        pairwise_js = []
+        for left_index in range(valid_documents.size(0)):
+            for right_index in range(left_index + 1, valid_documents.size(0)):
+                left = valid_documents[left_index]
+                right = valid_documents[right_index]
+                mixture = 0.5 * (left + right)
+                left_kl = torch.sum(
+                    torch.where(
+                        left > 0,
+                        left * (torch.log(left.clamp_min(eps)) - torch.log(mixture.clamp_min(eps))),
+                        torch.zeros_like(left),
+                    )
+                )
+                right_kl = torch.sum(
+                    torch.where(
+                        right > 0,
+                        right * (torch.log(right.clamp_min(eps)) - torch.log(mixture.clamp_min(eps))),
+                        torch.zeros_like(right),
+                    )
+                )
+                pairwise_js.append(0.5 * (left_kl + right_kl))
+
+        pairwise_js_tensor = torch.stack(pairwise_js)
+        state_max_js.append(pairwise_js_tensor.max())
+        state_mean_js.append(pairwise_js_tensor.mean())
+        state_top1_disagreement.append(
+            documents.new_tensor(
+                float(torch.unique(valid_documents.argmax(dim=-1)).numel() > 1)
+            )
+        )
+
+    if not state_max_js:
+        empty = documents.new_zeros((0,))
+        return {
+            "state_max_js": empty,
+            "state_mean_js": empty,
+            "informative": empty.bool(),
+            "top1_disagreement": empty,
+        }
+
+    state_max_js_tensor = torch.stack(state_max_js)
+    return {
+        "state_max_js": state_max_js_tensor,
+        "state_mean_js": torch.stack(state_mean_js),
+        "informative": state_max_js_tensor > float(informative_js_threshold),
+        "top1_disagreement": torch.stack(state_top1_disagreement),
+    }
+
+
+def _probe_diversity_metrics(
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    config: Any,
+    total_state_count: int,
+) -> Dict[str, float]:
+    state_valid = tensors["eitr_state_valid"].bool()
+    valid_state_count = int(state_valid.sum().item())
+    informative_js_threshold = float(_config_value(config, "informative_js_threshold", 0.01))
+    min_informative_state_rate = float(
+        _config_value(config, "min_informative_state_rate", 0.0)
+    )
+    diversity = probe_effect_diversity(
+        tensors["eitr_probe_doc_probs"][state_valid],
+        tensors["eitr_probe_valid"][state_valid],
+        informative_js_threshold=informative_js_threshold,
+    )
+    informative_count = int(diversity["informative"].sum().item())
+    informative_rate = informative_count / max(valid_state_count, 1)
+    informative_total_rate = informative_count / max(total_state_count, 1)
+    pairwise_js_mean = (
+        float(diversity["state_mean_js"].mean().item()) if valid_state_count else 0.0
+    )
+    pairwise_js_max = (
+        float(diversity["state_max_js"].max().item()) if valid_state_count else 0.0
+    )
+    top1_disagreement_rate = (
+        float(diversity["top1_disagreement"].mean().item()) if valid_state_count else 0.0
+    )
+
+    if min_informative_state_rate > 0 and informative_rate < min_informative_state_rate:
+        raise RuntimeError(
+            "EITR retrieval-effect diversity is too low: "
+            f"informative_rate={informative_rate:.3f} < required={min_informative_state_rate:.3f}, "
+            f"valid_states={valid_state_count}, informative_states={informative_count}, "
+            f"js_threshold={informative_js_threshold:.6f}"
+        )
+
+    return {
+        "eitr/informative_probe_state_count": float(informative_count),
+        "eitr/informative_probe_state_rate": float(informative_rate),
+        "eitr/informative_probe_total_state_rate": float(informative_total_rate),
+        "eitr/probe_effect_pairwise_js_mean": pairwise_js_mean,
+        "eitr/probe_effect_pairwise_js_max": pairwise_js_max,
+        "eitr/probe_effect_top1_disagreement_rate": top1_disagreement_rate,
+        "eitr/informative_js_threshold": informative_js_threshold,
+    }
 
 
 def _record_is_eligible(
@@ -391,6 +524,13 @@ def build_sibling_probe_tensors(
         "eitr/support_truncation_count": float(support_truncation_count),
         "eitr/rejected_rollout_count": float(sum(rejection_counts.values())),
     }
+    metrics.update(
+        _probe_diversity_metrics(
+            tensors,
+            config=config,
+            total_state_count=total_state_count,
+        )
+    )
     return tensors, metrics
 
 
@@ -587,6 +727,13 @@ def build_online_probe_tensors(
             )
         ),
     }
+    metrics.update(
+        _probe_diversity_metrics(
+            tensors,
+            config=config,
+            total_state_count=total_state_count,
+        )
+    )
     return tensors, metrics
 
 

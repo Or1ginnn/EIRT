@@ -52,6 +52,10 @@ actor_rollout_ref:
       retrieval_score_temperature: 0.1
       require_empty_prefix: False
       min_state_coverage: 0.0
+      # Coverage only says probes exist. These fields check that their real
+      # retrieval distributions actually diverge enough to provide EITR signal.
+      informative_js_threshold: 0.01
+      min_informative_state_rate: 0.0
       target_js: 0.01
       initial_beta: 0.1
       dual_lr: 0.05

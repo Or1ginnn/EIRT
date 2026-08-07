@@ -43,6 +43,14 @@ D_B            = JS(p_old || p_current)
 
 retriever 不参与反向传播；梯度只经过 current policy 对 probe action 的 sequence log-prob。
 
+Probe coverage 只说明成功生成了 query，不说明这些 query 带来了不同检索结果。因此训练还会计算同状态 probe 两两之间的 retrieval-effect JS：
+
+- `eitr/informative_probe_state_rate`：在有效 probe 组中，至少一对检索分布 JS 超过 `0.01` 的比例；
+- `eitr/probe_effect_pairwise_js_mean/max`：真实检索分歧的平均值和最大值；
+- `eitr/probe_effect_top1_disagreement_rate`：同组 query 的 top-1 文档发生变化的比例。
+
+如果 query 只是同义改写且检索结果相同，该状态的分歧为零，不产生有效 EITR geometry。Smoke 默认要求 informative state rate 至少为 `0.1`，防止在几乎没有环境分歧信号时误跑完整训练。
+
 ### 2.3 Actor objective 与 dual
 
 任务 reward、GRPO advantage 和 PPO ratio 保持不变。Actor 最小化目标中额外加入：
@@ -119,11 +127,12 @@ bash scripts/train/train_eitr_nq_gate_c_full.sh
 
 1. 完成 10 次 update，无 CUDA/Ray OOM、NaN、FSDP hang 或 tensor-shape 错误；
 2. `eitr/probe_state_coverage >= 0.5`；
-3. `actor/eitr_global_induced_js`、`actor/eitr_beta`、`actor/eitr_probe_ess` 全部有限；
-4. ESS 位于 `[1, 4]`，`log_ratio_clipfrac` 不应长期接近 1；
-5. 至少从第二个 optimizer mini-batch 起 induced JS 出现非零值；
-6. EITR 关闭时不出现 probe 指标，答案 reward 与原 GRPO 一致；
-7. 抽查 probe：同组 4 个输入 prefix token 完全一致，query 不同，retrieval 结果来自真实 `/retrieve`。
+3. `eitr/informative_probe_state_rate >= 0.1`，证明至少一部分 query 组产生了真实检索分歧；
+4. `actor/eitr_global_induced_js`、`actor/eitr_beta`、`actor/eitr_probe_ess` 全部有限；
+5. ESS 位于 `[1, 4]`，`log_ratio_clipfrac` 不应长期接近 1；
+6. 至少从第二个 optimizer mini-batch 起 induced JS 出现非零值；
+7. EITR 关闭时不出现 probe 指标，答案 reward 与原 GRPO 一致；
+8. 抽查 probe：同组 4 个输入 prefix token 完全一致，query 不同，retrieval 结果来自真实 `/retrieve`。
 
 ## 6. 2026-08-06 旧链路试跑记录
 
