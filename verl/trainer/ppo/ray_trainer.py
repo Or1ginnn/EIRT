@@ -45,6 +45,7 @@ from verl.trainer.ppo.eitr import (
     validate_eitr_config,
     validate_sibling_group_layout,
 )
+from verl.trainer.ppo.step_plan import resolve_training_step_plan
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
@@ -281,7 +282,19 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['env/number_of_valid_action'] = float(np.array(batch.meta_info['valid_action_stats'], dtype=np.int16).mean())
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
     if 'valid_search_stats' in batch.meta_info:
-        metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+        executed_searches = np.array(batch.meta_info['valid_search_stats'], dtype=np.int16)
+        # Backward-compatible alias plus a name that states the real semantics:
+        # only retriever calls executed inside the environment loop are counted.
+        metrics['env/number_of_valid_search'] = float(executed_searches.mean())
+        metrics['env/number_of_executed_search'] = float(executed_searches.mean())
+    if 'final_generation_stats' in batch.meta_info:
+        metrics['env/final_generation_ratio'] = float(
+            np.array(batch.meta_info['final_generation_stats'], dtype=np.int16).mean()
+        )
+    if 'final_search_attempt_stats' in batch.meta_info:
+        metrics['env/final_unexecuted_search_ratio'] = float(
+            np.array(batch.meta_info['final_search_attempt_stats'], dtype=np.int16).mean()
+        )
 
 
     return metrics
@@ -427,19 +440,30 @@ class RayPPOTrainer(object):
         assert len(self.train_dataloader) >= 1
         assert len(self.val_dataloader) >= 1
 
-        # inject total_training_steps to actor/critic optim_config. This is hacky.
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
-        print(f'Total training steps: {self.total_training_steps}')
+        self.training_step_plan = resolve_training_step_plan(
+            steps_per_epoch=len(self.train_dataloader),
+            total_epochs=self.config.trainer.total_epochs,
+            total_training_steps=self.config.trainer.total_training_steps,
+        )
+        self.total_training_steps = self.training_step_plan.target_outer_updates
+        self.training_loop_epochs = self.training_step_plan.required_epochs
+        budget_source = (
+            'trainer.total_training_steps'
+            if self.training_step_plan.explicit_step_budget
+            else 'trainer.total_epochs'
+        )
+        print(
+            'Training step plan: '
+            f'{self.total_training_steps} exact outer updates, '
+            f'{self.training_step_plan.steps_per_epoch} batches/epoch, '
+            f'{self.training_loop_epochs} loop epochs '
+            f'(budget source: {budget_source})'
+        )
 
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
-            self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-            self.config.critic.optim.total_training_steps = total_training_steps
+            self.config.actor_rollout_ref.actor.optim.total_training_steps = self.total_training_steps
+            self.config.critic.optim.total_training_steps = self.total_training_steps
 
     def _validate(self):
         """
@@ -677,9 +701,6 @@ class RayPPOTrainer(object):
             if self.config.trainer.get('val_only', False):
                 return
 
-        # we start from step 1
-        self.global_steps += 1
-
         eitr_config = self.config.actor_rollout_ref.actor.get('eitr', {})
         eitr_mode = resolve_eitr_mode(eitr_config)
         eitr_uses_probes = eitr_mode != 'off'
@@ -742,10 +763,13 @@ class RayPPOTrainer(object):
             config=gen_config,
         )
 
-        # start training loop
-        for epoch in range(self.config.trainer.total_epochs):
+        # ``global_steps`` is the number of completed outer rollout/update
+        # iterations.  An explicit total_training_steps budget is authoritative,
+        # so the dataloader is re-iterated for as many epochs as required.
+        for epoch in range(self.training_loop_epochs):
             for batch_dict in self.train_dataloader:
-                print(f'epoch {epoch}, step {self.global_steps}')
+                current_step = self.global_steps + 1
+                print(f'epoch {epoch}, outer update {current_step}/{self.total_training_steps}')
                 metrics = {}
                 timing_raw = {}
                 eitr_rollout_meta = {}
@@ -819,7 +843,7 @@ class RayPPOTrainer(object):
                     ####################
 
                     actor_update_ready = (
-                        self.config.trainer.critic_warmup <= self.global_steps
+                        self.config.trainer.critic_warmup <= current_step
                     )
                     probe_source = str(
                         eitr_config.get('probe_source', 'online_same_state')
@@ -950,12 +974,22 @@ class RayPPOTrainer(object):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
-                    # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        self.global_steps % self.config.trainer.test_freq == 0:
+                    # The update is now complete.  All logging, validation and
+                    # checkpoint names use this completed-update count.
+                    self.global_steps = current_step
+                    is_final_step = self.global_steps == self.total_training_steps
+                    is_periodic_validation_step = (
+                        self.config.trainer.test_freq > 0
+                        and self.global_steps % self.config.trainer.test_freq == 0
+                    )
+                    if self.val_reward_fn is not None and (
+                        is_periodic_validation_step or is_final_step
+                    ):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
+                        if is_final_step:
+                            pprint(f'Final validation metrics: {val_metrics}')
 
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
@@ -965,20 +999,26 @@ class RayPPOTrainer(object):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics.update({
+                    'trainer/outer_update_step': float(self.global_steps),
+                    'trainer/target_outer_updates': float(self.total_training_steps),
+                    'trainer/outer_update_progress': float(
+                        self.global_steps / self.total_training_steps
+                    ),
+                })
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
-                self.global_steps += 1
-
-                if self.global_steps >= self.total_training_steps:
-
-                    # perform validation after training
-                    if self.val_reward_fn is not None:
-                        val_metrics = self._validate()
-                        pprint(f'Final validation metrics: {val_metrics}')
-                        logger.log(data=val_metrics, step=self.global_steps)
+                if is_final_step:
                     return
+
+        raise RuntimeError(
+            'Training loop exhausted before reaching the resolved outer-update budget: '
+            f'completed={self.global_steps}, target={self.total_training_steps}, '
+            f'loop_epochs={self.training_loop_epochs}, '
+            f'batches_per_epoch={len(self.train_dataloader)}'
+        )
     
     def _create_loss_mask(self, batch, metrics):
         """Create loss mask for state tokens."""

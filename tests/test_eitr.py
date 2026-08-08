@@ -505,14 +505,15 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         self.assertEqual(valid_actions, [1])
         self.assertEqual(searches, [1])
 
-        final_observations, _, _, final_searches = manager.execute_predictions(
+        final_observations, _, final_valid_actions, final_searches = manager.execute_predictions(
             ["<search>another query</search>"],
             pad_token="<pad>",
             active_mask=[True],
             do_search=False,
         )
         self.assertEqual(final_observations, ["\n\n<information></information>\n\n"])
-        self.assertEqual(final_searches, [1])
+        self.assertEqual(final_valid_actions, [0])
+        self.assertEqual(final_searches, [0])
 
     def test_empty_closed_search_is_not_a_valid_action(self):
         manager = object.__new__(LLMGenerationManager)

@@ -370,6 +370,11 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            # The LR schedule is intentionally indexed by outer rollout/update
+            # steps, not by the variable number of AdamW steps inside GRPO/EITR.
+            # This keeps off/probe_only/eitr on the same LR at a paired outer
+            # step.  Log the LR actually used before advancing the scheduler.
+            lr_used = self.actor_optimizer.param_groups[0]['lr']
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
@@ -379,8 +384,8 @@ class ActorRolloutRefWorker(Worker):
             metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
             self.actor_lr_scheduler.step()
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics['actor/lr'] = lr
+            metrics['actor/lr'] = lr_used
+            metrics['actor/lr_next_outer_update'] = self.actor_lr_scheduler.get_last_lr()[0]
 
             log_gpu_memory_usage('After update policy', logger=logger)
 

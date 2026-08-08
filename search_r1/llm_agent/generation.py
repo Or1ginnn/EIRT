@@ -243,9 +243,11 @@ class LLMGenerationManager:
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
         
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
-        turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        turns_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        final_generation_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        final_search_attempt_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
         self._eitr_current_rollout_index = self._eitr_rollout_call_index
@@ -294,6 +296,10 @@ class LLMGenerationManager:
         for step in range(self.config.max_turns):
             if not active_mask.sum():
                 break
+            # Count actual LLM generations explicitly. ``max_turns`` bounds the
+            # retriever-enabled interaction loop; the optional final generation
+            # below is a separate answer opportunity.
+            turns_stats[active_mask] += 1
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
@@ -335,7 +341,6 @@ class LLMGenerationManager:
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
-            turns_stats[curr_active_mask] += 1
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
@@ -355,6 +360,8 @@ class LLMGenerationManager:
             
         # final LLM rollout
         if active_mask.sum():
+            turns_stats[active_mask] += 1
+            final_generation_stats[active_mask] += 1
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
@@ -369,6 +376,11 @@ class LLMGenerationManager:
             meta_info = gen_output.meta_info            
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            final_actions, _ = self.postprocess_predictions(responses_str)
+            final_search_attempt_stats += torch.tensor([
+                int(bool(active) and action == 'search')
+                for action, active in zip(final_actions, active_mask)
+            ], dtype=torch.int)
 
             # # Execute in environment and process observations
             _, dones, valid_action, is_search = self.execute_predictions(
@@ -397,6 +409,8 @@ class LLMGenerationManager:
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
+        meta_info['final_generation_stats'] = final_generation_stats.tolist()
+        meta_info['final_search_attempt_stats'] = final_search_attempt_stats.tolist()
         if self.config.collect_eitr_probes:
             meta_info['eitr_first_search_records'] = self._eitr_first_search_records
             meta_info['eitr_probe_groups'] = self._eitr_probe_groups
@@ -499,11 +513,17 @@ class LLMGenerationManager:
                                 query=contents[i],
                                 retrieval_result=retrieval_result,
                             )
+                        dones.append(0)
+                        valid_action.append(1)
+                        is_search.append(1)
                     else:
+                        # The final answer opportunity does not execute tools.
+                        # A generated search here is an unfinished/invalid final
+                        # action, not a real retriever call.
                         next_obs.append('\n\n<information></information>\n\n')
-                    dones.append(0)
-                    valid_action.append(1)
-                    is_search.append(1)
+                        dones.append(0)
+                        valid_action.append(0)
+                        is_search.append(0)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \

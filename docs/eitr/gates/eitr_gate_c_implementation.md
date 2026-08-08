@@ -106,6 +106,37 @@ eitr:
 
 ## 6. 关键指标
 
+### 6.1 统一的 step 口径
+
+Search-R1 原始训练循环存在 off-by-one，并且在 dataloader 的 epoch 容量小于
+`trainer.total_training_steps` 时会静默提前结束。Phase 2 将训练预算统一定义为：
+
+```text
+1 outer update = 1个训练batch的rollout + reward/advantage + GRPO更新
+                 + 该模式可能执行的EITR correction
+```
+
+显式设置 `trainer.total_training_steps=T` 时，trainer 会按需重新迭代 dataloader，
+并且恰好完成 `T` 个 outer updates；`global_step` 表示已经完成的 outer updates。
+初始验证记录在 step 0，训练日志记录在 step 1...T，最终验证与第 T 次更新合并在
+同一个 W&B step，不再制造一个没有训练更新的终点 step。
+
+LR scheduler 也以 outer update 为时间单位，因此 paired 的 `off/probe_only/eitr`
+在相同 outer step 使用相同学习率。一次 outer update 内部的 AdamW 次数单独报告，
+不再与 W&B global step 混用：
+
+- `trainer/outer_update_step`
+- `trainer/target_outer_updates`
+- `actor/grpo_optimizer_step_count`
+- `actor/eitr_correction_optimizer_step_count`
+- `actor/optimizer_step_count`
+- 对应的 `*_cumulative` 累计指标
+
+在默认 smoke 参数下，每个 outer update 有 5 次 GRPO optimizer steps；只有
+`eitr` 模式会在有效 state 上增加 0～5 次 correction optimizer steps。
+
+### 6.2 EITR 与环境指标
+
 - `eitr/real_valid_search_count`
 - `eitr/probe_selected_state_count`
 - `eitr/probe_candidate_valid_rate`
@@ -117,6 +148,9 @@ eitr:
 - `actor/eitr_pass_*_raw_logprob_grad_norm`
 - `actor/eitr_pass_*_applied_logprob_grad_norm`
 - `actor/eitr_correction_optimizer_step_count`
+- `env/number_of_executed_search`
+- `env/final_generation_ratio`
+- `env/final_unexecuted_search_ratio`
 
 Collector 的具体拒绝原因仍以 `eitr/collector_*` 记录，例如 missing close tag、empty query 和 empty retrieval effect。
 

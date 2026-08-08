@@ -67,6 +67,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_lambda_env = float(self.eitr_config.get('lambda_env', 0.1))
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
+        self.grpo_optimizer_steps_completed = 0
+        self.eitr_optimizer_steps_completed = 0
         validate_eitr_optimization_schedule(
             self.eitr_config,
             self.ppo_epochs,
@@ -357,6 +359,7 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         eitr_world_size = torch.distributed.get_world_size() if distributed else 1
+        grpo_optimizer_step_count = 0
         eitr_correction_optimizer_step_count = 0
 
         for ppo_epoch in range(self.ppo_epochs):
@@ -416,6 +419,7 @@ class DataParallelPPOActor(BasePPOActor):
                     })
 
                 grad_norm = self._optimizer_step()
+                grpo_optimizer_step_count += 1
                 append_to_dict(metrics, {
                     'actor/grad_norm': grad_norm.detach().item(),
                     'actor/ppo_epoch': float(ppo_epoch),
@@ -680,8 +684,30 @@ class DataParallelPPOActor(BasePPOActor):
                 'actor/eitr_probe_only': float(self.eitr_mode == 'probe_only'),
                 'actor/eitr_grpo_pass_count': float(self.ppo_epochs),
                 'actor/eitr_correction_pass_count': float(self.eitr_correction_passes),
-                'actor/eitr_correction_optimizer_step_count': float(
-                    eitr_correction_optimizer_step_count
-                ),
             })
+
+        # A trainer outer update can contain several synchronized AdamW steps.
+        # Report ordinary GRPO and EITR correction steps separately so paired
+        # experiments share an unambiguous outer x-axis without hiding the
+        # method's extra correction work.
+        self.grpo_optimizer_steps_completed += grpo_optimizer_step_count
+        self.eitr_optimizer_steps_completed += eitr_correction_optimizer_step_count
+        append_to_dict(metrics, {
+            'actor/grpo_optimizer_step_count': float(grpo_optimizer_step_count),
+            'actor/eitr_correction_optimizer_step_count': float(
+                eitr_correction_optimizer_step_count
+            ),
+            'actor/optimizer_step_count': float(
+                grpo_optimizer_step_count + eitr_correction_optimizer_step_count
+            ),
+            'actor/grpo_optimizer_step_count_cumulative': float(
+                self.grpo_optimizer_steps_completed
+            ),
+            'actor/eitr_correction_optimizer_step_count_cumulative': float(
+                self.eitr_optimizer_steps_completed
+            ),
+            'actor/optimizer_step_count_cumulative': float(
+                self.grpo_optimizer_steps_completed + self.eitr_optimizer_steps_completed
+            ),
+        })
         return metrics

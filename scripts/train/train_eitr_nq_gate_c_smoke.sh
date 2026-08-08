@@ -42,7 +42,10 @@ EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-96}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-smoke}"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
+# With an explicit TOTAL_TRAINING_STEPS budget, the trainer cycles the
+# dataloader until that exact number of outer updates is complete.  Keep the
+# smoke epoch default aligned as a readable fallback for its one-batch loader.
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-20}"
 TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-32}"
 VAL_DATA_NUM="${VAL_DATA_NUM:-64}"
