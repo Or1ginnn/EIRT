@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Formal Gate C run. The caller must deliberately choose the training budget;
-# this wrapper prevents a smoke-test default from being mistaken for a paper run.
+# Formal Phase-2 Conditional EITR run. The caller must deliberately choose the
+# training budget so a smoke default cannot be mistaken for a paper run.
 : "${TOTAL_TRAINING_STEPS:?Set TOTAL_TRAINING_STEPS to the Search-R1 baseline budget}"
 
-export EITR_ENABLED="${EITR_ENABLED:-true}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-gate-c-full}"
+export EITR_MODE="${EITR_MODE:-eitr}"
+export EITR_PROBE_PROBABILITY="${EITR_PROBE_PROBABILITY:-1.0}"
+export EITR_PROBE_COUNT="${EITR_PROBE_COUNT:-4}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-full}"
 export TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-null}"
 export VAL_DATA_NUM="${VAL_DATA_NUM:-null}"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"

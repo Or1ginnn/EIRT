@@ -86,8 +86,13 @@ class vLLMRollout(BaseRollout):
                 vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size,
                                                   num_tp_per_train_tp=num_tp_per_train_tp)
 
-        assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
-            "model context length should be greater than total sequence length"
+        rollout_sequence_length = int(config.prompt_length + config.response_length)
+        configured_max_model_len = config.get('max_model_len', None)
+        max_model_len = int(configured_max_model_len or rollout_sequence_length)
+        assert max_model_len >= rollout_sequence_length, \
+            "vLLM max_model_len should cover the ordinary rollout sequence length"
+        assert model_hf_config.max_position_embeddings >= max_model_len, \
+            "model context length should be greater than vLLM max_model_len"
         self.inference_engine = LLM(actor_module,
                                     tokenizer=tokenizer,
                                     model_hf_config=model_hf_config,
@@ -96,7 +101,7 @@ class vLLMRollout(BaseRollout):
                                     enforce_eager=config.enforce_eager,
                                     gpu_memory_utilization=config.gpu_memory_utilization,
                                     skip_tokenizer_init=False,
-                                    max_model_len=config.prompt_length + config.response_length,
+                                    max_model_len=max_model_len,
                                     load_format=config.load_format)
 
         # Offload vllm model to reduce peak memory usage

@@ -41,6 +41,7 @@ from verl.trainer.ppo.eitr import (
     assign_probe_old_log_probs,
     attach_eitr_probe_tensors,
     flatten_probe_logprob_inputs,
+    resolve_eitr_mode,
     validate_eitr_config,
     validate_sibling_group_layout,
 )
@@ -680,12 +681,15 @@ class RayPPOTrainer(object):
         self.global_steps += 1
 
         eitr_config = self.config.actor_rollout_ref.actor.get('eitr', {})
-        eitr_enabled = bool(eitr_config.get('enabled', False))
-        if eitr_enabled:
+        eitr_mode = resolve_eitr_mode(eitr_config)
+        eitr_uses_probes = eitr_mode != 'off'
+        if eitr_uses_probes:
             if not self.config.do_search or self.config.algorithm.adv_estimator != 'grpo':
-                raise ValueError('EITR Gate C requires do_search=true and algorithm.adv_estimator=grpo')
+                raise ValueError('Conditional EITR requires do_search=true and algorithm.adv_estimator=grpo')
+            if str(self.config.actor_rollout_ref.actor.strategy).lower() != 'fsdp':
+                raise ValueError('Conditional EITR Phase 2 currently requires actor.strategy=fsdp')
             if self.config.actor_rollout_ref.actor.get('use_dynamic_bsz', False):
-                raise ValueError('EITR Gate C currently requires actor.use_dynamic_bsz=false')
+                raise ValueError('Conditional EITR currently requires actor.use_dynamic_bsz=false')
             if int(self.config.data.train_batch_size) % int(self.actor_rollout_wg.world_size) != 0:
                 raise ValueError('EITR train_batch_size must be divisible by the actor world size')
             validate_eitr_config(
@@ -694,6 +698,19 @@ class RayPPOTrainer(object):
                 max_queries_per_turn=1,
                 rollout_n=int(self.config.actor_rollout_ref.rollout.n),
                 max_prompt_length=int(self.config.data.max_prompt_length),
+                rollout_max_model_len=int(
+                    self.config.actor_rollout_ref.rollout.get(
+                        'max_model_len',
+                        int(self.config.data.max_prompt_length)
+                        + int(self.config.data.max_response_length),
+                    )
+                    or (
+                        int(self.config.data.max_prompt_length)
+                        + int(self.config.data.max_response_length)
+                    )
+                ),
+                rollout_top_p=float(self.config.actor_rollout_ref.rollout.top_p),
+                rollout_top_k=int(self.config.actor_rollout_ref.rollout.top_k),
             )
 
         # Agent config preparation
@@ -707,11 +724,15 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
-            collect_eitr_probes=eitr_enabled,
+            collect_eitr_probes=eitr_uses_probes,
+            eitr_probe_probability=float(eitr_config.get('probe_probability', 1.0)),
             eitr_probe_count=int(eitr_config.get('probe_count', 4)),
             eitr_n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
-            eitr_probe_oversample=int(eitr_config.get('probe_oversample', 2)),
+            eitr_probe_oversample=int(eitr_config.get('probe_oversample', 0)),
             eitr_max_query_tokens=int(eitr_config.get('max_query_tokens', 96)),
+            eitr_max_probe_prompt_tokens=int(
+                eitr_config.get('max_probe_prompt_tokens', 4096)
+            ),
             eitr_probe_seed=int(eitr_config.get('probe_seed', 20260805)),
         )
 
@@ -762,9 +783,10 @@ class RayPPOTrainer(object):
                                 initial_input_ids=first_input_ids,
                             )
 
-                        if eitr_enabled:
+                        if eitr_uses_probes:
                             for key in (
                                 'eitr_probe_groups',
+                                'eitr_probe_state_groups',
                                 'eitr_first_search_records',
                                 'eitr_probe_collection_stats',
                             ):
@@ -786,7 +808,7 @@ class RayPPOTrainer(object):
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(final_gen_batch_output)
-                        if eitr_enabled:
+                        if eitr_uses_probes:
                             validate_sibling_group_layout(
                                 batch.non_tensor_batch['uid'],
                                 n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
@@ -796,15 +818,65 @@ class RayPPOTrainer(object):
                     ####################
                     ####################
 
+                    actor_update_ready = (
+                        self.config.trainer.critic_warmup <= self.global_steps
+                    )
+                    probe_source = str(
+                        eitr_config.get('probe_source', 'online_same_state')
+                    )
+                    if eitr_uses_probes and actor_update_ready:
+                        # Materialize batch-aligned probe tensors before sequence
+                        # balancing. The online representation owns one physical
+                        # slot per rollout row, so the ordinary off-mode reorder
+                        # can move rows freely without breaking FSDP symmetry.
+                        with _timer('eitr_probe_prepare', timing_raw):
+                            batch.meta_info.update(eitr_rollout_meta)
+                            batch, eitr_probe_metrics = attach_eitr_probe_tensors(
+                                batch,
+                                eitr_config,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                            )
+                            if bool(batch.batch['eitr_state_slot'].any().item()):
+                                probe_logprob_tensors, probe_response_mask = flatten_probe_logprob_inputs(batch)
+                                probe_logprob_batch = DataProto.from_dict(probe_logprob_tensors)
+                                probe_logprob_batch.meta_info['micro_batch_size'] = int(
+                                    eitr_config.get('probe_logprob_micro_batch_size', 4)
+                                )
+                                probe_logprob_batch.meta_info['temperature'] = float(
+                                    batch.meta_info['temperature']
+                                )
+                                probe_logprob_batch.meta_info['use_dynamic_bsz'] = False
+                                with torch.no_grad():
+                                    probe_logprob_output = self.actor_rollout_wg.compute_log_prob(
+                                        probe_logprob_batch
+                                    )
+                                batch = assign_probe_old_log_probs(
+                                    batch,
+                                    probe_logprob_output.batch['old_log_probs'],
+                                    probe_response_mask,
+                                )
+                            else:
+                                metrics['eitr/probe_old_logprob_skipped_zero_active'] = 1.0
+                            metrics.update(eitr_probe_metrics)
+
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
-                    if eitr_enabled:
-                        # Keep contiguous sibling groups so every FSDP rank executes
-                        # the same number of probe forwards. Probe groups themselves
-                        # remain self-contained tensors on representative rows.
+                    if (
+                        eitr_uses_probes
+                        and actor_update_ready
+                        and probe_source == 'sibling_rollouts'
+                        and bool(batch.batch['eitr_state_slot'].any().item())
+                    ):
+                        # The legacy sibling ablation still stores one slot on a
+                        # representative row per contiguous uid group. Its layout
+                        # cannot be arbitrarily rebalanced without a multi-state
+                        # packing migration.
                         metrics['eitr/sequence_balance_disabled'] = 1.0
                     else:
+                        # Online Phase 2 and off mode intentionally share the
+                        # exact same balancing path. A zero-active EITR batch can
+                        # therefore reduce to the same ordinary GRPO update.
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
@@ -869,28 +941,8 @@ class RayPPOTrainer(object):
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if actor_update_ready:
                         # update actor
-                        if eitr_enabled:
-                            with _timer('eitr_probe_prepare', timing_raw):
-                                batch.meta_info.update(eitr_rollout_meta)
-                                batch, eitr_probe_metrics = attach_eitr_probe_tensors(
-                                    batch,
-                                    eitr_config,
-                                    pad_token_id=self.tokenizer.pad_token_id,
-                                )
-                                probe_logprob_tensors, probe_response_mask = flatten_probe_logprob_inputs(batch)
-                                probe_logprob_batch = DataProto.from_dict(probe_logprob_tensors)
-                                with torch.no_grad():
-                                    probe_logprob_output = self.actor_rollout_wg.compute_log_prob(
-                                        probe_logprob_batch
-                                    )
-                                batch = assign_probe_old_log_probs(
-                                    batch,
-                                    probe_logprob_output.batch['old_log_probs'],
-                                    probe_response_mask,
-                                )
-                                metrics.update(eitr_probe_metrics)
                         with _timer('update_actor', timing_raw):
                             if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)

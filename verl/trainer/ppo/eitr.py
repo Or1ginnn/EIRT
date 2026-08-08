@@ -28,6 +28,8 @@ EITR_BATCH_KEYS = (
     "eitr_state_valid",
 )
 
+EITR_MODES = ("off", "probe_only", "eitr")
+
 
 def _config_value(config: Any, key: str, default: Any) -> Any:
     if config is None:
@@ -40,6 +42,67 @@ def _config_value(config: Any, key: str, default: Any) -> Any:
     return getattr(config, key, default)
 
 
+def resolve_eitr_mode(config: Any) -> str:
+    """Resolve the Phase-2 mode while preserving the old ``enabled`` switch.
+
+    ``mode`` is authoritative when it is set.  A missing/null mode falls back
+    to the Gate-C ``enabled`` boolean so old launch commands still select the
+    EITR loss instead of silently running the baseline.
+    """
+    configured_mode = _config_value(config, "mode", None)
+    if configured_mode is None:
+        return "eitr" if bool(_config_value(config, "enabled", False)) else "off"
+    mode = str(configured_mode).strip().lower()
+    if mode not in EITR_MODES:
+        raise ValueError(
+            f"Unsupported EITR mode={configured_mode!r}; expected one of {EITR_MODES}"
+        )
+    return mode
+
+
+def eitr_probe_enabled_for_pass(
+    config: Any,
+    pass_index: int,
+    *,
+    grpo_passes: int = 1,
+) -> bool:
+    """Whether a global optimization pass is an EITR correction pass."""
+    if int(pass_index) < 0:
+        raise ValueError("PPO pass_index must be non-negative")
+    if int(grpo_passes) <= 0:
+        raise ValueError("grpo_passes must be positive")
+    return resolve_eitr_mode(config) != "off" and int(pass_index) >= int(grpo_passes)
+
+
+def eitr_loss_enabled_for_pass(
+    config: Any,
+    pass_index: int,
+    *,
+    grpo_passes: int = 1,
+) -> bool:
+    """Whether a PPO pass applies the fixed-lambda environment penalty."""
+    return (
+        eitr_probe_enabled_for_pass(config, pass_index, grpo_passes=grpo_passes)
+        and resolve_eitr_mode(config) == "eitr"
+    )
+
+
+def validate_eitr_optimization_schedule(
+    config: Any,
+    ppo_epochs: int,
+    correction_passes: int = 1,
+) -> None:
+    """Validate GRPO epochs followed by separate EITR-only corrections."""
+    ppo_epochs = int(ppo_epochs)
+    if ppo_epochs <= 0:
+        raise ValueError("actor.ppo_epochs must be positive")
+    mode = resolve_eitr_mode(config)
+    if mode != "off" and int(correction_passes) <= 0:
+        raise ValueError(
+            f"EITR mode={mode} requires eitr.correction_passes >= 1"
+        )
+
+
 def validate_eitr_config(
     config: Any,
     *,
@@ -47,20 +110,27 @@ def validate_eitr_config(
     max_queries_per_turn: int,
     rollout_n: int,
     max_prompt_length: Optional[int] = None,
+    rollout_max_model_len: Optional[int] = None,
+    rollout_top_p: Optional[float] = None,
+    rollout_top_k: Optional[int] = None,
 ) -> None:
-    """Fail early when the Gate C probe estimator's assumptions do not hold."""
+    """Fail early when the Conditional EITR estimator assumptions do not hold."""
+    mode = resolve_eitr_mode(config)
     probe_count = int(_config_value(config, "probe_count", 4))
-    probe_oversample = int(_config_value(config, "probe_oversample", 2))
+    min_valid_probe_count = int(_config_value(config, "min_valid_probe_count", 2))
+    probe_probability = float(_config_value(config, "probe_probability", 1.0))
+    probe_oversample = int(_config_value(config, "probe_oversample", 0))
+    probe_micro_batch_size = int(_config_value(config, "probe_micro_batch_size", 4))
+    probe_logprob_micro_batch_size = int(
+        _config_value(config, "probe_logprob_micro_batch_size", 4)
+    )
     max_query_tokens = int(_config_value(config, "max_query_tokens", 96))
     max_action_tokens = int(_config_value(config, "max_action_tokens", 128))
     max_probe_prompt_tokens = int(_config_value(config, "max_probe_prompt_tokens", 4096))
     max_doc_support = int(_config_value(config, "max_doc_support", 32))
     score_temperature = float(_config_value(config, "retrieval_score_temperature", 0.1))
     min_state_coverage = float(_config_value(config, "min_state_coverage", 0.0))
-    target_js = float(_config_value(config, "target_js", 0.01))
-    initial_beta = float(_config_value(config, "initial_beta", 0.1))
-    dual_lr = float(_config_value(config, "dual_lr", 0.05))
-    beta_max = float(_config_value(config, "beta_max", 10.0))
+    lambda_env = float(_config_value(config, "lambda_env", 0.1))
     log_ratio_clip = float(_config_value(config, "log_ratio_clip", 10.0))
     informative_js_threshold = float(_config_value(config, "informative_js_threshold", 0.01))
     min_informative_state_rate = float(
@@ -69,10 +139,15 @@ def validate_eitr_config(
 
     if probe_count < 2:
         raise ValueError("EITR requires probe_count >= 2")
-    if n_agent < probe_count:
+    if not 2 <= min_valid_probe_count <= probe_count:
         raise ValueError(
-            f"EITR probe_count={probe_count} requires rollout.n_agent >= {probe_count}, got {n_agent}"
+            "EITR min_valid_probe_count must be in [2, probe_count], got "
+            f"{min_valid_probe_count} for probe_count={probe_count}"
         )
+    if n_agent <= 0:
+        raise ValueError("EITR requires rollout.n_agent > 0")
+    if not 0.0 <= probe_probability <= 1.0:
+        raise ValueError("EITR probe_probability must be in [0, 1]")
     if max_queries_per_turn != 1:
         raise ValueError(
             "The Gate C estimator requires retriever.max_queries_per_turn=1"
@@ -81,28 +156,56 @@ def validate_eitr_config(
         raise ValueError("The Gate C estimator currently requires rollout.n=1")
     if probe_oversample < 0:
         raise ValueError("EITR probe_oversample must be non-negative")
-    if min(max_query_tokens, max_action_tokens, max_probe_prompt_tokens, max_doc_support) <= 0:
-        raise ValueError("EITR token limits and max_doc_support must be positive")
+    if min(probe_micro_batch_size, probe_logprob_micro_batch_size) <= 0:
+        raise ValueError("EITR probe micro-batch sizes must be positive")
+    if min(
+        max_query_tokens,
+        max_action_tokens,
+        max_probe_prompt_tokens,
+        max_doc_support,
+        probe_micro_batch_size,
+    ) <= 0:
+        raise ValueError("EITR token, support, and probe micro-batch limits must be positive")
     if max_prompt_length is not None and max_probe_prompt_tokens < int(max_prompt_length):
         raise ValueError(
             "EITR max_probe_prompt_tokens must be at least data.max_prompt_length so probe "
             "generation and probe log-prob computation use the exact same state; "
             f"got {max_probe_prompt_tokens} < {int(max_prompt_length)}"
         )
+    if (
+        rollout_max_model_len is not None
+        and max_probe_prompt_tokens + max_query_tokens > int(rollout_max_model_len)
+    ):
+        raise ValueError(
+            "EITR vLLM max_model_len must cover max_probe_prompt_tokens + "
+            "max_query_tokens; got "
+            f"{rollout_max_model_len} < {max_probe_prompt_tokens + max_query_tokens}"
+        )
+    if rollout_top_p is not None and abs(float(rollout_top_p) - 1.0) > 1e-8:
+        raise ValueError(
+            "EITR requires rollout.top_p=1.0 so sampled queries and recomputed "
+            "full-softmax log probabilities describe the same policy"
+        )
+    if rollout_top_k is not None and int(rollout_top_k) != -1:
+        raise ValueError(
+            "EITR requires rollout.top_k=-1 so query sampling is not truncated"
+        )
     if score_temperature <= 0:
         raise ValueError("EITR retrieval_score_temperature must be positive")
     if not 0.0 <= min_state_coverage <= 1.0:
         raise ValueError("EITR min_state_coverage must be in [0, 1]")
-    if target_js < 0 or initial_beta < 0 or dual_lr < 0 or beta_max < 0:
-        raise ValueError("EITR target_js, beta values, and dual_lr must be non-negative")
-    if initial_beta > beta_max:
-        raise ValueError("EITR initial_beta cannot exceed beta_max")
+    if lambda_env < 0:
+        raise ValueError("EITR lambda_env must be non-negative")
     if log_ratio_clip <= 0:
         raise ValueError("EITR log_ratio_clip must be positive")
     if informative_js_threshold < 0:
         raise ValueError("EITR informative_js_threshold must be non-negative")
     if not 0.0 <= min_informative_state_rate <= 1.0:
         raise ValueError("EITR min_informative_state_rate must be in [0, 1]")
+    if mode == "off" and bool(_config_value(config, "enabled", False)):
+        # An explicit mode is authoritative. This catches an otherwise very
+        # easy-to-miss contradictory migration override.
+        raise ValueError("EITR mode=off conflicts with legacy enabled=true")
 
 
 def validate_sibling_group_layout(uids: Sequence[Any], *, n_agent: int, world_size: int) -> None:
@@ -281,13 +384,15 @@ def _probe_diversity_metrics(
         float(diversity["top1_disagreement"].mean().item()) if valid_state_count else 0.0
     )
 
-    if min_informative_state_rate > 0 and informative_rate < min_informative_state_rate:
-        raise RuntimeError(
-            "EITR retrieval-effect diversity is too low: "
-            f"informative_rate={informative_rate:.3f} < required={min_informative_state_rate:.3f}, "
-            f"valid_states={valid_state_count}, informative_states={informative_count}, "
-            f"js_threshold={informative_js_threshold:.6f}"
-        )
+    effective_probe_counts = tensors["eitr_probe_valid"][state_valid].sum(dim=-1).float()
+    if effective_probe_counts.numel():
+        effective_probe_count_mean = float(effective_probe_counts.mean().item())
+        effective_probe_count_min = float(effective_probe_counts.min().item())
+        effective_probe_count_max = float(effective_probe_counts.max().item())
+    else:
+        effective_probe_count_mean = 0.0
+        effective_probe_count_min = 0.0
+        effective_probe_count_max = 0.0
 
     return {
         "eitr/informative_probe_state_count": float(informative_count),
@@ -297,6 +402,13 @@ def _probe_diversity_metrics(
         "eitr/probe_effect_pairwise_js_max": pairwise_js_max,
         "eitr/probe_effect_top1_disagreement_rate": top1_disagreement_rate,
         "eitr/informative_js_threshold": informative_js_threshold,
+        "eitr/informative_probe_state_rate_below_threshold": float(
+            min_informative_state_rate > 0
+            and informative_rate < min_informative_state_rate
+        ),
+        "eitr/effective_probe_count_mean": effective_probe_count_mean,
+        "eitr/effective_probe_count_min": effective_probe_count_min,
+        "eitr/effective_probe_count_max": effective_probe_count_max,
     }
 
 
@@ -352,6 +464,7 @@ def build_sibling_probe_tensors(
         )
 
     probe_count = int(_config_value(config, "probe_count", 4))
+    min_valid_probe_count = int(_config_value(config, "min_valid_probe_count", 2))
     max_action_tokens = int(_config_value(config, "max_action_tokens", 128))
     max_doc_support = int(_config_value(config, "max_doc_support", 32))
     score_temperature = float(_config_value(config, "retrieval_score_temperature", 0.1))
@@ -437,12 +550,15 @@ def build_sibling_probe_tensors(
                 rejection_counts[reason] += 1
 
     valid_state_count = 0
+    partial_state_count = 0
     support_truncation_count = 0
     for uid, group_indices in grouped_indices.items():
         selected = eligible_by_group.get(uid, [])[:probe_count]
-        if len(selected) < probe_count:
+        if len(selected) < min_valid_probe_count:
             rejection_counts["insufficient_sibling_probes"] += 1
             continue
+        if len(selected) < probe_count:
+            partial_state_count += 1
 
         doc_ids = []
         seen_doc_ids = set()
@@ -492,29 +608,33 @@ def build_sibling_probe_tensors(
             tensors["eitr_probe_old_seq_logp"][representative, probe_offset] = old_log_probs[
                 source_index, :action_length
             ].float().sum()
-            tensors["eitr_probe_doc_probs"][representative, probe_offset] = _effect_distribution(
+            effect_distribution = _effect_distribution(
                 records[source_index]["retrieval_effect"],
                 support_lookup,
                 max_doc_support,
                 score_temperature,
             )
-            tensors["eitr_probe_valid"][representative, probe_offset] = 1
+            tensors["eitr_probe_doc_probs"][representative, probe_offset] = effect_distribution
+            if effect_distribution.sum() > 0:
+                tensors["eitr_probe_valid"][representative, probe_offset] = 1
+            else:
+                tensors["eitr_probe_response_mask"][representative, probe_offset].zero_()
+                rejection_counts["empty_probe_distribution"] += 1
 
-        if torch.all(tensors["eitr_probe_doc_probs"][representative].sum(dim=-1) > 0):
+        effective_probe_count = int(tensors["eitr_probe_valid"][representative].sum().item())
+        if effective_probe_count >= min_valid_probe_count:
             tensors["eitr_state_valid"][representative] = 1
             valid_state_count += 1
         else:
             tensors["eitr_probe_valid"][representative].zero_()
-            rejection_counts["empty_probe_distribution"] += 1
+            tensors["eitr_probe_response_mask"][representative].zero_()
+            rejection_counts["insufficient_effective_sibling_probes"] += 1
+
+    if valid_state_count == 0:
+        tensors["eitr_state_slot"].zero_()
 
     total_state_count = len(grouped_indices)
     coverage = valid_state_count / total_state_count if total_state_count else 0.0
-    if min_state_coverage > 0 and coverage < min_state_coverage:
-        raise RuntimeError(
-            f"EITR probe coverage {coverage:.3f} is below required {min_state_coverage:.3f}; "
-            f"rejections={dict(rejection_counts)}"
-        )
-
     metrics = {
         "eitr/probe_state_count": float(valid_state_count),
         "eitr/probe_state_coverage": float(coverage),
@@ -523,6 +643,10 @@ def build_sibling_probe_tensors(
         ),
         "eitr/support_truncation_count": float(support_truncation_count),
         "eitr/rejected_rollout_count": float(sum(rejection_counts.values())),
+        "eitr/partial_probe_state_count": float(partial_state_count),
+        "eitr/probe_state_coverage_below_threshold": float(
+            min_state_coverage > 0 and coverage < min_state_coverage
+        ),
     }
     metrics.update(
         _probe_diversity_metrics(
@@ -544,7 +668,12 @@ def build_online_probe_tensors(
     pad_token_id: int,
     config: Any,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
-    """Build exact same-prefix online probes collected during rollout."""
+    """Build exact same-prefix online probes, one optional state per rollout row.
+
+    Every rollout row owns a fixed tensor slot, including rows without a valid
+    search.  Besides making Conditional EITR naturally mask invalid rows, this
+    keeps the number of probe forwards identical across FSDP ranks.
+    """
     batch_size, original_prompt_width = prompts.shape
     if len(uids) != batch_size or len(probe_groups) != batch_size:
         raise ValueError(
@@ -552,15 +681,12 @@ def build_online_probe_tensors(
             f"probe_groups={len(probe_groups)}"
         )
     probe_count = int(_config_value(config, "probe_count", 4))
+    min_valid_probe_count = int(_config_value(config, "min_valid_probe_count", 2))
     max_action_tokens = int(_config_value(config, "max_action_tokens", 128))
     max_prompt_tokens = int(_config_value(config, "max_probe_prompt_tokens", 4096))
     max_doc_support = int(_config_value(config, "max_doc_support", 32))
     score_temperature = float(_config_value(config, "retrieval_score_temperature", 0.1))
     min_state_coverage = float(_config_value(config, "min_state_coverage", 0.0))
-
-    grouped_indices: Dict[str, list[int]] = defaultdict(list)
-    for index, uid in enumerate(uids):
-        grouped_indices[str(uid)].append(index)
 
     available_prompt_lengths = []
     for group in probe_groups:
@@ -622,14 +748,13 @@ def build_online_probe_tensors(
 
     rejection_counts: Counter[str] = Counter()
     valid_state_count = 0
+    partial_state_count = 0
     support_truncation_count = 0
-    for group_indices in grouped_indices.values():
-        representative = group_indices[0]
+    for representative, candidate_group in enumerate(probe_groups):
+        # A physical slot exists for every row. Invalid rows retain the dummy
+        # forward below and contribute exactly zero to the loss.
         tensors["eitr_state_slot"][representative] = 1
-        group = next(
-            (probe_groups[index] for index in group_indices if isinstance(probe_groups[index], Mapping)),
-            None,
-        )
+        group = candidate_group if isinstance(candidate_group, Mapping) else None
 
         prompt_mask = attention_mask[representative, :original_prompt_width].bool()
         dummy_state_ids = prompts[representative][prompt_mask].tolist()
@@ -651,13 +776,16 @@ def build_online_probe_tensors(
         eligible_probes = [
             probe
             for probe in probes
-            if probe.get("action_token_ids")
+            if isinstance(probe, Mapping)
+            and probe.get("action_token_ids")
             and len(probe["action_token_ids"]) <= max_action_tokens
             and probe.get("retrieval_effect")
         ][:probe_count]
-        if not state_ids or len(eligible_probes) < probe_count:
+        if not state_ids or len(eligible_probes) < min_valid_probe_count:
             rejection_counts["insufficient_online_probes"] += 1
             continue
+        if len(eligible_probes) < probe_count:
+            partial_state_count += 1
 
         doc_ids = []
         seen_doc_ids = set()
@@ -688,29 +816,36 @@ def build_online_probe_tensors(
                 probe["action_token_ids"],
                 True,
             )
-            tensors["eitr_probe_doc_probs"][representative, probe_offset] = _effect_distribution(
+            effect_distribution = _effect_distribution(
                 probe["retrieval_effect"],
                 support_lookup,
                 max_doc_support,
                 score_temperature,
             )
-            tensors["eitr_probe_valid"][representative, probe_offset] = 1
+            tensors["eitr_probe_doc_probs"][representative, probe_offset] = effect_distribution
+            if effect_distribution.sum() > 0:
+                tensors["eitr_probe_valid"][representative, probe_offset] = 1
+            else:
+                tensors["eitr_probe_response_mask"][representative, probe_offset].zero_()
+                rejection_counts["empty_probe_distribution"] += 1
 
-        if torch.all(tensors["eitr_probe_doc_probs"][representative].sum(dim=-1) > 0):
+        effective_probe_count = int(tensors["eitr_probe_valid"][representative].sum().item())
+        if effective_probe_count >= min_valid_probe_count:
             tensors["eitr_state_valid"][representative] = 1
             valid_state_count += 1
         else:
             tensors["eitr_probe_valid"][representative].zero_()
             tensors["eitr_probe_response_mask"][representative].zero_()
-            rejection_counts["empty_probe_distribution"] += 1
+            rejection_counts["insufficient_effective_online_probes"] += 1
 
-    total_state_count = len(grouped_indices)
+    # With no usable state every rank can skip the probe forward entirely. If
+    # at least one state is usable, all rows remain physical slots so later DP
+    # partitioning cannot create mismatched FSDP forward counts.
+    if valid_state_count == 0:
+        tensors["eitr_state_slot"].zero_()
+
+    total_state_count = batch_size
     coverage = valid_state_count / total_state_count if total_state_count else 0.0
-    if min_state_coverage > 0 and coverage < min_state_coverage:
-        raise RuntimeError(
-            f"EITR online probe coverage {coverage:.3f} is below required {min_state_coverage:.3f}; "
-            f"rejections={dict(rejection_counts)}"
-        )
     metrics = {
         "eitr/probe_state_count": float(valid_state_count),
         "eitr/probe_state_coverage": float(coverage),
@@ -719,6 +854,10 @@ def build_online_probe_tensors(
         ),
         "eitr/support_truncation_count": float(support_truncation_count),
         "eitr/rejected_state_count": float(sum(rejection_counts.values())),
+        "eitr/partial_probe_state_count": float(partial_state_count),
+        "eitr/probe_state_coverage_below_threshold": float(
+            min_state_coverage > 0 and coverage < min_state_coverage
+        ),
         "eitr/probe_retrieval_call_count": float(
             sum(
                 int(group.get("extra_retrieval_calls", 0))
@@ -787,7 +926,22 @@ def attach_eitr_probe_tensors(
         batch.batch[key] = value
     for key, value in collector_stats.items():
         metrics[f"eitr/collector_{key}"] = float(value)
+    real_valid = float(collector_stats.get("real_search_valid", 0.0))
+    selected = float(collector_stats.get("probe_state_selected", 0.0))
+    generated = float(collector_stats.get("probe_candidate_generated", 0.0))
+    accepted = float(collector_stats.get("probe_query_accepted", 0.0))
+    effective = float(collector_stats.get("probe_state_effective", 0.0))
+    metrics.update({
+        "eitr/real_valid_search_count": real_valid,
+        "eitr/probe_selected_state_count": selected,
+        "eitr/probe_candidate_valid_rate": accepted / max(generated, 1.0),
+        "eitr/active_state_rate_given_selected": effective / max(selected, 1.0),
+        "eitr/deferred_additional_search_state_count": float(
+            collector_stats.get("additional_state_deferred", 0.0)
+        ),
+    })
     batch.meta_info.pop("eitr_probe_groups", None)
+    batch.meta_info.pop("eitr_probe_state_groups", None)
     batch.meta_info.pop("eitr_first_search_records", None)
     batch.meta_info.pop("eitr_probe_collection_stats", None)
     return batch, metrics
@@ -879,16 +1033,17 @@ def induced_js_from_cached_effects(
     )
     js = 0.5 * (old_kl + current_kl)
     ess = 1.0 / current_weights.square().sum(dim=-1).clamp_min(eps)
+    raw_log_ratio_abs = raw_log_ratio.abs()
+    valid_probe_count = mask.float().sum(dim=-1).clamp_min(1.0)
     return {
         "js": js,
         "ess": ess,
         "current_weights": current_weights,
         "old_distribution": old_distribution,
         "current_distribution": current_distribution,
-        "log_ratio_abs_max": raw_log_ratio.abs().amax(dim=-1),
-        "log_ratio_clipfrac": (raw_log_ratio.abs() > float(log_ratio_clip)).float().mean(dim=-1),
+        "log_ratio_abs_max": raw_log_ratio_abs.masked_fill(~mask, 0.0).amax(dim=-1),
+        "log_ratio_clipfrac": (
+            ((raw_log_ratio_abs > float(log_ratio_clip)) & mask).float().sum(dim=-1)
+            / valid_probe_count
+        ),
     }
-
-
-def update_dual_beta(beta: float, mean_js: float, target_js: float, dual_lr: float, beta_max: float) -> float:
-    return float(np.clip(beta + dual_lr * (mean_js - target_js), 0.0, beta_max))

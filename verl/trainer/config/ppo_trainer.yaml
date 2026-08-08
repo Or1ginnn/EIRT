@@ -36,12 +36,23 @@ actor_rollout_ref:
     use_kl_loss: False # True for GRPO
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
-    # Environment-induced trust region (Gate C). Disabled means exact legacy path.
+    # Conditional environment-induced trust region. ``off`` preserves the
+    # ordinary PPO/GRPO path; null mode falls back to the legacy enabled flag.
     eitr:
       enabled: False
+      mode: null  # off | probe_only | eitr
       probe_source: online_same_state
+      probe_probability: 1.0
       probe_count: 4
-      probe_oversample: 2
+      # A valid state needs the real query plus at least one valid probe. Failed
+      # extra probes lower K_eff; they never terminate the GRPO update.
+      min_valid_probe_count: 2
+      # Do not condition samples on format validity by retrying until K is full.
+      probe_oversample: 0
+      # Bound both candidate re-scoring forwards. These count flattened probe
+      # sequences, not rollout states.
+      probe_micro_batch_size: 4
+      probe_logprob_micro_batch_size: 4
       max_query_tokens: 96
       probe_seed: 20260805
       max_action_tokens: 128
@@ -51,16 +62,18 @@ actor_rollout_ref:
       max_doc_support: 32
       retrieval_score_temperature: 0.1
       require_empty_prefix: False
+      # Diagnostic thresholds only; falling below them is logged and never
+      # aborts GRPO or forces EITR activation.
       min_state_coverage: 0.0
-      # Coverage only says probes exist. These fields check that their real
-      # retrieval distributions actually diverge enough to provide EITR signal.
       informative_js_threshold: 0.01
       min_informative_state_rate: 0.0
-      target_js: 0.01
-      initial_beta: 0.1
-      dual_lr: 0.05
-      beta_max: 10.0
+      # GRPO runs actor.ppo_epochs ordinary passes first. EITR then runs a
+      # separate correction-only pass; probe_only re-scores without a backward.
+      correction_passes: 1
+      lambda_env: 0.1
       log_ratio_clip: 10.0
+    # Number of ordinary GRPO passes. EITR correction_passes are separate and
+    # therefore do not give EITR an extra reward-bearing policy update.
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
@@ -96,6 +109,9 @@ actor_rollout_ref:
     top_p: 0.95
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
+    # Optional engine context override. Conditional EITR sets this large enough
+    # for an exact rolling search state plus its query-only continuation.
+    max_model_len: null
     # for vllm rollout
     dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5

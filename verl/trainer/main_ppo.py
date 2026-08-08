@@ -19,6 +19,7 @@ from verl import DataProto
 import torch
 from verl.utils.reward_score import qa_em
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+import os
 import re
 import numpy as np
 
@@ -105,7 +106,21 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray_init_kwargs = {
+            'runtime_env': {
+                'env_vars': {
+                    'TOKENIZERS_PARALLELISM': 'true',
+                    'NCCL_DEBUG': 'WARN',
+                }
+            }
+        }
+        ray_tmpdir = os.environ.get('RAY_TMPDIR')
+        if ray_tmpdir:
+            # The Phase-2 server launcher points this at the data disk. Passing
+            # it explicitly prevents Ray session logs/object spill metadata from
+            # silently falling back to /tmp or the system disk.
+            ray_init_kwargs['_temp_dir'] = ray_tmpdir
+        ray.init(**ray_init_kwargs)
 
     ray.get(main_task.remote(config))
 

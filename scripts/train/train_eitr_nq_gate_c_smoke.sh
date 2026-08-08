@@ -1,20 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Defaults target the current A800 pilot server and intentionally leave GPU 0 unused.
+# Phase-2 Conditional EITR smoke. Defaults target the A800 data disk and leave
+# GPU 0 untouched.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
 export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.99}"
 
 NUM_GPUS="${NUM_GPUS:-2}"
-DATA_DIR="${DATA_DIR:-data/nq_search}"
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-3B}"
+STORAGE_ROOT="${STORAGE_ROOT:-/mnt/data1/zar/eitr_storage}"
+STORAGE_ROOT="$(realpath -m "$STORAGE_ROOT")"
+ALLOW_NON_DATA_DISK="${ALLOW_NON_DATA_DISK:-false}"
+case "$STORAGE_ROOT" in
+    /mnt/data1/zar|/mnt/data1/zar/*) ;;
+    *)
+        if [[ "$ALLOW_NON_DATA_DISK" != "true" ]]; then
+            echo "STORAGE_ROOT must stay on /mnt/data1/zar; got: $STORAGE_ROOT" >&2
+            exit 2
+        fi
+        ;;
+esac
+DATA_DIR="${DATA_DIR:-$STORAGE_ROOT/data/nq_search}"
+BASE_MODEL="${BASE_MODEL:-$STORAGE_ROOT/models/Qwen2.5-3B}"
 RETRIEVER_URL="${RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}"
-EITR_ENABLED="${EITR_ENABLED:-true}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-gate-c-smoke}"
+if [[ -z "${EITR_MODE+x}" && -n "${EITR_ENABLED+x}" ]]; then
+    if [[ "$EITR_ENABLED" == "true" ]]; then
+        EITR_MODE="eitr"
+    else
+        EITR_MODE="off"
+    fi
+fi
+EITR_MODE="${EITR_MODE:-eitr}"
+EITR_PROBE_PROBABILITY="${EITR_PROBE_PROBABILITY:-1.0}"
+EITR_PROBE_COUNT="${EITR_PROBE_COUNT:-4}"
+EITR_MIN_VALID_PROBE_COUNT="${EITR_MIN_VALID_PROBE_COUNT:-2}"
+EITR_LAMBDA_ENV="${EITR_LAMBDA_ENV:-0.1}"
+EITR_CORRECTION_PASSES="${EITR_CORRECTION_PASSES:-1}"
+EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"
+EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"
+EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-96}"
+PPO_EPOCHS="${PPO_EPOCHS:-1}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-smoke}"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
-TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-11}"
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-20}"
 TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-32}"
 VAL_DATA_NUM="${VAL_DATA_NUM:-64}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
@@ -22,22 +51,35 @@ VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
-MAX_PROBE_PROMPT_TOKENS="${MAX_PROBE_PROMPT_TOKENS:-$MAX_PROMPT_LENGTH}"
+MAX_PROBE_PROMPT_TOKENS="${MAX_PROBE_PROMPT_TOKENS:-$((MAX_PROMPT_LENGTH + 512))}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((MAX_PROBE_PROMPT_TOKENS + EITR_MAX_QUERY_TOKENS))}"
 INFORMATIVE_JS_THRESHOLD="${INFORMATIVE_JS_THRESHOLD:-0.01}"
-MIN_INFORMATIVE_STATE_RATE="${MIN_INFORMATIVE_STATE_RATE:-0.1}"
 SAVE_FREQ="${SAVE_FREQ:--1}"
 TEST_FREQ="${TEST_FREQ:-5}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
 
-case "$BASE_MODEL" in
-    *parallel_search*|*parallel-search*|*finance*)
-        echo "Gate C requires a clean single-query Search-R1 initialization, got: $BASE_MODEL" >&2
+case "$EITR_MODE" in
+    off|probe_only|eitr) ;;
+    *)
+        echo "EITR_MODE must be one of: off, probe_only, eitr; got: $EITR_MODE" >&2
         exit 2
         ;;
 esac
 
+case "$BASE_MODEL" in
+    *parallel_search*|*parallel-search*|*finance*)
+        echo "Phase 2 requires a clean single-query Search-R1 initialization, got: $BASE_MODEL" >&2
+        exit 2
+        ;;
+esac
+
+if [[ ! -e "$BASE_MODEL" ]]; then
+    echo "Phase 2 model path does not exist: $BASE_MODEL" >&2
+    exit 2
+fi
+
 if [[ ! -f "$DATA_DIR/train.parquet" || ! -f "$DATA_DIR/test.parquet" ]]; then
-    echo "Gate C requires $DATA_DIR/train.parquet and $DATA_DIR/test.parquet" >&2
+    echo "Phase 2 requires $DATA_DIR/train.parquet and $DATA_DIR/test.parquet" >&2
     exit 2
 fi
 
@@ -46,17 +88,91 @@ if (( MAX_PROBE_PROMPT_TOKENS < MAX_PROMPT_LENGTH )); then
     exit 2
 fi
 
+if (( VLLM_MAX_MODEL_LEN < MAX_PROBE_PROMPT_TOKENS + EITR_MAX_QUERY_TOKENS )); then
+    echo "VLLM_MAX_MODEL_LEN must cover exact probe state + query continuation" >&2
+    exit 2
+fi
+if (( VLLM_MAX_MODEL_LEN < MAX_PROMPT_LENGTH + 500 )); then
+    echo "VLLM_MAX_MODEL_LEN must cover the ordinary rollout prompt + response" >&2
+    exit 2
+fi
+
+export RAY_TMPDIR="${RAY_TMPDIR:-$STORAGE_ROOT/ray_tmp/$EXPERIMENT_NAME}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$STORAGE_ROOT/checkpoints/$EXPERIMENT_NAME}"
+LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
+HYDRA_RUN_DIR="${HYDRA_RUN_DIR:-$STORAGE_ROOT/hydra/$EXPERIMENT_NAME}"
+export HF_HOME="${HF_HOME:-$STORAGE_ROOT/cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$STORAGE_ROOT/cache/xdg}"
+export TORCH_HOME="${TORCH_HOME:-$STORAGE_ROOT/cache/torch}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$STORAGE_ROOT/cache/torch_extensions}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$STORAGE_ROOT/cache/triton}"
+export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$STORAGE_ROOT/cache/cuda}"
+export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-$STORAGE_ROOT/cache/numba}"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$STORAGE_ROOT/cache/pycache}"
+export WANDB_DIR="${WANDB_DIR:-$STORAGE_ROOT/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$STORAGE_ROOT/cache/wandb}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-$STORAGE_ROOT/wandb/config}"
+export WANDB_DATA_DIR="${WANDB_DATA_DIR:-$STORAGE_ROOT/wandb/data}"
+export TMPDIR="${TMPDIR:-$STORAGE_ROOT/tmp}"
+
+for writable_path in \
+    "$RAY_TMPDIR" \
+    "$CHECKPOINT_DIR" \
+    "$LOG_DIR" \
+    "$HYDRA_RUN_DIR" \
+    "$HF_HOME" \
+    "$TRANSFORMERS_CACHE" \
+    "$XDG_CACHE_HOME" \
+    "$TORCH_HOME" \
+    "$TORCH_EXTENSIONS_DIR" \
+    "$TRITON_CACHE_DIR" \
+    "$CUDA_CACHE_PATH" \
+    "$NUMBA_CACHE_DIR" \
+    "$PYTHONPYCACHEPREFIX" \
+    "$WANDB_DIR" \
+    "$WANDB_CACHE_DIR" \
+    "$WANDB_CONFIG_DIR" \
+    "$WANDB_DATA_DIR" \
+    "$TMPDIR"; do
+    resolved_writable_path="$(realpath -m "$writable_path")"
+    case "$resolved_writable_path" in
+        "$STORAGE_ROOT"|"$STORAGE_ROOT"/*) ;;
+        *)
+            echo "Refusing writable path outside STORAGE_ROOT=$STORAGE_ROOT: $resolved_writable_path" >&2
+            exit 2
+            ;;
+    esac
+done
+
+mkdir -p \
+    "$RAY_TMPDIR" \
+    "$CHECKPOINT_DIR" \
+    "$LOG_DIR" \
+    "$HYDRA_RUN_DIR" \
+    "$HF_HOME" \
+    "$TRANSFORMERS_CACHE" \
+    "$XDG_CACHE_HOME" \
+    "$TORCH_HOME" \
+    "$TORCH_EXTENSIONS_DIR" \
+    "$TRITON_CACHE_DIR" \
+    "$CUDA_CACHE_PATH" \
+    "$NUMBA_CACHE_DIR" \
+    "$PYTHONPYCACHEPREFIX" \
+    "$WANDB_DIR" \
+    "$WANDB_CACHE_DIR" \
+    "$WANDB_CONFIG_DIR" \
+    "$WANDB_DATA_DIR" \
+    "$TMPDIR"
+
 if [[ "$CHECK_ONLY" == "true" ]]; then
     curl --fail --silent --show-error \
         --header 'Content-Type: application/json' \
         --data '{"queries":["who wrote Hamlet"],"topk":3,"return_scores":true}' \
         "$RETRIEVER_URL" >/dev/null
-    echo "Gate C preflight passed: data files, clean model path, prompt limit, and retriever are ready."
+    echo "Phase 2 preflight passed: data, model, data-disk write paths, exact-state limit, and retriever are ready."
     exit 0
 fi
-
-RAY_TMPDIR="${RAY_TMPDIR:-ray_tmp/eitr_gate_c_smoke}"
-mkdir -p "$RAY_TMPDIR"
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files="$DATA_DIR/train.parquet" \
@@ -86,30 +202,36 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=false \
     actor_rollout_ref.actor.fsdp_config.grad_offload=false \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
-    actor_rollout_ref.actor.eitr.enabled="$EITR_ENABLED" \
+    actor_rollout_ref.actor.eitr.mode="$EITR_MODE" \
     actor_rollout_ref.actor.eitr.probe_source=online_same_state \
-    actor_rollout_ref.actor.eitr.probe_count=4 \
-    actor_rollout_ref.actor.eitr.probe_oversample=2 \
-    actor_rollout_ref.actor.eitr.max_query_tokens=96 \
+    actor_rollout_ref.actor.eitr.probe_probability="$EITR_PROBE_PROBABILITY" \
+    actor_rollout_ref.actor.eitr.probe_count="$EITR_PROBE_COUNT" \
+    actor_rollout_ref.actor.eitr.min_valid_probe_count="$EITR_MIN_VALID_PROBE_COUNT" \
+    actor_rollout_ref.actor.eitr.probe_oversample=0 \
+    actor_rollout_ref.actor.eitr.probe_micro_batch_size="$EITR_PROBE_MICRO_BATCH_SIZE" \
+    actor_rollout_ref.actor.eitr.probe_logprob_micro_batch_size="$EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE" \
+    actor_rollout_ref.actor.eitr.max_query_tokens="$EITR_MAX_QUERY_TOKENS" \
     actor_rollout_ref.actor.eitr.probe_seed=20260805 \
     actor_rollout_ref.actor.eitr.max_action_tokens=128 \
     actor_rollout_ref.actor.eitr.max_probe_prompt_tokens="$MAX_PROBE_PROMPT_TOKENS" \
     actor_rollout_ref.actor.eitr.retrieval_score_temperature=0.1 \
-    actor_rollout_ref.actor.eitr.min_state_coverage=0.5 \
+    actor_rollout_ref.actor.eitr.min_state_coverage=0.0 \
     actor_rollout_ref.actor.eitr.informative_js_threshold="$INFORMATIVE_JS_THRESHOLD" \
-    actor_rollout_ref.actor.eitr.min_informative_state_rate="$MIN_INFORMATIVE_STATE_RATE" \
-    actor_rollout_ref.actor.eitr.target_js=0.01 \
-    actor_rollout_ref.actor.eitr.initial_beta=0.1 \
-    actor_rollout_ref.actor.eitr.dual_lr=0.05 \
-    actor_rollout_ref.actor.eitr.beta_max=10.0 \
+    actor_rollout_ref.actor.eitr.min_informative_state_rate=0.0 \
+    actor_rollout_ref.actor.eitr.correction_passes="$EITR_CORRECTION_PASSES" \
+    actor_rollout_ref.actor.eitr.lambda_env="$EITR_LAMBDA_ENV" \
     actor_rollout_ref.actor.eitr.log_ratio_clip=10.0 \
+    actor_rollout_ref.actor.ppo_epochs="$PPO_EPOCHS" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.max_model_len="$VLLM_MAX_MODEL_LEN" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.n_agent=5 \
     actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=false \
     trainer.logger="['wandb']" \
@@ -124,8 +246,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.project_name="$WANDB_PROJECT" \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.default_hdfs_dir=null \
-    trainer.default_local_dir="verl_checkpoints/$EXPERIMENT_NAME" \
+    trainer.default_local_dir="$CHECKPOINT_DIR" \
+    hydra.run.dir="$HYDRA_RUN_DIR" \
+    hydra.job.chdir=false \
     max_turns=4 \
     retriever.url="$RETRIEVER_URL" \
     retriever.topk=3 \
-    2>&1 | tee "$EXPERIMENT_NAME.log"
+    2>&1 | tee "$LOG_DIR/$EXPERIMENT_NAME.log"

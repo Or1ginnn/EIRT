@@ -1,5 +1,6 @@
 import torch
 import re
+import random
 from collections import Counter, defaultdict
 import os
 from typing import List, Dict, Any, Optional, Tuple
@@ -22,10 +23,17 @@ class GenerationConfig:
     search_url: str = None
     topk: int = 3
     collect_eitr_probes: bool = False
+    # Probability of probing a *valid* real search state. Phase 2 uses 1.0 so
+    # scarce search states are never discarded. ``eitr_probe_count`` is the
+    # target total K and includes the real query.
+    eitr_probe_probability: float = 1.0
     eitr_probe_count: int = 4
     eitr_n_agent: int = 1
-    eitr_probe_oversample: int = 2
+    # Default zero keeps the K samples unconditional: an invalid extra sample
+    # lowers K_eff instead of being silently replaced by a later draw.
+    eitr_probe_oversample: int = 0
     eitr_max_query_tokens: int = 96
+    eitr_max_probe_prompt_tokens: int = 4096
     eitr_probe_seed: int = 20260805
 
 class LLMGenerationManager:
@@ -41,6 +49,8 @@ class LLMGenerationManager:
         self.config = config
         self.is_validation = is_validation
         self._eitr_probe_call_index = 0
+        self._eitr_rollout_call_index = 0
+        self._eitr_current_rollout_index = 0
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -238,6 +248,8 @@ class LLMGenerationManager:
         valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
+        self._eitr_current_rollout_index = self._eitr_rollout_call_index
+        self._eitr_rollout_call_index += 1
         self._eitr_first_search_records = (
             [None] * gen_batch.batch['input_ids'].shape[0]
             if self.config.collect_eitr_probes
@@ -245,6 +257,30 @@ class LLMGenerationManager:
         )
         self._eitr_probe_groups = (
             [None] * gen_batch.batch['input_ids'].shape[0]
+            if self.config.collect_eitr_probes
+            else None
+        )
+        # ``eitr_probe_groups`` remains a batch-aligned compatibility view
+        # containing at most the first collected state for each real rollout.
+        # The flat list is the lossless Phase-2 representation and can contain
+        # every valid search turn from every real trajectory.
+        self._eitr_probe_state_groups = (
+            []
+            if self.config.collect_eitr_probes
+            else None
+        )
+        self._eitr_current_search_records = (
+            {}
+            if self.config.collect_eitr_probes
+            else None
+        )
+        self._eitr_primary_search_seen = (
+            [False] * gen_batch.batch['input_ids'].shape[0]
+            if self.config.collect_eitr_probes
+            else None
+        )
+        self._eitr_pending_probe_groups = (
+            []
             if self.config.collect_eitr_probes
             else None
         )
@@ -266,26 +302,34 @@ class LLMGenerationManager:
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            })
+            active_indices = torch.nonzero(active_mask, as_tuple=False).flatten().tolist()
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
-            meta_info = gen_output.meta_info            
+            meta_info = gen_output.meta_info
             raw_responses_ids = (
                 gen_output.batch['responses'].detach().cpu()
-                if self.config.collect_eitr_probes and step == 0
+                if self.config.collect_eitr_probes
                 else None
             )
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # Execute in environment and process observations
+            if self.config.collect_eitr_probes:
+                self._eitr_current_search_records = {}
             next_obs, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask
+                responses_str,
+                self.tokenizer.pad_token,
+                active_mask,
+                turn_index=step,
             )
-            if self.config.collect_eitr_probes and step == 0:
+            if self.config.collect_eitr_probes:
                 self._collect_eitr_same_state_probes(
                     rollings=rollings,
                     raw_responses_ids=raw_responses_ids,
+                    active_indices=active_indices,
+                    turn_index=step,
                 )
             
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
@@ -342,6 +386,12 @@ class LLMGenerationManager:
                 original_right_side,
                 responses_ids,
             )
+
+        # Counterfactual generation is deliberately delayed until every real
+        # turn (including the final answer turn) has finished. Probe requests
+        # therefore cannot consume RNG between two real trajectory turns.
+        if self.config.collect_eitr_probes:
+            self._finalize_eitr_same_state_probes()
         
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
@@ -350,6 +400,7 @@ class LLMGenerationManager:
         if self.config.collect_eitr_probes:
             meta_info['eitr_first_search_records'] = self._eitr_first_search_records
             meta_info['eitr_probe_groups'] = self._eitr_probe_groups
+            meta_info['eitr_probe_state_groups'] = self._eitr_probe_state_groups
             meta_info['eitr_probe_collection_stats'] = dict(
                 self._eitr_probe_collection_stats or {}
             )
@@ -390,7 +441,14 @@ class LLMGenerationManager:
         
         return final_output
 
-    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
+    def execute_predictions(
+        self,
+        predictions: List[str],
+        pad_token: str,
+        active_mask=None,
+        do_search=True,
+        turn_index: Optional[int] = None,
+    ) -> List[str]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -434,8 +492,9 @@ class LLMGenerationManager:
                             f'\n\n<information>{self._passages2string(retrieval_result).strip()}</information>\n\n'
                         )
                         if self.config.collect_eitr_probes:
-                            self._record_eitr_first_search(
+                            self._record_eitr_search(
                                 index=i,
+                                turn_index=turn_index,
                                 prediction=predictions[i],
                                 query=contents[i],
                                 retrieval_result=retrieval_result,
@@ -457,6 +516,55 @@ If I want to give the final answer, I should put the answer between <answer> and
             
         return next_obs, dones, valid_action, is_search
 
+    def _record_eitr_search(
+        self,
+        index: int,
+        turn_index: Optional[int],
+        prediction: str,
+        query: str,
+        retrieval_result: List[Dict[str, Any]],
+    ) -> None:
+        """Cache one complete, non-empty real search action.
+
+        The real environment path has already accepted this action. EITR adds a
+        stricter conditional mask: an opening tag alone or an empty closed
+        query is not a valid query-policy state and is never probed.
+        """
+        first_records = getattr(self, '_eitr_first_search_records', None)
+        current_records = getattr(self, '_eitr_current_search_records', None)
+        if first_records is None or current_records is None:
+            return
+        match = re.search(r'<search>(.*?)</search>', prediction, re.DOTALL)
+        if match is None:
+            self._eitr_probe_collection_stats['real_search_missing_close_tag'] += 1
+            return
+        normalized_query = ' '.join(query.strip().split())
+        matched_query = ' '.join(match.group(1).strip().split())
+        if not normalized_query or not matched_query:
+            self._eitr_probe_collection_stats['real_search_empty_query'] += 1
+            return
+        action_text = prediction[:match.end()]
+        action_token_ids = self.tokenizer(
+            action_text,
+            add_special_tokens=False,
+        )['input_ids']
+        record = {
+            'queries': [normalized_query],
+            'source_index': int(index),
+            'turn_index': int(turn_index) if turn_index is not None else 0,
+            'prefix_text': prediction[:match.start()],
+            'search_open_text': prediction[:match.start(1)],
+            'action_text': action_text,
+            'action_token_ids': list(action_token_ids),
+            'retrieval_effect': self._compact_retrieval_effect(retrieval_result),
+        }
+        current_records[index] = record
+        if first_records[index] is None:
+            first_records[index] = record
+        stats = self._eitr_probe_collection_stats
+        stats['real_search_valid'] += 1
+        stats[f'real_search_valid_turn_{record["turn_index"]}'] += 1
+
     def _record_eitr_first_search(
         self,
         index: int,
@@ -464,26 +572,14 @@ If I want to give the final answer, I should put the answer between <answer> and
         query: str,
         retrieval_result: List[Dict[str, Any]],
     ) -> None:
-        """Cache a compact first-search record for Gate C probe estimation."""
-        records = getattr(self, '_eitr_first_search_records', None)
-        if records is None or records[index] is not None:
-            return
-        match = re.search(r'<search>(.*?)</search>', prediction, re.DOTALL)
-        if match is None:
-            return
-        action_text = prediction[:match.end()]
-        action_token_ids = self.tokenizer(
-            action_text,
-            add_special_tokens=False,
-        )['input_ids']
-        records[index] = {
-            'queries': [query],
-            'prefix_text': prediction[:match.start()],
-            'search_open_text': prediction[:match.start(1)],
-            'action_text': action_text,
-            'action_token_ids': list(action_token_ids),
-            'retrieval_effect': self._compact_retrieval_effect(retrieval_result),
-        }
+        """Backward-compatible wrapper used by early Gate-C integrations."""
+        self._record_eitr_search(
+            index=index,
+            turn_index=0,
+            prediction=prediction,
+            query=query,
+            retrieval_result=retrieval_result,
+        )
 
     @staticmethod
     def _find_token_subsequence(values: List[int], pattern: List[int]) -> int:
@@ -530,70 +626,188 @@ If I want to give the final answer, I should put the answer between <answer> and
                 return open_end, token_end
         return None
 
+    def _should_probe_eitr_state(self, source_index: int, turn_index: int) -> bool:
+        """Make a reproducible Bernoulli decision for one valid search state."""
+        probability = float(getattr(self.config, 'eitr_probe_probability', 1.0))
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                f'eitr_probe_probability must be in [0, 1], got {probability}'
+            )
+        if probability <= 0.0:
+            return False
+        if probability >= 1.0:
+            return True
+        seed = int(getattr(self.config, 'eitr_probe_seed', 20260805))
+        rollout_index = int(getattr(self, '_eitr_current_rollout_index', 0))
+        state_seed = f'{seed}:{rollout_index}:{int(turn_index)}:{int(source_index)}'
+        return random.Random(state_seed).random() < probability
+
+    def _parse_eitr_probe_response(
+        self,
+        response_tokens: List[int],
+    ) -> Tuple[Optional[str], Optional[List[int]], Optional[str]]:
+        """Parse a query continuation using decoded closing-tag detection.
+
+        Looking for tokenized ``</search>`` in isolation is unsafe for
+        context-sensitive tokenizers. Progressive decoding also gives the exact
+        generated token boundary needed by the later teacher-forced log-prob
+        computation.
+        """
+        close_end = None
+        decoded_action = None
+        for token_end in range(1, len(response_tokens) + 1):
+            decoded_prefix = self.tokenizer.decode(
+                response_tokens[:token_end],
+                skip_special_tokens=True,
+            )
+            if '</search>' in decoded_prefix:
+                close_end = token_end
+                decoded_action = decoded_prefix
+                break
+        if close_end is None or decoded_action is None:
+            return None, None, 'missing_close_tag'
+
+        query_text = decoded_action.split('</search>', 1)[0]
+        query = ' '.join(query_text.strip().split())
+        if not query:
+            return None, None, 'empty_query'
+        if '||' in query or '<' in query or '>' in query:
+            return None, None, 'invalid_query_text'
+        return query, response_tokens[:close_end], None
+
+    def _register_compat_eitr_group(self, group: Dict[str, Any]) -> None:
+        """Expose one primary state per rollout through the legacy field."""
+        compatibility_groups = getattr(self, '_eitr_probe_groups', None)
+        if compatibility_groups is None:
+            return
+        source_index = int(group['source_index'])
+        if not 0 <= source_index < len(compatibility_groups):
+            return
+        current = compatibility_groups[source_index]
+        if (
+            not isinstance(current, dict)
+            or int(group.get('effective_probe_count', 0))
+            > int(current.get('effective_probe_count', 0))
+        ):
+            compatibility_groups[source_index] = group
+
     def _collect_eitr_same_state_probes(
         self,
         rollings: DataProto,
         raw_responses_ids: torch.Tensor,
+        active_indices: Optional[List[int]] = None,
+        turn_index: int = 0,
     ) -> None:
-        """Sample query-only probes from an identical prefix ending at <search>."""
+        """Cache the selected same-state prefix without running a probe yet.
+
+        The real rollout is never modified. A selected state always retains its
+        real query. Counterfactual generation and retrieval happen only in the
+        post-rollout finalizer, where malformed probes lower the effective K.
+        """
         if self._eitr_probe_groups is None:
             return
         stats = self._eitr_probe_collection_stats
-        probe_count = int(self.config.eitr_probe_count)
-        candidates_per_state = max(
-            probe_count - 1 + int(self.config.eitr_probe_oversample),
-            probe_count - 1,
-        )
+        probe_count = max(int(self.config.eitr_probe_count), 1)
         n_agent = int(self.config.eitr_n_agent)
-        batch_size = raw_responses_ids.size(0)
-        if n_agent <= 0 or batch_size % n_agent != 0:
+        if n_agent <= 0:
             raise ValueError(
-                f'EITR expected rollout batch divisible by n_agent={n_agent}, got {batch_size}'
+                f'EITR expected positive n_agent, got {n_agent}'
             )
 
-        close_tag_ids = self.tokenizer('</search>', add_special_tokens=False)['input_ids']
-        state_groups = []
-        for group_start in range(0, batch_size, n_agent):
-            stats['state_group_total'] += 1
-            source_index = None
-            normal_action_ids = None
-            state_prompt_ids = None
-            for candidate_index in range(group_start, group_start + n_agent):
-                record = self._eitr_first_search_records[candidate_index]
-                if not record:
-                    stats['candidate_missing_first_search'] += 1
-                    continue
-                if len(record.get('queries') or []) != 1:
-                    stats['candidate_not_single_query'] += 1
-                    continue
-                if not record.get('retrieval_effect'):
-                    stats['candidate_empty_retrieval_effect'] += 1
-                    continue
-                generated_ids = raw_responses_ids[candidate_index].tolist()
-                boundaries = self._locate_search_token_boundaries(generated_ids, record)
-                if boundaries is None:
-                    stats['candidate_search_boundary_not_found'] += 1
-                    continue
-                open_end, close_end = boundaries
-                continuation_ids = generated_ids[open_end:close_end]
-                if not continuation_ids:
-                    stats['candidate_empty_query_action'] += 1
-                    continue
-                prompt_mask = rollings.batch['attention_mask'][candidate_index].bool()
-                base_prompt_ids = rollings.batch['input_ids'][candidate_index][prompt_mask].tolist()
-                fixed_prefix_ids = generated_ids[:open_end]
-                source_index = candidate_index
-                normal_action_ids = continuation_ids
-                state_prompt_ids = (base_prompt_ids + fixed_prefix_ids)[-self.config.max_prompt_length:]
-                break
+        if active_indices is None:
+            active_indices = list(range(raw_responses_ids.size(0)))
+        if len(active_indices) != raw_responses_ids.size(0):
+            raise ValueError(
+                'EITR active-index mapping must align with generated responses: '
+                f'{len(active_indices)} != {raw_responses_ids.size(0)}'
+            )
 
-            if source_index is None:
+        current_records = getattr(self, '_eitr_current_search_records', None)
+        if not isinstance(current_records, dict):
+            # Compatibility with the original first-search collector unit test.
+            first_records = getattr(self, '_eitr_first_search_records', None) or []
+            current_records = {
+                index: first_records[index]
+                for index in active_indices
+                if index < len(first_records) and first_records[index]
+            }
+
+        flat_groups = getattr(self, '_eitr_probe_state_groups', None)
+        if flat_groups is None:
+            flat_groups = []
+            self._eitr_probe_state_groups = flat_groups
+        primary_seen = getattr(self, '_eitr_primary_search_seen', None)
+        if primary_seen is None:
+            primary_seen = [False] * len(self._eitr_probe_groups)
+            self._eitr_primary_search_seen = primary_seen
+
+        state_groups: List[Dict[str, Any]] = []
+        response_by_source = {
+            source_index: raw_responses_ids[local_index].tolist()
+            for local_index, source_index in enumerate(active_indices)
+        }
+        for source_index in active_indices:
+            record = current_records.get(source_index)
+            if not record:
+                continue
+            stats['state_group_total'] += 1
+            state_turn = int(record.get('turn_index', turn_index))
+            is_additional_state = bool(primary_seen[source_index])
+            if len(record.get('queries') or []) != 1:
+                stats['candidate_not_single_query'] += 1
                 stats['state_group_rejected'] += 1
                 continue
-            record = self._eitr_first_search_records[source_index]
+            if not record.get('retrieval_effect'):
+                stats['candidate_empty_retrieval_effect'] += 1
+                stats['state_group_rejected'] += 1
+                continue
+
+            generated_ids = response_by_source[source_index]
+            boundaries = self._locate_search_token_boundaries(generated_ids, record)
+            if boundaries is None:
+                stats['candidate_search_boundary_not_found'] += 1
+                stats['state_group_rejected'] += 1
+                continue
+            open_end, close_end = boundaries
+            normal_action_ids = generated_ids[open_end:close_end]
+            if not normal_action_ids:
+                stats['candidate_empty_query_action'] += 1
+                stats['state_group_rejected'] += 1
+                continue
+            prompt_mask = rollings.batch['attention_mask'][source_index].bool()
+            base_prompt_ids = rollings.batch['input_ids'][source_index][prompt_mask].tolist()
+            fixed_prefix_ids = generated_ids[:open_end]
+            state_prompt_ids = base_prompt_ids + fixed_prefix_ids
+            max_probe_prompt_tokens = int(
+                getattr(
+                    self.config,
+                    'eitr_max_probe_prompt_tokens',
+                    self.config.max_prompt_length,
+                )
+            )
+            if len(state_prompt_ids) > max_probe_prompt_tokens:
+                # The real query was sampled under the full prefix. Silently
+                # shortening it would make probe generation and later scoring
+                # condition on a different state.
+                stats['state_prompt_too_long'] += 1
+                stats['state_group_rejected'] += 1
+                continue
+            if not is_additional_state:
+                # Consume the rollout's one Phase-2 probe opportunity only
+                # after a usable exact state has actually been constructed.
+                # An empty retrieval or an unlocatable boundary on an earlier
+                # turn must not prevent a later valid search from being used.
+                primary_seen[source_index] = True
+            group_start = source_index - (source_index % n_agent)
             group = {
+                'state_id': f'{source_index}:{state_turn}',
                 'state_prompt_token_ids': state_prompt_ids,
                 'source_index': source_index,
+                'turn_index': state_turn,
+                'group_start': group_start,
+                'target_probe_count': probe_count,
+                'selected_for_probe': False,
+                'deferred': is_additional_state,
                 'extra_retrieval_calls': 0,
                 'probes': [{
                     'query': record['queries'][0],
@@ -601,86 +815,145 @@ If I want to give the final answer, I should put the answer between <answer> and
                     'retrieval_effect': record['retrieval_effect'],
                 }],
             }
-            self._eitr_probe_groups[group_start] = group
-            state_groups.append((group_start, group))
+            flat_groups.append(group)
+            if is_additional_state:
+                group['effective_probe_count'] = 1
+                group['eitr_eligible'] = False
+                stats['additional_state_deferred'] += 1
+                continue
+            if not self._should_probe_eitr_state(source_index, state_turn):
+                group['effective_probe_count'] = 1
+                group['eitr_eligible'] = False
+                stats['probe_state_not_selected'] += 1
+                self._register_compat_eitr_group(group)
+                continue
+            group['selected_for_probe'] = True
+            stats['probe_state_selected'] += 1
+            state_groups.append(group)
             stats['state_group_collected'] += 1
 
-        if not state_groups or candidates_per_state <= 0:
+        if not state_groups:
+            return
+        if probe_count <= 1:
+            for group in state_groups:
+                group['effective_probe_count'] = len(group['probes'])
+                group['eitr_eligible'] = len(group['probes']) >= 2
+                if group['eitr_eligible']:
+                    stats['probe_state_effective'] += 1
+                else:
+                    stats['probe_state_insufficient'] += 1
+                self._register_compat_eitr_group(group)
             return
 
-        repeated_state_ids = []
-        candidate_owners = []
-        for group_start, group in state_groups:
-            for _ in range(candidates_per_state):
-                repeated_state_ids.append(group['state_prompt_token_ids'])
-                candidate_owners.append(group_start)
+        pending_groups = getattr(self, '_eitr_pending_probe_groups', None)
+        if pending_groups is None:
+            pending_groups = []
+            self._eitr_pending_probe_groups = pending_groups
+        pending_groups.extend(state_groups)
 
-        max_state_length = max(len(item) for item in repeated_state_ids)
-        probe_input_ids = torch.full(
-            (len(repeated_state_ids), max_state_length),
-            self.tokenizer.pad_token_id,
-            dtype=torch.long,
+    def _finalize_eitr_same_state_probes(self) -> None:
+        """Generate and retrieve all cached probes after the real rollout ends."""
+        state_groups = list(getattr(self, '_eitr_pending_probe_groups', None) or [])
+        self._eitr_pending_probe_groups = []
+        if not state_groups:
+            return
+
+        stats = self._eitr_probe_collection_stats
+        probe_count = max(int(self.config.eitr_probe_count), 1)
+        candidates_per_state = max(
+            probe_count - 1 + int(self.config.eitr_probe_oversample),
+            probe_count - 1,
         )
-        probe_attention_mask = torch.zeros_like(probe_input_ids)
-        for index, token_ids in enumerate(repeated_state_ids):
-            length = len(token_ids)
-            probe_input_ids[index, -length:] = torch.tensor(token_ids, dtype=torch.long)
-            probe_attention_mask[index, -length:] = 1
-        probe_position_ids = self.tensor_fn.create_position_ids(probe_attention_mask)
-        probe_prompts = DataProto.from_dict({
-            'input_ids': probe_input_ids,
-            'attention_mask': probe_attention_mask,
-            'position_ids': probe_position_ids,
-        })
-        probe_prompts.meta_info.update({
-            'recompute_log_prob': False,
-            'sampling_params': {
-                'max_tokens': int(self.config.eitr_max_query_tokens),
-                'n': 1,
-                'seed': int(self.config.eitr_probe_seed + self._eitr_probe_call_index),
-            },
-        })
-        self._eitr_probe_call_index += 1
-        probe_outputs = self._generate_with_gpu_padding(probe_prompts)
+        if candidates_per_state <= 0:
+            for group in state_groups:
+                group['effective_probe_count'] = len(group['probes'])
+                group['eitr_eligible'] = len(group['probes']) >= 2
+                stats['probe_effective_k_sum'] += len(group['probes'])
+                if group['eitr_eligible']:
+                    stats['probe_state_effective'] += 1
+                else:
+                    stats['probe_state_insufficient'] += 1
+                self._register_compat_eitr_group(group)
+            return
+
+        # vLLM constructs one seeded generator per request. Repeating the same
+        # state several rows in one call with one shared seed therefore produces
+        # identical continuations. Sample one candidate per state per round and
+        # advance the seed between rounds so the K-1 candidates for a state are
+        # genuine independent draws from the frozen rollout policy.
+        generated_candidates = []
+        state_prompt_ids = [group['state_prompt_token_ids'] for group in state_groups]
+        max_state_length = max(len(item) for item in state_prompt_ids)
+        for _ in range(candidates_per_state):
+            probe_input_ids = torch.full(
+                (len(state_prompt_ids), max_state_length),
+                self.tokenizer.pad_token_id,
+                dtype=torch.long,
+            )
+            probe_attention_mask = torch.zeros_like(probe_input_ids)
+            for index, token_ids in enumerate(state_prompt_ids):
+                length = len(token_ids)
+                probe_input_ids[index, -length:] = torch.tensor(token_ids, dtype=torch.long)
+                probe_attention_mask[index, -length:] = 1
+            probe_position_ids = self.tensor_fn.create_position_ids(probe_attention_mask)
+            probe_prompts = DataProto.from_dict({
+                'input_ids': probe_input_ids,
+                'attention_mask': probe_attention_mask,
+                'position_ids': probe_position_ids,
+            })
+            probe_seed = int(
+                self.config.eitr_probe_seed + self._eitr_probe_call_index
+            )
+            probe_prompts.meta_info.update({
+                'recompute_log_prob': False,
+                'sampling_params': {
+                    'max_tokens': int(self.config.eitr_max_query_tokens),
+                    'n': 1,
+                    'seed': probe_seed,
+                },
+            })
+            self._eitr_probe_call_index += 1
+            probe_outputs = self._generate_with_gpu_padding(probe_prompts)
+            stats['probe_generation_call_count'] += 1
+            stats['probe_candidate_generated'] += len(state_groups)
+            generated_candidates.extend(
+                zip(range(len(state_groups)), probe_outputs.batch['responses'])
+            )
 
         valid_candidates = []
         flat_queries = []
         seen_queries_by_owner = {
             owner: {group['probes'][0]['query'].strip().lower()}
-            for owner, group in state_groups
+            for owner, group in enumerate(state_groups)
         }
         accepted_candidates_by_owner = defaultdict(int)
-        for owner, response in zip(candidate_owners, probe_outputs.batch['responses']):
+        for owner, response in generated_candidates:
             if accepted_candidates_by_owner[owner] >= probe_count - 1:
                 continue
             response_tokens = response.tolist()
-            close_offset = self._find_token_subsequence(response_tokens, close_tag_ids)
-            if close_offset < 0:
-                stats['probe_missing_close_tag'] += 1
-                continue
-            action_ids = response_tokens[:close_offset + len(close_tag_ids)]
-            query_text = self.tokenizer.decode(
-                response_tokens[:close_offset],
-                skip_special_tokens=True,
+            query, action_ids, rejection_reason = self._parse_eitr_probe_response(
+                response_tokens
             )
-            query = ' '.join(query_text.strip().split())
-            if not query or '||' in query or '<' in query or '>' in query:
-                stats['probe_invalid_query_text'] += 1
+            if rejection_reason is not None:
+                stats[f'probe_{rejection_reason}'] += 1
                 continue
             query_key = query.lower()
             if query_key in seen_queries_by_owner[owner]:
                 stats['probe_duplicate_query'] += 1
-                continue
+                # Duplicate samples are still valid draws from pi_old. Dropping
+                # them would condition the Monte Carlo estimator on uniqueness.
             seen_queries_by_owner[owner].add(query_key)
             valid_candidates.append((owner, query, action_ids))
             flat_queries.append(query)
             accepted_candidates_by_owner[owner] += 1
             stats['probe_query_accepted'] += 1
 
-        retrieval_results = self.batch_search(flat_queries)
+        retrieval_results = self.batch_search(flat_queries) if flat_queries else []
         for (owner, query, action_ids), retrieval_result in zip(valid_candidates, retrieval_results):
-            group = self._eitr_probe_groups[owner]
-            group['extra_retrieval_calls'] += 1
+            group = state_groups[owner]
+            group['extra_retrieval_calls'] = int(
+                group.get('extra_retrieval_calls', 0)
+            ) + 1
             if len(group['probes']) >= probe_count:
                 continue
             effect = self._compact_retrieval_effect(retrieval_result)
@@ -693,6 +966,17 @@ If I want to give the final answer, I should put the answer between <answer> and
                 stats['probe_effect_accepted'] += 1
             else:
                 stats['probe_empty_retrieval_effect'] += 1
+
+        for group in state_groups:
+            effective_count = len(group['probes'])
+            group['effective_probe_count'] = effective_count
+            group['eitr_eligible'] = effective_count >= 2
+            stats['probe_effective_k_sum'] += effective_count
+            if group['eitr_eligible']:
+                stats['probe_state_effective'] += 1
+            else:
+                stats['probe_state_insufficient'] += 1
+            self._register_compat_eitr_group(group)
 
     @staticmethod
     def _compact_retrieval_effect(retrieval_result: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -729,7 +1013,10 @@ If I want to give the final answer, I should put the answer between <answer> and
                 match = re.search(pattern, prediction, re.DOTALL)
                 if match:
                     content = match.group(2).strip()  # Return only the content inside the tags
-                    action = match.group(1)
+                    # A closed tag with an empty payload is still a malformed
+                    # tool/final action. In particular, <search></search> must
+                    # not be counted as a valid search state for Conditional EITR.
+                    action = match.group(1) if content else None
                 else:
                     content = ''
                     action = None
