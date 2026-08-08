@@ -22,11 +22,19 @@ case "$STORAGE_ROOT" in
 esac
 DATA_DIR="${DATA_DIR:-$STORAGE_ROOT/data/nq_search}"
 BASE_MODEL="${BASE_MODEL:-$STORAGE_ROOT/models/Qwen2.5-3B}"
+SAVE_FULL_CHECKPOINT="${SAVE_FULL_CHECKPOINT:-false}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-null}"
 RETRIEVER_URL="${RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}"
+case "$SAVE_FULL_CHECKPOINT" in
+    true|false) ;;
+    *)
+        echo "SAVE_FULL_CHECKPOINT must be true or false; got: $SAVE_FULL_CHECKPOINT" >&2
+        exit 2
+        ;;
+esac
 if [[ "$RESUME_FROM_CHECKPOINT" != "null" ]]; then
     if [[ ! -f "$RESUME_FROM_CHECKPOINT/trainer_state/driver_state.pt" ]]; then
-        echo "Incomplete resume checkpoint: $RESUME_FROM_CHECKPOINT" >&2
+        echo "Resume requires a full checkpoint: $RESUME_FROM_CHECKPOINT" >&2
         exit 2
     fi
     BASE_MODEL="$RESUME_FROM_CHECKPOINT"
@@ -269,6 +277,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq="$SAVE_FREQ" \
     trainer.test_freq="$TEST_FREQ" \
+    trainer.save_full_checkpoint="$SAVE_FULL_CHECKPOINT" \
     trainer.resume_from_checkpoint="$RESUME_FROM_CHECKPOINT" \
     trainer.total_epochs="$TOTAL_EPOCHS" \
     trainer.total_training_steps="$TOTAL_TRAINING_STEPS" \

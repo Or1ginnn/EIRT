@@ -218,7 +218,8 @@ trainer:
   n_gpus_per_node: 8
   save_freq: -1
   test_freq: -1
-  # Set to actor/global_step_N to resume on the same FSDP world size.
+  # false: Search-R1-compatible model/tokenizer only; true: also save exact-resume state.
+  save_full_checkpoint: false
   resume_from_checkpoint: null
   critic_warmup: 0
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}

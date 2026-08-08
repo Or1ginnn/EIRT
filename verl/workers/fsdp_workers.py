@@ -516,7 +516,7 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None):
+    def save_checkpoint(self, local_path, hdfs_path=None, save_training_state=False):
         assert self._is_actor
         import random
         import numpy as np
@@ -538,24 +538,25 @@ class ActorRolloutRefWorker(Worker):
             self.actor_module.save_pretrained(local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(local_path)
 
-        # The model is saved once on rank zero, while optimizer state is sharded
-        # by FSDP and must be preserved per rank for same-topology resume.
-        trainer_state_dir = os.path.join(local_path, 'trainer_state')
-        os.makedirs(trainer_state_dir, exist_ok=True)
-        rank_state = {
-            'optimizer': self.actor_optimizer.state_dict(),
-            'lr_scheduler': self.actor_lr_scheduler.state_dict(),
-            'grpo_optimizer_steps_completed': self.actor.grpo_optimizer_steps_completed,
-            'eitr_optimizer_steps_completed': self.actor.eitr_optimizer_steps_completed,
-            'python_rng_state': random.getstate(),
-            'numpy_rng_state': np.random.get_state(),
-            'torch_rng_state': torch.get_rng_state(),
-            'cuda_rng_state': torch.cuda.get_rng_state(),
-        }
-        rank_state_path = os.path.join(trainer_state_dir, f'actor_rank_{self.rank}.pt')
-        rank_state_tmp_path = rank_state_path + '.tmp'
-        torch.save(rank_state, rank_state_tmp_path)
-        os.replace(rank_state_tmp_path, rank_state_path)
+        if save_training_state:
+            # FSDP optimizer state is sharded, so exact resume needs one file
+            # per rank in addition to the rank-zero model checkpoint.
+            trainer_state_dir = os.path.join(local_path, 'trainer_state')
+            os.makedirs(trainer_state_dir, exist_ok=True)
+            rank_state = {
+                'optimizer': self.actor_optimizer.state_dict(),
+                'lr_scheduler': self.actor_lr_scheduler.state_dict(),
+                'grpo_optimizer_steps_completed': self.actor.grpo_optimizer_steps_completed,
+                'eitr_optimizer_steps_completed': self.actor.eitr_optimizer_steps_completed,
+                'python_rng_state': random.getstate(),
+                'numpy_rng_state': np.random.get_state(),
+                'torch_rng_state': torch.get_rng_state(),
+                'cuda_rng_state': torch.cuda.get_rng_state(),
+            }
+            rank_state_path = os.path.join(trainer_state_dir, f'actor_rank_{self.rank}.pt')
+            rank_state_tmp_path = rank_state_path + '.tmp'
+            torch.save(rank_state, rank_state_tmp_path)
+            os.replace(rank_state_tmp_path, rank_state_path)
 
         torch.distributed.barrier()
         if self.rank == 0 and hdfs_path is not None:
@@ -568,7 +569,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path):
-        """Restore sharded optimizer/RNG state after the actor weights are loaded."""
+        """Restore sharded optimizer/RNG state from a full checkpoint."""
         assert self._is_actor
         import random
         import numpy as np

@@ -664,30 +664,40 @@ class RayPPOTrainer(object):
                                         f'global_step_{self.global_steps}')
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, 'actor')
-        self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
+        save_full_checkpoint = bool(
+            self.config.trainer.get('save_full_checkpoint', False)
+        )
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path,
+            actor_remote_path,
+            save_full_checkpoint,
+        )
 
-        import torch
-        generation_manager = getattr(self, '_generation_manager', None)
-        generation_state = None
-        if generation_manager is not None:
-            generation_state = {
-                'eitr_probe_call_index': generation_manager._eitr_probe_call_index,
-                'eitr_rollout_call_index': generation_manager._eitr_rollout_call_index,
+        if save_full_checkpoint:
+            import torch
+            generation_manager = getattr(self, '_generation_manager', None)
+            generation_state = None
+            if generation_manager is not None:
+                generation_state = {
+                    'eitr_probe_call_index': generation_manager._eitr_probe_call_index,
+                    'eitr_rollout_call_index': generation_manager._eitr_rollout_call_index,
+                }
+            driver_state = {
+                'global_steps': self.global_steps,
+                'total_training_steps': self.total_training_steps,
+                'steps_per_epoch': len(self.train_dataloader),
+                'actor_world_size': self.actor_rollout_wg.world_size,
+                'python_rng_state': random.getstate(),
+                'numpy_rng_state': np.random.get_state(),
+                'torch_rng_state': torch.get_rng_state(),
+                'generation_state': generation_state,
             }
-        driver_state = {
-            'global_steps': self.global_steps,
-            'total_training_steps': self.total_training_steps,
-            'steps_per_epoch': len(self.train_dataloader),
-            'actor_world_size': self.actor_rollout_wg.world_size,
-            'python_rng_state': random.getstate(),
-            'numpy_rng_state': np.random.get_state(),
-            'torch_rng_state': torch.get_rng_state(),
-            'generation_state': generation_state,
-        }
-        driver_state_path = os.path.join(actor_local_path, 'trainer_state', 'driver_state.pt')
-        driver_state_tmp_path = driver_state_path + '.tmp'
-        torch.save(driver_state, driver_state_tmp_path)
-        os.replace(driver_state_tmp_path, driver_state_path)
+            driver_state_path = os.path.join(
+                actor_local_path, 'trainer_state', 'driver_state.pt'
+            )
+            driver_state_tmp_path = driver_state_path + '.tmp'
+            torch.save(driver_state, driver_state_tmp_path)
+            os.replace(driver_state_tmp_path, driver_state_path)
 
         if self.use_critic:
             critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
@@ -697,7 +707,7 @@ class RayPPOTrainer(object):
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
     def _load_checkpoint(self):
-        """Resume the actor optimizer and deterministic driver state in-place."""
+        """Resume optimizer and deterministic driver state from a full checkpoint."""
         resume_path = self.config.trainer.get('resume_from_checkpoint', None)
         if resume_path in (None, '', 'null'):
             return False
@@ -708,7 +718,9 @@ class RayPPOTrainer(object):
         resume_path = os.path.realpath(str(resume_path))
         state_path = os.path.join(resume_path, 'trainer_state', 'driver_state.pt')
         if not os.path.isfile(state_path):
-            raise FileNotFoundError(f'Incomplete resume checkpoint: {state_path}')
+            raise FileNotFoundError(
+                f'Resume requires a full checkpoint: {state_path}'
+            )
         if os.path.realpath(str(self.config.actor_rollout_ref.model.path)) != resume_path:
             raise ValueError(
                 'Resume requires actor_rollout_ref.model.path to equal '
@@ -735,7 +747,7 @@ class RayPPOTrainer(object):
         np.random.set_state(driver_state['numpy_rng_state'])
         torch.set_rng_state(driver_state['torch_rng_state'])
         self._resume_generation_state = driver_state.get('generation_state') or {}
-        print(f'Resumed actor/optimizer state from {resume_path} at outer step {self.global_steps}')
+        print(f'Resumed full checkpoint from {resume_path} at outer step {self.global_steps}')
         return True
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
