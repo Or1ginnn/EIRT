@@ -107,6 +107,9 @@ eitr:
 检索 observation 的单轮保留上限为 `1024` token，完整 trajectory 的累计保存上限与
 每轮提供给模型的 rolling prompt 均为 `8192` token。两者使用独立配置，当前取值相同。
 
+三种 paired 模式统一继承 Search-R1 Qwen2.5 GRPO 的 actor 优化参数：
+`lr=1e-6`、`lr_warmup_steps_ratio=0.285`。EITR 不单独调整学习率。
+
 三种 paired 模式统一使用 `rollout.top_p=1.0, top_k=-1`。EITR 的 SNIS ratio 使用 actor 完整 softmax 下的 query sequence log-prob，因此采样也必须来自同一个未截断分布；`probe_only/eitr` 若配置 nucleus 或 top-k 截断会在启动时直接拒绝。
 
 `min_state_coverage` 和 `min_informative_state_rate` 现在只产生诊断标记，不再抛异常。
