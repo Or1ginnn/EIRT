@@ -27,6 +27,11 @@ SPEC = importlib.util.spec_from_file_location("eitr_module", MODULE_PATH)
 EITR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EITR)
 
+TRACKING_MODULE_PATH = Path(__file__).resolve().parents[1] / "verl" / "utils" / "tracking.py"
+TRACKING_SPEC = importlib.util.spec_from_file_location("tracking_module", TRACKING_MODULE_PATH)
+TRACKING_MODULE = importlib.util.module_from_spec(TRACKING_SPEC)
+TRACKING_SPEC.loader.exec_module(TRACKING_MODULE)
+
 build_sibling_probe_tensors = EITR.build_sibling_probe_tensors
 build_online_probe_tensors = EITR.build_online_probe_tensors
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
@@ -37,6 +42,47 @@ eitr_loss_enabled_for_pass = EITR.eitr_loss_enabled_for_pass
 validate_eitr_optimization_schedule = EITR.validate_eitr_optimization_schedule
 validate_eitr_config = EITR.validate_eitr_config
 validate_sibling_group_layout = EITR.validate_sibling_group_layout
+
+
+class TrackingFlushTest(unittest.TestCase):
+    def test_finish_flushes_backends_once(self):
+        class FinishBackend:
+            def __init__(self):
+                self.calls = 0
+
+            def finish(self):
+                self.calls += 1
+
+        class FlushBackend:
+            def __init__(self):
+                self.calls = 0
+
+            def flush(self):
+                self.calls += 1
+
+        finish_backend = FinishBackend()
+        flush_backend = FlushBackend()
+        tracking = TRACKING_MODULE.Tracking.__new__(TRACKING_MODULE.Tracking)
+        tracking._finished = False
+        tracking.logger = {
+            "wandb": finish_backend,
+            "console": flush_backend,
+        }
+
+        tracking.finish()
+        tracking.finish()
+
+        self.assertEqual(finish_backend.calls, 1)
+        self.assertEqual(flush_backend.calls, 1)
+
+    def test_smoke_logs_to_console_and_wandb(self):
+        runner = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "train"
+            / "train_eitr_nq_gate_c_smoke.sh"
+        ).read_text()
+        self.assertIn("trainer.logger=\"['console','wandb']\"", runner)
 
 
 class EITRMathTest(unittest.TestCase):

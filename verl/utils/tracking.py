@@ -25,6 +25,7 @@ class Tracking(object):
     supported_backend = ['wandb', 'mlflow', 'console']
 
     def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None):
+        self._finished = False
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -60,6 +61,26 @@ class Tracking(object):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
+
+    def finish(self):
+        """Synchronously flush and close every configured tracking backend.
+
+        PPO training runs inside a short-lived Ray task.  Relying on Python's
+        process-exit hooks can drop the final asynchronous W&B history row,
+        especially for one-step startup checks, so the task must close the
+        logger explicitly before returning.
+        """
+        if self._finished:
+            return
+        for logger_instance in self.logger.values():
+            finish = getattr(logger_instance, 'finish', None)
+            if callable(finish):
+                finish()
+                continue
+            flush = getattr(logger_instance, 'flush', None)
+            if callable(flush):
+                flush()
+        self._finished = True
 
 
 class _MlflowLoggingAdapter:

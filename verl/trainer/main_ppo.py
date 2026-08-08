@@ -209,8 +209,13 @@ def main_task(config):
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn,
                             )
-    trainer.init_workers()
-    trainer.fit()
+    try:
+        trainer.init_workers()
+        trainer.fit()
+    finally:
+        # The driver is a short-lived Ray task.  Explicitly finish W&B so the
+        # last (or only) training step is written before the task exits.
+        trainer.logger.finish()
 
 
 if __name__ == '__main__':
