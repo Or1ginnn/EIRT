@@ -18,6 +18,7 @@ class GenerationConfig:
     max_prompt_length: int 
     max_response_length: int
     max_obs_length: int
+    max_trajectory_length: int
     num_gpus: int
     no_think_rl: bool=False
     search_url: str = None
@@ -32,7 +33,10 @@ class GenerationConfig:
     # Default zero keeps the K samples unconditional: an invalid extra sample
     # lowers K_eff instead of being silently replaced by a later draw.
     eitr_probe_oversample: int = 0
-    eitr_max_query_tokens: int = 96
+    # Must match ``max_response_length``. Each same-state probe is cropped to
+    # the real turn's remaining token budget after the fixed ``<search>``
+    # prefix, so real and counterfactual queries share one action horizon.
+    eitr_max_query_tokens: int = 500
     eitr_max_probe_prompt_tokens: int = 4096
     eitr_probe_seed: int = 20260805
 
@@ -179,7 +183,7 @@ class LLMGenerationManager:
                     pad_to_left=False
                 )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
-        max_len = min(self.config.max_prompt_length, effective_len)
+        max_len = min(self.config.max_trajectory_length, effective_len)
         
         return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
 
@@ -558,8 +562,8 @@ If I want to give the final answer, I should put the answer between <answer> and
         if match is None:
             self._eitr_probe_collection_stats['real_search_missing_close_tag'] += 1
             return
-        normalized_query = ' '.join(query.strip().split())
-        matched_query = ' '.join(match.group(1).strip().split())
+        normalized_query = self._normalize_eitr_query_text(query)
+        matched_query = self._normalize_eitr_query_text(match.group(1))
         if not normalized_query or not matched_query:
             self._eitr_probe_collection_stats['real_search_empty_query'] += 1
             return
@@ -662,6 +666,11 @@ If I want to give the final answer, I should put the answer between <answer> and
         state_seed = f'{seed}:{rollout_index}:{int(turn_index)}:{int(source_index)}'
         return random.Random(state_seed).random() < probability
 
+    @staticmethod
+    def _normalize_eitr_query_text(query: Any) -> str:
+        """Apply the same non-empty query normalization to real and probe actions."""
+        return ' '.join(str(query).strip().split())
+
     def _parse_eitr_probe_response(
         self,
         response_tokens: List[int],
@@ -688,11 +697,9 @@ If I want to give the final answer, I should put the answer between <answer> and
             return None, None, 'missing_close_tag'
 
         query_text = decoded_action.split('</search>', 1)[0]
-        query = ' '.join(query_text.strip().split())
+        query = self._normalize_eitr_query_text(query_text)
         if not query:
             return None, None, 'empty_query'
-        if '||' in query or '<' in query or '>' in query:
-            return None, None, 'invalid_query_text'
         return query, response_tokens[:close_end], None
 
     def _register_compat_eitr_group(self, group: Dict[str, Any]) -> None:
@@ -794,6 +801,14 @@ If I want to give the final answer, I should put the answer between <answer> and
                 stats['candidate_empty_query_action'] += 1
                 stats['state_group_rejected'] += 1
                 continue
+            query_token_budget = int(self.config.max_response_length) - int(open_end)
+            if query_token_budget <= 0 or len(normal_action_ids) > query_token_budget:
+                # The real turn itself was sampled with max_response_length. A
+                # probe must inherit the exact suffix budget left after the
+                # fixed reasoning + <search> prefix.
+                stats['candidate_query_budget_mismatch'] += 1
+                stats['state_group_rejected'] += 1
+                continue
             prompt_mask = rollings.batch['attention_mask'][source_index].bool()
             base_prompt_ids = rollings.batch['input_ids'][source_index][prompt_mask].tolist()
             fixed_prefix_ids = generated_ids[:open_end]
@@ -826,6 +841,7 @@ If I want to give the final answer, I should put the answer between <answer> and
                 'turn_index': state_turn,
                 'group_start': group_start,
                 'target_probe_count': probe_count,
+                'query_token_budget': query_token_budget,
                 'selected_for_probe': False,
                 'deferred': is_additional_state,
                 'extra_retrieval_calls': 0,
@@ -904,6 +920,14 @@ If I want to give the final answer, I should put the answer between <answer> and
         generated_candidates = []
         state_prompt_ids = [group['state_prompt_token_ids'] for group in state_groups]
         max_state_length = max(len(item) for item in state_prompt_ids)
+        max_query_budget = max(int(group['query_token_budget']) for group in state_groups)
+        configured_query_limit = int(self.config.eitr_max_query_tokens)
+        if configured_query_limit != int(self.config.max_response_length):
+            raise ValueError(
+                'EITR max_query_tokens must equal the real rollout '
+                f'max_response_length; got {configured_query_limit} != '
+                f'{int(self.config.max_response_length)}'
+            )
         for _ in range(candidates_per_state):
             probe_input_ids = torch.full(
                 (len(state_prompt_ids), max_state_length),
@@ -927,7 +951,10 @@ If I want to give the final answer, I should put the answer between <answer> and
             probe_prompts.meta_info.update({
                 'recompute_log_prob': False,
                 'sampling_params': {
-                    'max_tokens': int(self.config.eitr_max_query_tokens),
+                    # One batched vLLM call needs one shared limit. Every result
+                    # is cropped below to its owning real state's smaller
+                    # residual budget before parsing.
+                    'max_tokens': max_query_budget,
                     'n': 1,
                     'seed': probe_seed,
                 },
@@ -950,7 +977,8 @@ If I want to give the final answer, I should put the answer between <answer> and
         for owner, response in generated_candidates:
             if accepted_candidates_by_owner[owner] >= probe_count - 1:
                 continue
-            response_tokens = response.tolist()
+            query_token_budget = int(state_groups[owner]['query_token_budget'])
+            response_tokens = response.tolist()[:query_token_budget]
             query, action_ids, rejection_reason = self._parse_eitr_probe_response(
                 response_tokens
             )

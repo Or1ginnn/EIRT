@@ -38,7 +38,10 @@ EITR_LAMBDA_ENV="${EITR_LAMBDA_ENV:-0.1}"
 EITR_CORRECTION_PASSES="${EITR_CORRECTION_PASSES:-1}"
 EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"
 EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"
-EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-96}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-500}"
+MAX_OBS_LENGTH="${MAX_OBS_LENGTH:-1024}"
+MAX_TRAJECTORY_LENGTH="${MAX_TRAJECTORY_LENGTH:-8192}"
+EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-$MAX_RESPONSE_LENGTH}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-smoke}"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
@@ -53,8 +56,8 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
-MAX_PROBE_PROMPT_TOKENS="${MAX_PROBE_PROMPT_TOKENS:-$((MAX_PROMPT_LENGTH + 512))}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-8192}"
+MAX_PROBE_PROMPT_TOKENS="${MAX_PROBE_PROMPT_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((MAX_PROBE_PROMPT_TOKENS + EITR_MAX_QUERY_TOKENS))}"
 INFORMATIVE_JS_THRESHOLD="${INFORMATIVE_JS_THRESHOLD:-0.01}"
 SAVE_FREQ="${SAVE_FREQ:--1}"
@@ -88,6 +91,16 @@ fi
 
 if (( MAX_PROBE_PROMPT_TOKENS < MAX_PROMPT_LENGTH )); then
     echo "MAX_PROBE_PROMPT_TOKENS must be >= MAX_PROMPT_LENGTH for exact same-state probes" >&2
+    exit 2
+fi
+
+if (( EITR_MAX_QUERY_TOKENS != MAX_RESPONSE_LENGTH )); then
+    echo "EITR_MAX_QUERY_TOKENS must equal MAX_RESPONSE_LENGTH for same-policy query probes" >&2
+    exit 2
+fi
+
+if (( MAX_TRAJECTORY_LENGTH < MAX_RESPONSE_LENGTH )); then
+    echo "MAX_TRAJECTORY_LENGTH must be >= MAX_RESPONSE_LENGTH" >&2
     exit 2
 fi
 
@@ -186,8 +199,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.val_batch_size="$VAL_BATCH_SIZE" \
     data.max_start_length=2048 \
     data.max_prompt_length="$MAX_PROMPT_LENGTH" \
-    data.max_response_length=500 \
-    data.max_obs_length=500 \
+    data.max_response_length="$MAX_RESPONSE_LENGTH" \
+    data.max_obs_length="$MAX_OBS_LENGTH" \
+    data.max_trajectory_length="$MAX_TRAJECTORY_LENGTH" \
     data.shuffle_train_dataloader=false \
     algorithm.adv_estimator=grpo \
     actor_rollout_ref.model.path="$BASE_MODEL" \
@@ -215,7 +229,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.eitr.probe_logprob_micro_batch_size="$EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE" \
     actor_rollout_ref.actor.eitr.max_query_tokens="$EITR_MAX_QUERY_TOKENS" \
     actor_rollout_ref.actor.eitr.probe_seed=20260805 \
-    actor_rollout_ref.actor.eitr.max_action_tokens=128 \
+    actor_rollout_ref.actor.eitr.max_action_tokens="$EITR_MAX_QUERY_TOKENS" \
     actor_rollout_ref.actor.eitr.max_probe_prompt_tokens="$MAX_PROBE_PROMPT_TOKENS" \
     actor_rollout_ref.actor.eitr.retrieval_score_temperature=0.1 \
     actor_rollout_ref.actor.eitr.min_state_coverage=0.0 \

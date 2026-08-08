@@ -9,6 +9,9 @@ data:
   max_response_length: 512
   max_start_length: 256
   max_obs_length: 512
+  # Complete stored agent trajectory. The rolling prompt remains bounded by
+  # max_prompt_length, but reward/training retains the full interaction tail.
+  max_trajectory_length: 1024
   train_batch_size: 1024
   val_batch_size: 1312
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
@@ -53,9 +56,11 @@ actor_rollout_ref:
       # sequences, not rollout states.
       probe_micro_batch_size: 4
       probe_logprob_micro_batch_size: 4
-      max_query_tokens: 96
+      # Match the real per-turn generation budget. At runtime each state uses
+      # only the suffix budget remaining after reasoning + <search>.
+      max_query_tokens: ${data.max_response_length}
       probe_seed: 20260805
-      max_action_tokens: 128
+      max_action_tokens: ${data.max_response_length}
       # Must cover the complete rolling search state. Silent truncation would
       # make probe sampling and probe log-prob scoring condition on different states.
       max_probe_prompt_tokens: 4096

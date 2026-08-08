@@ -480,6 +480,12 @@ class RayPPOTrainer(object):
             max_prompt_length=self.config.data.max_prompt_length,
             max_response_length=self.config.data.max_response_length,
             max_obs_length=self.config.data.max_obs_length,
+            max_trajectory_length=int(
+                self.config.data.get(
+                    'max_trajectory_length',
+                    2 * int(self.config.data.max_prompt_length),
+                )
+            ),
             num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
@@ -718,6 +724,7 @@ class RayPPOTrainer(object):
                 n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
                 max_queries_per_turn=1,
                 rollout_n=int(self.config.actor_rollout_ref.rollout.n),
+                rollout_response_length=int(self.config.data.max_response_length),
                 max_prompt_length=int(self.config.data.max_prompt_length),
                 rollout_max_model_len=int(
                     self.config.actor_rollout_ref.rollout.get(
@@ -741,6 +748,12 @@ class RayPPOTrainer(object):
             max_prompt_length=self.config.data.max_prompt_length,
             max_response_length=self.config.data.max_response_length,
             max_obs_length=self.config.data.max_obs_length,
+            max_trajectory_length=int(
+                self.config.data.get(
+                    'max_trajectory_length',
+                    2 * int(self.config.data.max_prompt_length),
+                )
+            ),
             num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,

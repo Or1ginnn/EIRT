@@ -91,14 +91,21 @@ eitr:
   probe_oversample: 0
   probe_micro_batch_size: 4
   probe_logprob_micro_batch_size: 4
-  max_query_tokens: 96
-  max_probe_prompt_tokens: 4608
+  # 与真实单轮生成预算一致；每个 state 实际只使用 <search> 后的剩余预算
+  max_query_tokens: 500
+  max_action_tokens: 500
+  max_probe_prompt_tokens: 8692
   correction_passes: 1
   lambda_env: 0.1
   log_ratio_clip: 10.0
 ```
 
-训练入口同时设置 `actor_rollout_ref.rollout.max_model_len=4704`，确保 vLLM engine 能容纳 `4608` token 的完整 search state 和最多 `96` token 的 query continuation；配置不足会在启动前失败，不会等到晚轮 search 才中止。
+训练入口同时设置 `actor_rollout_ref.rollout.max_model_len=9192`。真实一轮仍使用
+`500` token 总生成预算；构造 exact search state 后，probe 只继承该轮在
+`<search>` 后剩余的 token budget。batched vLLM 输出也会按各自 state 的剩余预算裁切后再解析，因此真实 query 与额外 query 不再使用不同的 action support。
+
+检索 observation 的单轮保留上限为 `1024` token，完整 trajectory 的累计保存上限与
+每轮提供给模型的 rolling prompt 均为 `8192` token。两者使用独立配置，当前取值相同。
 
 三种 paired 模式统一使用 `rollout.top_p=1.0, top_k=-1`。EITR 的 SNIS ratio 使用 actor 完整 softmax 下的 query sequence log-prob，因此采样也必须来自同一个未截断分布；`probe_only/eitr` 若配置 nucleus 或 top-k 截断会在启动时直接拒绝。
 

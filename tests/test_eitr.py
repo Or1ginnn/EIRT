@@ -162,6 +162,7 @@ class EITRProbeBatchTest(unittest.TestCase):
             n_agent=5,
             max_queries_per_turn=1,
             rollout_n=1,
+            rollout_response_length=4,
             max_prompt_length=16,
             rollout_max_model_len=20,
             rollout_top_p=1.0,
@@ -191,6 +192,22 @@ class EITRProbeBatchTest(unittest.TestCase):
                 rollout_n=1,
                 max_prompt_length=16,
                 rollout_max_model_len=19,
+            )
+        with self.assertRaisesRegex(ValueError, "max_query_tokens must equal"):
+            validate_eitr_config(
+                {"max_query_tokens": 3, "max_action_tokens": 3},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+                rollout_response_length=4,
+            )
+        with self.assertRaisesRegex(ValueError, "max_action_tokens"):
+            validate_eitr_config(
+                {"max_query_tokens": 4, "max_action_tokens": 3},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+                rollout_response_length=4,
             )
         with self.assertRaisesRegex(ValueError, "top_p=1.0"):
             validate_eitr_config(
@@ -405,6 +422,7 @@ class SearchR1CompatibilityTest(unittest.TestCase):
             eitr_n_agent=1,
             eitr_max_probe_prompt_tokens=16,
             max_prompt_length=16,
+            max_response_length=6,
         )
         manager._eitr_probe_groups = [None]
         manager._eitr_probe_collection_stats = Counter()
@@ -429,6 +447,7 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         self.assertIsNotNone(group)
         self.assertEqual(group["state_prompt_token_ids"], [11, 12, 101, 102, 103])
         self.assertEqual(group["probes"][0]["action_token_ids"], [104, 105])
+        self.assertEqual(group["query_token_budget"], 3)
         self.assertEqual(manager._eitr_probe_collection_stats["state_group_collected"], 1)
 
     def test_unusable_first_search_does_not_consume_primary_probe_state(self):
@@ -440,6 +459,7 @@ class SearchR1CompatibilityTest(unittest.TestCase):
             eitr_n_agent=1,
             eitr_max_probe_prompt_tokens=16,
             max_prompt_length=16,
+            max_response_length=6,
         )
         manager._eitr_probe_groups = [None]
         manager._eitr_probe_state_groups = []
@@ -515,6 +535,26 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         self.assertEqual(final_valid_actions, [0])
         self.assertEqual(final_searches, [0])
 
+    def test_complete_trajectory_uses_its_own_length_limit(self):
+        manager = object.__new__(LLMGenerationManager)
+        manager.tokenizer = SimpleNamespace(pad_token_id=0)
+        manager.config = SimpleNamespace(
+            max_prompt_length=4,
+            max_trajectory_length=8,
+        )
+        manager.tensor_fn = SimpleNamespace(
+            create_attention_mask=lambda values: (values != 0).long()
+        )
+        right_side = {
+            "responses": torch.tensor([[1, 2, 3, 4, 5]]),
+            "responses_with_info_mask": torch.tensor([[1, 2, 3, 4, 5]]),
+        }
+        updated = manager._update_right_side(
+            right_side,
+            torch.tensor([[6, 7, 8, 9]]),
+        )
+        self.assertEqual(updated["responses"].tolist(), [[1, 2, 3, 4, 5, 6, 7, 8]])
+
     def test_empty_closed_search_is_not_a_valid_action(self):
         manager = object.__new__(LLMGenerationManager)
         actions, contents = manager.postprocess_predictions(
@@ -530,6 +570,8 @@ class SearchR1CompatibilityTest(unittest.TestCase):
                     (201,): "who wrote Hamlet",
                     (201, 202): "who wrote Hamlet</search>",
                     (202,): "</search>",
+                    (203,): "symbols || <inside>",
+                    (203, 202): "symbols || <inside></search>",
                 }
                 return mapping.get(tuple(token_ids), "")
 
@@ -549,6 +591,11 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         self.assertIsNone(query)
         self.assertIsNone(action_ids)
         self.assertEqual(reason, "empty_query")
+
+        query, action_ids, reason = manager._parse_eitr_probe_response([203, 202])
+        self.assertEqual(query, "symbols || <inside>")
+        self.assertEqual(action_ids, [203, 202])
+        self.assertIsNone(reason)
 
     def test_same_state_probe_rounds_use_distinct_seeds(self):
         class FakeDataProto:
@@ -572,12 +619,14 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             eitr_probe_count=4,
             eitr_probe_oversample=0,
-            eitr_max_query_tokens=96,
+            eitr_max_query_tokens=3,
+            max_response_length=3,
             eitr_probe_seed=123,
         )
         group = {
             "source_index": 0,
             "state_prompt_token_ids": [11, 12, 13],
+            "query_token_budget": 3,
             "extra_retrieval_calls": 0,
             "probes": [{
                 "query": "real-query",
@@ -590,9 +639,11 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         manager._eitr_probe_collection_stats = Counter()
         manager._eitr_probe_call_index = 0
         seen_seeds = []
+        seen_max_tokens = []
 
         def fake_generate(prompts):
             seen_seeds.append(prompts.meta_info["sampling_params"]["seed"])
+            seen_max_tokens.append(prompts.meta_info["sampling_params"]["max_tokens"])
             token = 301 + len(seen_seeds)
             return SimpleNamespace(batch={
                 "responses": torch.tensor([[token, 999, 0]], dtype=torch.long)
@@ -612,6 +663,7 @@ class SearchR1CompatibilityTest(unittest.TestCase):
             generation_module.DataProto = original_data_proto
 
         self.assertEqual(seen_seeds, [123, 124, 125])
+        self.assertEqual(seen_max_tokens, [3, 3, 3])
         self.assertEqual(manager._eitr_probe_collection_stats["probe_generation_call_count"], 3)
         self.assertEqual(group["effective_probe_count"], 4)
         self.assertEqual(len({probe["query"] for probe in group["probes"]}), 4)

@@ -109,6 +109,7 @@ def validate_eitr_config(
     n_agent: int,
     max_queries_per_turn: int,
     rollout_n: int,
+    rollout_response_length: Optional[int] = None,
     max_prompt_length: Optional[int] = None,
     rollout_max_model_len: Optional[int] = None,
     rollout_top_p: Optional[float] = None,
@@ -124,8 +125,8 @@ def validate_eitr_config(
     probe_logprob_micro_batch_size = int(
         _config_value(config, "probe_logprob_micro_batch_size", 4)
     )
-    max_query_tokens = int(_config_value(config, "max_query_tokens", 96))
-    max_action_tokens = int(_config_value(config, "max_action_tokens", 128))
+    max_query_tokens = int(_config_value(config, "max_query_tokens", 512))
+    max_action_tokens = int(_config_value(config, "max_action_tokens", 512))
     max_probe_prompt_tokens = int(_config_value(config, "max_probe_prompt_tokens", 4096))
     max_doc_support = int(_config_value(config, "max_doc_support", 32))
     score_temperature = float(_config_value(config, "retrieval_score_temperature", 0.1))
@@ -166,6 +167,17 @@ def validate_eitr_config(
         probe_micro_batch_size,
     ) <= 0:
         raise ValueError("EITR token, support, and probe micro-batch limits must be positive")
+    if rollout_response_length is not None and max_query_tokens != int(rollout_response_length):
+        raise ValueError(
+            "EITR max_query_tokens must equal data.max_response_length so real and "
+            "counterfactual queries use the same turn budget; got "
+            f"{max_query_tokens} != {int(rollout_response_length)}"
+        )
+    if max_action_tokens < max_query_tokens:
+        raise ValueError(
+            "EITR max_action_tokens must be at least max_query_tokens so tensor packing "
+            "does not impose a smaller query support"
+        )
     if max_prompt_length is not None and max_probe_prompt_tokens < int(max_prompt_length):
         raise ValueError(
             "EITR max_probe_prompt_tokens must be at least data.max_prompt_length so probe "
