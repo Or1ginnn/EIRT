@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import random
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -665,12 +666,77 @@ class RayPPOTrainer(object):
             self.config.trainer.default_hdfs_dir, 'actor')
         self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
 
+        import torch
+        generation_manager = getattr(self, '_generation_manager', None)
+        generation_state = None
+        if generation_manager is not None:
+            generation_state = {
+                'eitr_probe_call_index': generation_manager._eitr_probe_call_index,
+                'eitr_rollout_call_index': generation_manager._eitr_rollout_call_index,
+            }
+        driver_state = {
+            'global_steps': self.global_steps,
+            'total_training_steps': self.total_training_steps,
+            'steps_per_epoch': len(self.train_dataloader),
+            'actor_world_size': self.actor_rollout_wg.world_size,
+            'python_rng_state': random.getstate(),
+            'numpy_rng_state': np.random.get_state(),
+            'torch_rng_state': torch.get_rng_state(),
+            'generation_state': generation_state,
+        }
+        driver_state_path = os.path.join(actor_local_path, 'trainer_state', 'driver_state.pt')
+        driver_state_tmp_path = driver_state_path + '.tmp'
+        torch.save(driver_state, driver_state_tmp_path)
+        os.replace(driver_state_tmp_path, driver_state_path)
+
         if self.use_critic:
             critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
                                              f'global_step_{self.global_steps}')
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
+
+    def _load_checkpoint(self):
+        """Resume the actor optimizer and deterministic driver state in-place."""
+        resume_path = self.config.trainer.get('resume_from_checkpoint', None)
+        if resume_path in (None, '', 'null'):
+            return False
+        if self.config.data.shuffle_train_dataloader:
+            raise ValueError('Resume requires data.shuffle_train_dataloader=false')
+
+        import torch
+        resume_path = os.path.realpath(str(resume_path))
+        state_path = os.path.join(resume_path, 'trainer_state', 'driver_state.pt')
+        if not os.path.isfile(state_path):
+            raise FileNotFoundError(f'Incomplete resume checkpoint: {state_path}')
+        if os.path.realpath(str(self.config.actor_rollout_ref.model.path)) != resume_path:
+            raise ValueError(
+                'Resume requires actor_rollout_ref.model.path to equal '
+                'trainer.resume_from_checkpoint'
+            )
+        try:
+            driver_state = torch.load(state_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            driver_state = torch.load(state_path, map_location='cpu')
+        if int(driver_state['total_training_steps']) != int(self.total_training_steps):
+            raise ValueError('Resume checkpoint total_training_steps does not match this run')
+        if int(driver_state['steps_per_epoch']) != len(self.train_dataloader):
+            raise ValueError('Resume checkpoint dataloader length does not match this run')
+        if int(driver_state['actor_world_size']) != self.actor_rollout_wg.world_size:
+            raise ValueError('Resume checkpoint actor world size does not match this run')
+
+        self.actor_rollout_wg.load_checkpoint(resume_path)
+        self.global_steps = int(driver_state['global_steps'])
+        if not 0 <= self.global_steps < self.total_training_steps:
+            raise ValueError(
+                f'Resume step must be in [0, {self.total_training_steps}); got {self.global_steps}'
+            )
+        random.setstate(driver_state['python_rng_state'])
+        np.random.set_state(driver_state['numpy_rng_state'])
+        torch.set_rng_state(driver_state['torch_rng_state'])
+        self._resume_generation_state = driver_state.get('generation_state') or {}
+        print(f'Resumed actor/optimizer state from {resume_path} at outer step {self.global_steps}')
+        return True
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -698,9 +764,14 @@ class RayPPOTrainer(object):
 
         logger = self.logger
         self.global_steps = 0
+        resumed = self._load_checkpoint()
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        if (
+            not resumed
+            and self.val_reward_fn is not None
+            and self.config.trainer.get('val_before_train', True)
+        ):
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
             logger.log(data=val_metrics, step=self.global_steps)
@@ -775,12 +846,25 @@ class RayPPOTrainer(object):
             actor_rollout_wg=self.actor_rollout_wg,
             config=gen_config,
         )
+        self._generation_manager = generation_manager
+        resume_generation_state = getattr(self, '_resume_generation_state', {})
+        if resume_generation_state:
+            generation_manager._eitr_probe_call_index = int(
+                resume_generation_state.get('eitr_probe_call_index', 0)
+            )
+            generation_manager._eitr_rollout_call_index = int(
+                resume_generation_state.get('eitr_rollout_call_index', 0)
+            )
 
         # ``global_steps`` is the number of completed outer rollout/update
         # iterations.  An explicit total_training_steps budget is authoritative,
         # so the dataloader is re-iterated for as many epochs as required.
+        steps_per_epoch = len(self.train_dataloader)
         for epoch in range(self.training_loop_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_index, batch_dict in enumerate(self.train_dataloader):
+                completed_batch_index = epoch * steps_per_epoch + batch_index
+                if completed_batch_index < self.global_steps:
+                    continue
                 current_step = self.global_steps + 1
                 print(f'epoch {epoch}, outer update {current_step}/{self.total_training_steps}')
                 metrics = {}
@@ -1004,8 +1088,9 @@ class RayPPOTrainer(object):
                         if is_final_step:
                             pprint(f'Final validation metrics: {val_metrics}')
 
-                    if self.config.trainer.save_freq > 0 and \
-                            self.global_steps % self.config.trainer.save_freq == 0:
+                    if self.config.trainer.save_freq > 0 and (
+                            self.global_steps % self.config.trainer.save_freq == 0
+                            or is_final_step):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
 

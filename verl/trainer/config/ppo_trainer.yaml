@@ -218,6 +218,8 @@ trainer:
   n_gpus_per_node: 8
   save_freq: -1
   test_freq: -1
+  # Set to actor/global_step_N to resume on the same FSDP world size.
+  resume_from_checkpoint: null
   critic_warmup: 0
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}

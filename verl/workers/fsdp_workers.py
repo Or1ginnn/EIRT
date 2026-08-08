@@ -518,6 +518,8 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None):
         assert self._is_actor
+        import random
+        import numpy as np
         import torch
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
@@ -535,14 +537,74 @@ class ActorRolloutRefWorker(Worker):
             os.makedirs(local_path, exist_ok=True)
             self.actor_module.save_pretrained(local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(local_path)
-            if hdfs_path is not None:
-                print(f'Uploading actor checkpoint to {hdfs_path}')
-                hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                hdfs_io.copy(src=local_path, dst=hdfs_path)
 
+        # The model is saved once on rank zero, while optimizer state is sharded
+        # by FSDP and must be preserved per rank for same-topology resume.
+        trainer_state_dir = os.path.join(local_path, 'trainer_state')
+        os.makedirs(trainer_state_dir, exist_ok=True)
+        rank_state = {
+            'optimizer': self.actor_optimizer.state_dict(),
+            'lr_scheduler': self.actor_lr_scheduler.state_dict(),
+            'grpo_optimizer_steps_completed': self.actor.grpo_optimizer_steps_completed,
+            'eitr_optimizer_steps_completed': self.actor.eitr_optimizer_steps_completed,
+            'python_rng_state': random.getstate(),
+            'numpy_rng_state': np.random.get_state(),
+            'torch_rng_state': torch.get_rng_state(),
+            'cuda_rng_state': torch.cuda.get_rng_state(),
+        }
+        rank_state_path = os.path.join(trainer_state_dir, f'actor_rank_{self.rank}.pt')
+        rank_state_tmp_path = rank_state_path + '.tmp'
+        torch.save(rank_state, rank_state_tmp_path)
+        os.replace(rank_state_tmp_path, rank_state_path)
+
+        torch.distributed.barrier()
+        if self.rank == 0 and hdfs_path is not None:
+            print(f'Uploading actor checkpoint to {hdfs_path}')
+            hdfs_io.makedirs(hdfs_path, exist_ok=True)
+            hdfs_io.copy(src=local_path, dst=hdfs_path)
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_checkpoint(self, local_path):
+        """Restore sharded optimizer/RNG state after the actor weights are loaded."""
+        assert self._is_actor
+        import random
+        import numpy as np
+        import torch
+
+        rank_state_path = os.path.join(
+            local_path, 'trainer_state', f'actor_rank_{self.rank}.pt'
+        )
+        if not os.path.isfile(rank_state_path):
+            raise FileNotFoundError(
+                f'Missing actor resume state for rank {self.rank}: {rank_state_path}'
+            )
+        try:
+            rank_state = torch.load(rank_state_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            rank_state = torch.load(rank_state_path, map_location='cpu')
+
+        self.actor_optimizer.load_state_dict(rank_state['optimizer'])
+        if not self._is_offload_optimizer:
+            device = torch.device('cuda', torch.cuda.current_device())
+            for state in self.actor_optimizer.state.values():
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        state[key] = value.to(device)
+        self.actor_lr_scheduler.load_state_dict(rank_state['lr_scheduler'])
+        self.actor.grpo_optimizer_steps_completed = int(
+            rank_state.get('grpo_optimizer_steps_completed', 0)
+        )
+        self.actor.eitr_optimizer_steps_completed = int(
+            rank_state.get('eitr_optimizer_steps_completed', 0)
+        )
+        random.setstate(rank_state['python_rng_state'])
+        np.random.set_state(rank_state['numpy_rng_state'])
+        torch.set_rng_state(rank_state['torch_rng_state'])
+        torch.cuda.set_rng_state(rank_state['cuda_rng_state'])
+        torch.distributed.barrier()
 
 
 class CriticWorker(Worker):
