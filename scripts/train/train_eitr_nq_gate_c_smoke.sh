@@ -20,7 +20,9 @@ case "$STORAGE_ROOT" in
         fi
         ;;
 esac
-DATA_DIR="${DATA_DIR:-$STORAGE_ROOT/data/nq_search}"
+LEGACY_DATA_DIR="${DATA_DIR:-}"
+TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-${LEGACY_DATA_DIR:-$STORAGE_ROOT/data/nq_search}}"
+VAL_DATA_DIR="${VAL_DATA_DIR:-${LEGACY_DATA_DIR:-$STORAGE_ROOT/data/nq_search}}"
 BASE_MODEL="${BASE_MODEL:-$STORAGE_ROOT/models/Qwen2.5-3B}"
 SAVE_FULL_CHECKPOINT="${SAVE_FULL_CHECKPOINT:-false}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-null}"
@@ -58,7 +60,8 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-500}"
 MAX_OBS_LENGTH="${MAX_OBS_LENGTH:-1024}"
 MAX_TRAJECTORY_LENGTH="${MAX_TRAJECTORY_LENGTH:-8192}"
 EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-$MAX_RESPONSE_LENGTH}"
-ACTOR_LR="${ACTOR_LR:-1e-6}"
+# Search-R1 v0.3 GRPO uses 5e-7 (v0.2 used 1e-6).
+ACTOR_LR="${ACTOR_LR:-5e-7}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
 STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"
 FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"
@@ -76,6 +79,7 @@ TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-32}"
 VAL_DATA_NUM="${VAL_DATA_NUM:-64}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
+SHUFFLE_TRAIN_DATALOADER="${SHUFFLE_TRAIN_DATALOADER:-false}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-8192}"
@@ -94,6 +98,14 @@ case "$EITR_MODE" in
         ;;
 esac
 
+case "$SHUFFLE_TRAIN_DATALOADER" in
+    true|false) ;;
+    *)
+        echo "SHUFFLE_TRAIN_DATALOADER must be true or false; got: $SHUFFLE_TRAIN_DATALOADER" >&2
+        exit 2
+        ;;
+esac
+
 case "$BASE_MODEL" in
     *parallel_search*|*parallel-search*|*finance*)
         echo "Phase 2 requires a clean single-query Search-R1 initialization, got: $BASE_MODEL" >&2
@@ -106,8 +118,12 @@ if [[ ! -e "$BASE_MODEL" ]]; then
     exit 2
 fi
 
-if [[ ! -f "$DATA_DIR/train.parquet" || ! -f "$DATA_DIR/test.parquet" ]]; then
-    echo "Phase 2 requires $DATA_DIR/train.parquet and $DATA_DIR/test.parquet" >&2
+if [[ ! -f "$TRAIN_DATA_DIR/train.parquet" ]]; then
+    echo "Phase 2 training data is missing: $TRAIN_DATA_DIR/train.parquet" >&2
+    exit 2
+fi
+if [[ ! -f "$VAL_DATA_DIR/test.parquet" ]]; then
+    echo "Phase 2 validation data is missing: $VAL_DATA_DIR/test.parquet" >&2
     exit 2
 fi
 
@@ -208,7 +224,7 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
         --header 'Content-Type: application/json' \
         --data '{"queries":["who wrote Hamlet"],"topk":3,"return_scores":true}' \
         "$RETRIEVER_URL" >/dev/null
-    echo "Phase 2 preflight passed: data, model, data-disk write paths, exact-state limit, and retriever are ready."
+    echo "Phase 2 preflight passed: train=$TRAIN_DATA_DIR/train.parquet, val=$VAL_DATA_DIR/test.parquet, shuffle=$SHUFFLE_TRAIN_DATALOADER, model, data-disk write paths, exact-state limit, and retriever are ready."
     exit 0
 fi
 
@@ -216,8 +232,8 @@ fi
 # Validation remains pure answer EM because main_ppo_format intentionally
 # constructs its validation RewardManager without the training shaping scores.
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
-    data.train_files="$DATA_DIR/train.parquet" \
-    data.val_files="$DATA_DIR/test.parquet" \
+    data.train_files="$TRAIN_DATA_DIR/train.parquet" \
+    data.val_files="$VAL_DATA_DIR/test.parquet" \
     data.train_data_num="$TRAIN_DATA_NUM" \
     data.val_data_num="$VAL_DATA_NUM" \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
@@ -227,7 +243,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     data.max_response_length="$MAX_RESPONSE_LENGTH" \
     data.max_obs_length="$MAX_OBS_LENGTH" \
     data.max_trajectory_length="$MAX_TRAJECTORY_LENGTH" \
-    data.shuffle_train_dataloader=false \
+    data.shuffle_train_dataloader="$SHUFFLE_TRAIN_DATALOADER" \
     algorithm.adv_estimator=grpo \
     actor_rollout_ref.model.path="$BASE_MODEL" \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \

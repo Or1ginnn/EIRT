@@ -34,6 +34,7 @@ TRACKING_SPEC.loader.exec_module(TRACKING_MODULE)
 
 build_sibling_probe_tensors = EITR.build_sibling_probe_tensors
 build_online_probe_tensors = EITR.build_online_probe_tensors
+build_grpo_uids = EITR.build_grpo_uids
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
 probe_effect_diversity = EITR.probe_effect_diversity
 resolve_eitr_mode = EITR.resolve_eitr_mode
@@ -98,6 +99,20 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('reward_model.structure_format_score="$STRUCTURE_FORMAT_SCORE"', runner)
         self.assertIn('reward_model.final_format_score="$FINAL_FORMAT_SCORE"', runner)
         self.assertIn('reward_model.retrieval_score="$RETRIEVAL_SCORE"', runner)
+        self.assertIn('ACTOR_LR="${ACTOR_LR:-5e-7}"', runner)
+
+    def test_formal_run_uses_mixed_train_and_nq_validation(self):
+        runner = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "train"
+            / "train_eitr_nq_gate_c_full.sh"
+        ).read_text()
+        self.assertIn("data/nq_hotpotqa_train", runner)
+        self.assertIn("data/nq_search", runner)
+        self.assertIn('SHUFFLE_TRAIN_DATALOADER="${SHUFFLE_TRAIN_DATALOADER:-true}"', runner)
+        self.assertIn('TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-null}"', runner)
+        self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
 
 
 class ObservationTruncationTest(unittest.TestCase):
@@ -136,6 +151,16 @@ class ObservationTruncationTest(unittest.TestCase):
 
 
 class EITRMathTest(unittest.TestCase):
+    def test_mixed_dataset_grpo_uids_do_not_collide(self):
+        uids = build_grpo_uids(
+            ["nq", "nq", "hotpotqa", "hotpotqa"],
+            [7, 7, 7, 7],
+        )
+        self.assertEqual(uids.tolist(), ["nq::7", "nq::7", "hotpotqa::7", "hotpotqa::7"])
+        self.assertNotEqual(uids[0], uids[2])
+        with self.assertRaisesRegex(ValueError, "metadata length mismatch"):
+            build_grpo_uids(["nq"], [1, 2])
+
     def test_induced_js_is_zero_at_old_policy_and_has_finite_gradient(self):
         old = torch.zeros(1, 4)
         current = old.clone().requires_grad_(True)

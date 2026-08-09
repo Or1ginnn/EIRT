@@ -41,6 +41,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.eitr import (
     assign_probe_old_log_probs,
     attach_eitr_probe_tensors,
+    build_grpo_uids,
     flatten_probe_logprob_inputs,
     resolve_eitr_mode,
     validate_eitr_config,
@@ -936,7 +937,10 @@ class RayPPOTrainer(object):
 
                         # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                         #                                         dtype=object)
-                        batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
+                        batch.non_tensor_batch['uid'] = build_grpo_uids(
+                            batch.non_tensor_batch['data_source'],
+                            batch.non_tensor_batch['index'],
+                        )
                                             
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)

@@ -242,6 +242,18 @@ def validate_sibling_group_layout(uids: Sequence[Any], *, n_agent: int, world_si
         )
 
 
+def build_grpo_uids(data_sources: Sequence[Any], indices: Sequence[Any]) -> np.ndarray:
+    """Build collision-free rollout group IDs for concatenated QA datasets."""
+    if len(data_sources) != len(indices):
+        raise ValueError(
+            f"GRPO uid metadata length mismatch: sources={len(data_sources)}, indices={len(indices)}"
+        )
+    return np.asarray(
+        [f"{str(source)}::{str(index)}" for source, index in zip(data_sources, indices)],
+        dtype=object,
+    )
+
+
 def _softmax(values: Sequence[float], temperature: float) -> np.ndarray:
     array = np.asarray(values, dtype=np.float64)
     if array.size == 0:

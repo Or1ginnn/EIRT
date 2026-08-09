@@ -173,6 +173,12 @@ Collector 的具体拒绝原因仍以 `eitr/collector_*` 记录，例如 missing
 EM，不加入格式 shaping。该奖励与 EITR correction 独立：GRPO 使用上述标量奖励，
 EITR 仍在随后的 correction pass 中最小化环境诱导分布漂移。
 
+正式训练默认读取 `data/nq_hotpotqa_train/train.parquet`，并开启 dataloader
+shuffle；该文件由NQ与HotpotQA顺序拼接而成，不打乱会让短预算训练偏向文件前部的
+NQ。验证单独读取 `data/nq_search/test.parquet` 中固定抽样的256条NQ，因此训练集与
+验证集不再共享同一个 `DATA_DIR`。混合训练还使用 `data_source::index` 作为GRPO组
+ID，避免两个数据源中相同的局部编号被误合并。
+
 默认所有缓存、日志、checkpoint、W&B 与临时文件都写入：
 
 ```text
