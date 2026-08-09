@@ -60,6 +60,9 @@ MAX_TRAJECTORY_LENGTH="${MAX_TRAJECTORY_LENGTH:-8192}"
 EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-$MAX_RESPONSE_LENGTH}"
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
+STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"
+FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"
+RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0}"
 LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.285}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-smoke}"
@@ -209,7 +212,10 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
     exit 0
 fi
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+# Search-R1 v0.3 reward: answer EM plus trajectory/final-answer format shaping.
+# Validation remains pure answer EM because main_ppo_format intentionally
+# constructs its validation RewardManager without the training shaping scores.
+PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     data.train_files="$DATA_DIR/train.parquet" \
     data.val_files="$DATA_DIR/test.parquet" \
     data.train_data_num="$TRAIN_DATA_NUM" \
@@ -285,6 +291,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir="$CHECKPOINT_DIR" \
+    reward_model.structure_format_score="$STRUCTURE_FORMAT_SCORE" \
+    reward_model.final_format_score="$FINAL_FORMAT_SCORE" \
+    reward_model.retrieval_score="$RETRIEVAL_SCORE" \
     hydra.run.dir="$HYDRA_RUN_DIR" \
     hydra.job.chdir=false \
     max_turns=4 \
