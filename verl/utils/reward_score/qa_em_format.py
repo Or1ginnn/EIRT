@@ -16,6 +16,22 @@ import re
 import string
 import random
 
+
+ASSISTANT_MARKER_PATTERN = r"<\|im_start\|>assistant\s*"
+
+
+def extract_assistant_content(text):
+    """Return only model-generated content after the final assistant marker.
+
+    Search-R1 prompts contain literal ``<answer>...</answer>`` examples.  Those
+    examples are instructions, not model actions, and must never be eligible
+    for answer extraction or format reward.
+    """
+    matches = list(re.finditer(ASSISTANT_MARKER_PATTERN, text))
+    if not matches:
+        return text
+    return text[matches[-1].end():]
+
 def normalize_answer(s):
     def remove_articles(text):
         return re.sub(r"\b(a|an|the)\b", " ", text)
@@ -47,15 +63,14 @@ def em_check(prediction, golden_answers):
 
 
 def is_valid_sequence(text):
-    # Find the position of "<|im_start|>assistant" with potential whitespace
-    assistant_pattern = r"<\|im_start\|>assistant\s*"
-    assistant_match = re.search(assistant_pattern, text)
+    # Find the final assistant turn and validate generated content only.
+    assistant_matches = list(re.finditer(ASSISTANT_MARKER_PATTERN, text))
     
-    if not assistant_match:
+    if not assistant_matches:
         return False, "Missing assistant marker"
     
     # Extract the content after the assistant marker
-    start_pos = assistant_match.end()
+    start_pos = assistant_matches[-1].end()
     content = text[start_pos:]
     
     # Check for balanced tags
@@ -65,6 +80,13 @@ def is_valid_sequence(text):
         closing_count = len(re.findall(f"</{tag}>", content))
         if opening_count != closing_count:
             return False, f"Mismatch in {tag} tags: {opening_count} opening vs {closing_count} closing tags"
+
+    # Closed but empty actions are not valid environment actions and must not
+    # receive structure reward either.
+    for tag in ("search", "answer"):
+        for block in re.findall(rf"<{tag}>(.*?)</{tag}>", content, re.DOTALL):
+            if not block.strip():
+                return False, f"Empty {tag} block"
     
     # Now check for proper sequence pattern and no extraneous content
     
@@ -122,23 +144,25 @@ def is_valid_sequence(text):
 
 
 def extract_solution(solution_str):
-    """Extract the equation from the solution string."""
+    """Extract the final answer from model-generated content only."""
 
     answer_pattern = r'<answer>(.*?)</answer>'
-    match = re.finditer(answer_pattern, solution_str, re.DOTALL)
+    assistant_content = extract_assistant_content(solution_str)
+    match = re.finditer(answer_pattern, assistant_content, re.DOTALL)
     matches = list(match)
     
-    # If there are 0 or exactly 1 matches, return None
-    if len(matches) <= 1:
+    if not matches:
         return None
     
-    # If there are 2 or more matches, return the last one
-    return matches[-1].group(1).strip()
+    # A trajectory should contain one final answer.  Taking the last complete
+    # generated block is robust to an earlier malformed/retried answer action.
+    answer = matches[-1].group(1).strip()
+    return answer or None
 
 
 def extract_information_blocks(text: str) -> list[str]:
     pattern = r"<information>(.*?)</information>"
-    matches = re.findall(pattern, text, re.DOTALL)
+    matches = re.findall(pattern, extract_assistant_content(text), re.DOTALL)
     return [match.strip() for match in matches]
 
 

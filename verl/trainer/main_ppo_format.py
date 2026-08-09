@@ -61,16 +61,16 @@ class RewardManager():
 
             prompt_length = prompt_ids.shape[-1]
 
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
             response_ids = data_item.batch['responses']
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
+            # Score only the generated trajectory.  The user prompt contains
+            # literal <answer> examples and must not be treated as a model
+            # answer.  Keep the assistant marker because the v0.3 structure
+            # validator uses it to delimit the generated turn.
+            response_str = self.tokenizer.decode(valid_response_ids)
+            sequences_str = f"<|im_start|>assistant\n{response_str}"
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 

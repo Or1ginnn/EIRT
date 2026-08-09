@@ -17,7 +17,11 @@ SPEC.loader.exec_module(QA_EM_FORMAT)
 
 class SearchR1V03RewardTest(unittest.TestCase):
     GROUND_TRUTH = {"target": ["Paris"]}
-    PREFIX = "prompt example <answer>demo</answer><|im_start|>assistant\n"
+    PREFIX = (
+        "instructions inside <answer> and </answer>; "
+        "for example <answer>Beijing</answer>"
+        "<|im_start|>assistant\n"
+    )
 
     def score(self, response):
         return QA_EM_FORMAT.compute_score_em(
@@ -40,6 +44,24 @@ class SearchR1V03RewardTest(unittest.TestCase):
         )
         self.assertEqual(self.score("<answer>London</answer>"), 0.1)
         self.assertEqual(self.score("London"), 0.0)
+
+    def test_prompt_answer_examples_are_never_scored(self):
+        self.assertEqual(self.score("<think>I do not know yet</think>"), 0.0)
+        self.assertEqual(self.score(""), 0.0)
+
+    def test_generated_answer_is_used_despite_multiple_prompt_examples(self):
+        self.assertEqual(self.score("<answer>London</answer>"), 0.1)
+        self.assertEqual(self.score("<answer>Paris</answer>"), 0.8)
+
+    def test_unclosed_generated_answer_gets_zero(self):
+        self.assertEqual(self.score("<answer>Paris"), 0.0)
+
+    def test_empty_generated_answer_gets_zero(self):
+        self.assertEqual(self.score("<answer></answer>"), 0.0)
+        self.assertEqual(
+            self.score("<think>reasoning</think><answer>   </answer>"),
+            0.0,
+        )
 
 
 if __name__ == "__main__":
