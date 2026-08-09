@@ -30,6 +30,8 @@ from verl.trainer.ppo.eitr import (
     coverage_weighted_state_scale,
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
+    rollout_averaged_env_drift,
+    should_run_post_diagnostic,
     resolve_eitr_mode,
     validate_eitr_optimization_schedule,
 )
@@ -52,11 +54,13 @@ class DataParallelPPOActor(BasePPOActor):
         config,
         actor_module: nn.Module,
         actor_optimizer: torch.optim.Optimizer = None,
+        eitr_optimizer: torch.optim.Optimizer = None,
     ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.eitr_optimizer = eitr_optimizer
         self.use_remove_padding = self.config.get('use_remove_padding', False)
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
@@ -66,6 +70,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_mode = resolve_eitr_mode(self.eitr_config)
         self.eitr_uses_probes = self.eitr_mode != 'off'
         self.eitr_lambda_env = float(self.eitr_config.get('lambda_env', 0.1))
+        self.eitr_post_diagnostic_freq = int(
+            self.eitr_config.get('post_diagnostic_freq', 0)
+        )
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
         self.grpo_optimizer_steps_completed = 0
@@ -75,6 +82,10 @@ class DataParallelPPOActor(BasePPOActor):
             self.ppo_epochs,
             self.eitr_correction_passes,
         )
+        if self.eitr_mode == 'eitr' and self.eitr_optimizer is None:
+            raise ValueError('EITR mode requires an independent correction optimizer')
+        if self.eitr_mode != 'eitr' and self.eitr_optimizer is not None:
+            raise ValueError('Only EITR mode may own a correction optimizer')
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
@@ -173,14 +184,16 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
-    def _optimizer_step(self):
+    def _optimizer_step(self, optimizer=None):
         assert self.config.grad_clip is not None
+
+        optimizer = optimizer or self.actor_optimizer
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        self.actor_optimizer.step()
+        optimizer.step()
         return grad_norm
 
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
@@ -320,6 +333,33 @@ class DataParallelPPOActor(BasePPOActor):
             'log_ratio_clipfrac': float(estimates['log_ratio_clipfrac'].detach().mean().item()),
         }
 
+    def _iter_eitr_state_chunks(self, mini_batch):
+        """Yield fixed-state chunks while keeping all K probes of a state together."""
+        if self.config.use_dynamic_bsz:
+            max_token_len = (
+                self.config.ppo_max_token_len_per_gpu
+                * self.ulysses_sequence_parallel_size
+            )
+            rollout_micro_batches, _ = rearrange_micro_batches(
+                batch=mini_batch,
+                max_token_len=max_token_len,
+            )
+        else:
+            rollout_micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
+
+        for rollout_micro_batch in rollout_micro_batches:
+            physical_probe_count = int(
+                rollout_micro_batch['eitr_probe_valid'].size(1)
+            )
+            probe_micro_batch_size = int(
+                self.eitr_config.get('probe_micro_batch_size', 4)
+            )
+            states_per_probe_chunk = max(
+                probe_micro_batch_size // physical_probe_count,
+                1,
+            )
+            yield from rollout_micro_batch.split(states_per_probe_chunk)
+
     def update_policy(self, data: DataProto):
         self.actor_module.train()
 
@@ -431,6 +471,8 @@ class DataParallelPPOActor(BasePPOActor):
         # avoids giving EITR/Probe-GRPO an extra reward-bearing policy update.
         # With zero active states the whole section is skipped, so parameters
         # and optimizer state exactly match ordinary GRPO.
+        post_drift_stat_tensor = None
+        post_diagnostic_ran = False
         if self.eitr_uses_probes:
             self.actor_optimizer.zero_grad()
             global_active_state_count = torch.tensor(
@@ -470,6 +512,10 @@ class DataParallelPPOActor(BasePPOActor):
                     if not probe_forward_enabled:
                         continue
 
+                    if eitr_loss_enabled:
+                        self.eitr_optimizer.zero_grad()
+                    local_applied_grad_sq = 0.0
+
                     for mini_batch in dataloader:
                         mini_global_state_count = torch.tensor(
                             float(mini_batch['eitr_state_valid'].sum().item()),
@@ -484,149 +530,152 @@ class DataParallelPPOActor(BasePPOActor):
                         if mini_global_state_count.item() <= 0:
                             continue
 
-                        mini_global_rollout_state_count = torch.tensor(
-                            float(mini_batch['eitr_state_valid'].numel()),
+                        for state_chunk in self._iter_eitr_state_chunks(mini_batch):
+                            state_chunk = state_chunk.cuda()
+                            eitr_result = self._compute_eitr_micro_batch(
+                                state_chunk,
+                                temperature,
+                                track_model_grad=eitr_loss_enabled,
+                            )
+                            if eitr_result is None:
+                                continue
+
+                            valid_state_count = eitr_result['valid_state_count']
+                            # Every chunk is normalized by the same full rollout
+                            # denominator. Gradients accumulate over all mini-batches
+                            # before the single V6 correction step.
+                            state_weight = coverage_weighted_state_scale(
+                                valid_state_count,
+                                float(global_rollout_state_count.item()),
+                                world_size=eitr_world_size,
+                            )
+                            raw_logprob_grad = torch.autograd.grad(
+                                eitr_result['loss'],
+                                eitr_result['current_seq_logp'],
+                                retain_graph=eitr_loss_enabled,
+                                allow_unused=True,
+                            )[0]
+                            raw_grad_sq = (
+                                float(raw_logprob_grad.detach().float().square().sum().item())
+                                if raw_logprob_grad is not None
+                                else 0.0
+                            )
+                            applied_scale = (
+                                self.eitr_lambda_env * state_weight
+                                if eitr_loss_enabled and valid_state_count > 0
+                                else 0.0
+                            )
+                            applied_grad_sq = raw_grad_sq * applied_scale * applied_scale
+                            local_applied_grad_sq += applied_grad_sq
+
+                            stats = pass_stats[pass_index]
+                            stats['raw_grad_sq_sum'] += raw_grad_sq
+                            stats['applied_grad_sq_sum'] += applied_grad_sq
+                            if valid_state_count > 0:
+                                stats['js_sum'] += eitr_result['js_sum']
+                                stats['state_count'] += valid_state_count
+                                stats['probe_count'] += eitr_result['valid_probe_count']
+                                stats['ess_sum'] += eitr_result['ess_mean'] * valid_state_count
+                                stats['clipfrac_sum'] += (
+                                    eitr_result['log_ratio_clipfrac'] * valid_state_count
+                                )
+                                stats['active_micro_batch_count'] += 1
+                                stats['log_ratio_abs_max'] = max(
+                                    stats['log_ratio_abs_max'],
+                                    eitr_result['log_ratio_abs_max'],
+                                )
+                            append_to_dict(metrics, {
+                                'actor/eitr_induced_js': eitr_result['js_mean'],
+                                'actor/eitr_probe_ess': eitr_result['ess_mean'],
+                                'actor/eitr_log_ratio_abs_max': eitr_result['log_ratio_abs_max'],
+                                'actor/eitr_log_ratio_clipfrac': eitr_result['log_ratio_clipfrac'],
+                                'actor/eitr_correction_pass': float(correction_index),
+                                'actor/eitr_state_chunk_size': float(
+                                    state_chunk['eitr_state_slot'].size(0)
+                                ),
+                            })
+
+                            if eitr_loss_enabled:
+                                correction_loss = eitr_result['loss'] * applied_scale
+                                correction_loss.backward()
+                                del correction_loss
+                            del raw_logprob_grad, eitr_result
+
+                    if eitr_loss_enabled:
+                        global_applied_grad_sq = torch.tensor(
+                            local_applied_grad_sq,
                             dtype=torch.float64,
                             device=torch.cuda.current_device(),
                         )
                         if distributed:
                             torch.distributed.all_reduce(
-                                mini_global_rollout_state_count,
+                                global_applied_grad_sq,
                                 op=torch.distributed.ReduceOp.SUM,
                             )
+                        if global_applied_grad_sq.item() > 0:
+                            correction_grad_norm = self._optimizer_step(
+                                self.eitr_optimizer
+                            )
+                            eitr_correction_optimizer_step_count += 1
+                            append_to_dict(metrics, {
+                                'actor/eitr_correction_grad_norm': correction_grad_norm.detach().item(),
+                                f'actor/grad_norm_pass_{pass_index}': correction_grad_norm.detach().item(),
+                            })
+                        self.eitr_optimizer.zero_grad()
+                        self.actor_optimizer.zero_grad()
 
-                        if self.config.use_dynamic_bsz:
-                            max_token_len = (
-                                self.config.ppo_max_token_len_per_gpu
-                                * self.ulysses_sequence_parallel_size
-                            )
-                            micro_batches, _ = rearrange_micro_batches(
-                                batch=mini_batch,
-                                max_token_len=max_token_len,
-                            )
-                        else:
-                            micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
-
-                        if eitr_loss_enabled:
-                            self.actor_optimizer.zero_grad()
-                        local_applied_grad_sq = 0.0
-
-                        for rollout_micro_batch in micro_batches:
-                            # ``probe_micro_batch_size`` is expressed in flattened
-                            # query sequences. Keep all K samples of one state
-                            # together, then backward each state chunk immediately
-                            # so earlier probe activations can be released.
-                            physical_probe_count = int(
-                                rollout_micro_batch['eitr_probe_valid'].size(1)
-                            )
-                            probe_micro_batch_size = int(
-                                self.eitr_config.get('probe_micro_batch_size', 4)
-                            )
-                            states_per_probe_chunk = max(
-                                probe_micro_batch_size // physical_probe_count,
-                                1,
-                            )
-                            state_chunks = rollout_micro_batch.split(states_per_probe_chunk)
-
-                            for state_chunk in state_chunks:
-                                state_chunk = state_chunk.cuda()
-                                eitr_result = self._compute_eitr_micro_batch(
-                                    state_chunk,
-                                    temperature,
-                                    track_model_grad=eitr_loss_enabled,
+                        outer_update_step = int(data.meta_info.get('outer_update_step', 0))
+                        post_diagnostic_ran = should_run_post_diagnostic(
+                            outer_update_step,
+                            self.eitr_post_diagnostic_freq,
+                            correction_applied=(
+                                eitr_correction_optimizer_step_count > 0
+                            ),
+                        )
+                        if post_diagnostic_ran:
+                            post_js_sum = 0.0
+                            post_state_count = 0.0
+                            for mini_batch in dataloader:
+                                mini_global_state_count = torch.tensor(
+                                    float(mini_batch['eitr_state_valid'].sum().item()),
+                                    dtype=torch.float64,
+                                    device=torch.cuda.current_device(),
                                 )
-                                if eitr_result is None:
-                                    # Online packing never reaches this branch.
-                                    # The legacy sibling ablation has group-level
-                                    # physical slots; its validated contiguous
-                                    # layout makes the same chunks empty on every
-                                    # rank, so they can be skipped symmetrically.
+                                if distributed:
+                                    torch.distributed.all_reduce(
+                                        mini_global_state_count,
+                                        op=torch.distributed.ReduceOp.SUM,
+                                    )
+                                if mini_global_state_count.item() <= 0:
                                     continue
-
-                                valid_state_count = eitr_result['valid_state_count']
-                                state_weight = coverage_weighted_state_scale(
-                                    valid_state_count,
-                                    float(mini_global_rollout_state_count.item()),
-                                    world_size=eitr_world_size,
-                                )
-                                raw_logprob_grad = torch.autograd.grad(
-                                    eitr_result['loss'],
-                                    eitr_result['current_seq_logp'],
-                                    retain_graph=eitr_loss_enabled,
-                                    allow_unused=True,
-                                )[0]
-                                raw_grad_sq = (
-                                    float(raw_logprob_grad.detach().float().square().sum().item())
-                                    if raw_logprob_grad is not None
-                                    else 0.0
-                                )
-                                applied_scale = (
-                                    self.eitr_lambda_env * state_weight
-                                    if eitr_loss_enabled and valid_state_count > 0
-                                    else 0.0
-                                )
-                                applied_grad_sq = raw_grad_sq * applied_scale * applied_scale
-                                local_applied_grad_sq += applied_grad_sq
-
-                                stats = pass_stats[pass_index]
-                                stats['raw_grad_sq_sum'] += raw_grad_sq
-                                stats['applied_grad_sq_sum'] += applied_grad_sq
-                                if valid_state_count > 0:
-                                    stats['js_sum'] += eitr_result['js_sum']
-                                    stats['state_count'] += valid_state_count
-                                    stats['probe_count'] += eitr_result['valid_probe_count']
-                                    stats['ess_sum'] += eitr_result['ess_mean'] * valid_state_count
-                                    stats['clipfrac_sum'] += (
-                                        eitr_result['log_ratio_clipfrac'] * valid_state_count
+                                for state_chunk in self._iter_eitr_state_chunks(mini_batch):
+                                    state_chunk = state_chunk.cuda()
+                                    post_result = self._compute_eitr_micro_batch(
+                                        state_chunk,
+                                        temperature,
+                                        track_model_grad=False,
                                     )
-                                    stats['active_micro_batch_count'] += 1
-                                    stats['log_ratio_abs_max'] = max(
-                                        stats['log_ratio_abs_max'],
-                                        eitr_result['log_ratio_abs_max'],
-                                    )
-                                append_to_dict(metrics, {
-                                    'actor/eitr_induced_js': eitr_result['js_mean'],
-                                    'actor/eitr_probe_ess': eitr_result['ess_mean'],
-                                    'actor/eitr_log_ratio_abs_max': eitr_result['log_ratio_abs_max'],
-                                    'actor/eitr_log_ratio_clipfrac': eitr_result['log_ratio_clipfrac'],
-                                    'actor/eitr_correction_pass': float(correction_index),
-                                    'actor/eitr_state_chunk_size': float(
-                                        state_chunk['eitr_state_slot'].size(0)
-                                    ),
-                                })
-
-                                if eitr_loss_enabled:
-                                    # Invalid local rows keep the same FSDP
-                                    # backward structure through their zero-loss
-                                    # dummy graph. Backward now releases this
-                                    # chunk before the next state chunk forward.
-                                    correction_loss = eitr_result['loss'] * applied_scale
-                                    correction_loss.backward()
-                                    del correction_loss
-                                del raw_logprob_grad, eitr_result
-
-                        if eitr_loss_enabled:
-                            global_applied_grad_sq = torch.tensor(
-                                local_applied_grad_sq,
+                                    if post_result is not None:
+                                        post_js_sum += post_result['js_sum']
+                                        post_state_count += post_result['valid_state_count']
+                                    del post_result
+                            post_drift_stat_tensor = torch.tensor(
+                                [post_js_sum, post_state_count],
                                 dtype=torch.float64,
                                 device=torch.cuda.current_device(),
                             )
                             if distributed:
                                 torch.distributed.all_reduce(
-                                    global_applied_grad_sq,
+                                    post_drift_stat_tensor,
                                     op=torch.distributed.ReduceOp.SUM,
                                 )
-                            if global_applied_grad_sq.item() > 0:
-                                correction_grad_norm = self._optimizer_step()
-                                eitr_correction_optimizer_step_count += 1
-                                append_to_dict(metrics, {
-                                    'actor/eitr_correction_grad_norm': correction_grad_norm.detach().item(),
-                                    f'actor/grad_norm_pass_{pass_index}': correction_grad_norm.detach().item(),
-                                })
-                            else:
-                                # Do not advance AdamW or apply weight decay for
-                                # a mathematically zero correction.
-                                self.actor_optimizer.zero_grad()
+                            if int(post_drift_stat_tensor[1].item()) != int(
+                                global_active_state_count.item()
+                            ):
+                                raise RuntimeError(
+                                    'Post-correction EITR re-score did not cover the '
+                                    'same active states as the pre-correction pass'
+                                )
 
         self.actor_optimizer.zero_grad()
 
@@ -690,7 +739,23 @@ class DataParallelPPOActor(BasePPOActor):
                 })
 
             final_probe_pass = total_pass_count - 1
+            if int(pass_stat_tensor[final_probe_pass, 1].item()) != int(
+                global_active_state_count.item()
+            ):
+                raise RuntimeError(
+                    'Pre-correction EITR pass did not cover every active state'
+                )
             final_state_count = max(float(pass_stat_tensor[final_probe_pass, 1].item()), 1.0)
+            rollout_denominator = max(global_rollout_state_count.item(), 1.0)
+            env_drift_pre = rollout_averaged_env_drift(
+                pass_stat_tensor[final_probe_pass, 0].item(),
+                rollout_denominator,
+            )
+            correction_lr = float(
+                self.eitr_optimizer.param_groups[0]['lr']
+                if self.eitr_optimizer is not None
+                else 0.0
+            )
             append_to_dict(metrics, {
                 'actor/eitr_global_induced_js': float(
                     pass_stat_tensor[final_probe_pass, 0].item() / final_state_count
@@ -703,16 +768,27 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 'actor/eitr_coverage': float(
                     global_active_state_count.item()
-                    / max(global_rollout_state_count.item(), 1.0)
+                    / rollout_denominator
                 ),
                 'actor/eitr_lambda_env': self.eitr_lambda_env,
                 'actor/eitr_effective_lambda': float(
                     self.eitr_lambda_env
                     * global_active_state_count.item()
-                    / max(global_rollout_state_count.item(), 1.0)
+                    / rollout_denominator
                     if self.eitr_mode == 'eitr'
                     else 0.0
                 ),
+                'actor/eitr_correction_lr': correction_lr,
+                'actor/eitr_effective_step_scale': float(
+                    correction_lr
+                    * self.eitr_lambda_env
+                    * global_active_state_count.item()
+                    / rollout_denominator
+                    if self.eitr_mode == 'eitr'
+                    else 0.0
+                ),
+                'actor/eitr_env_drift_pre': env_drift_pre,
+                'actor/eitr_post_diagnostic_ran': float(post_diagnostic_ran),
                 'actor/eitr_loss_applied': float(
                     eitr_correction_optimizer_step_count > 0
                 ),
@@ -720,11 +796,18 @@ class DataParallelPPOActor(BasePPOActor):
                 'actor/eitr_grpo_pass_count': float(self.ppo_epochs),
                 'actor/eitr_correction_pass_count': float(self.eitr_correction_passes),
             })
+            if post_drift_stat_tensor is not None:
+                env_drift_post = rollout_averaged_env_drift(
+                    post_drift_stat_tensor[0].item(),
+                    rollout_denominator,
+                )
+                append_to_dict(metrics, {
+                    'actor/eitr_env_drift_post': env_drift_post,
+                    'actor/eitr_env_drift_delta': env_drift_post - env_drift_pre,
+                })
 
-        # A trainer outer update can contain several synchronized AdamW steps.
-        # Report ordinary GRPO and EITR correction steps separately so paired
-        # experiments share an unambiguous outer x-axis without hiding the
-        # method's extra correction work.
+        # Report GRPO AdamW and the single full-batch EITR SGD step separately
+        # so paired experiments share an unambiguous outer x-axis.
         self.grpo_optimizer_steps_completed += grpo_optimizer_step_count
         self.eitr_optimizer_steps_completed += eitr_correction_optimizer_step_count
         append_to_dict(metrics, {

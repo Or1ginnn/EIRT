@@ -86,6 +86,36 @@ def coverage_weighted_state_scale(
     return valid_state_count * world_size / global_rollout_state_count
 
 
+def rollout_averaged_env_drift(js_sum: float, global_rollout_state_count: float) -> float:
+    """Aggregate V6 environment drift with the full rollout denominator."""
+    js_sum = float(js_sum)
+    global_rollout_state_count = float(global_rollout_state_count)
+    if global_rollout_state_count < 0:
+        raise ValueError("global_rollout_state_count must be non-negative")
+    if global_rollout_state_count == 0:
+        return 0.0
+    return js_sum / global_rollout_state_count
+
+
+def should_run_post_diagnostic(
+    outer_update_step: int,
+    frequency: int,
+    *,
+    correction_applied: bool,
+) -> bool:
+    """Schedule the extra post-correction query re-score."""
+    outer_update_step = int(outer_update_step)
+    frequency = int(frequency)
+    if frequency < 0:
+        raise ValueError("post diagnostic frequency must be non-negative")
+    return bool(
+        correction_applied
+        and frequency > 0
+        and outer_update_step > 0
+        and outer_update_step % frequency == 0
+    )
+
+
 def eitr_probe_enabled_for_pass(
     config: Any,
     pass_index: int,
@@ -127,6 +157,38 @@ def validate_eitr_optimization_schedule(
         raise ValueError(
             f"EITR mode={mode} requires eitr.correction_passes >= 1"
         )
+    if mode != "off" and int(correction_passes) != 1:
+        raise ValueError(
+            "V6 EITR requires exactly one full-batch correction pass"
+        )
+
+
+def build_eitr_correction_optimizer(
+    parameters,
+    config: Any,
+    *,
+    default_lr: float,
+):
+    """Build the stateless V6 correction optimizer without touching AdamW state."""
+    if resolve_eitr_mode(config) != "eitr":
+        return None
+    optimizer_name = str(
+        _config_value(config, "correction_optimizer", "sgd")
+    ).strip().lower()
+    if optimizer_name != "sgd":
+        raise ValueError(
+            "V6 EITR correction_optimizer must be 'sgd'"
+        )
+    configured_lr = _config_value(config, "correction_lr", None)
+    correction_lr = float(default_lr if configured_lr is None else configured_lr)
+    if correction_lr <= 0:
+        raise ValueError("EITR correction_lr must be positive")
+    return torch.optim.SGD(
+        parameters,
+        lr=correction_lr,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
 
 
 def validate_eitr_config(
@@ -158,6 +220,11 @@ def validate_eitr_config(
     score_temperature = float(_config_value(config, "retrieval_score_temperature", 0.1))
     min_state_coverage = float(_config_value(config, "min_state_coverage", 0.0))
     lambda_env = float(_config_value(config, "lambda_env", 0.1))
+    correction_optimizer = str(
+        _config_value(config, "correction_optimizer", "sgd")
+    ).strip().lower()
+    correction_lr = _config_value(config, "correction_lr", None)
+    post_diagnostic_freq = int(_config_value(config, "post_diagnostic_freq", 0))
     log_ratio_clip = float(_config_value(config, "log_ratio_clip", 10.0))
     informative_js_threshold = float(_config_value(config, "informative_js_threshold", 0.01))
     min_informative_state_rate = float(
@@ -234,6 +301,12 @@ def validate_eitr_config(
         raise ValueError("EITR min_state_coverage must be in [0, 1]")
     if lambda_env < 0:
         raise ValueError("EITR lambda_env must be non-negative")
+    if correction_optimizer != "sgd":
+        raise ValueError("V6 EITR correction_optimizer must be 'sgd'")
+    if correction_lr is not None and float(correction_lr) <= 0:
+        raise ValueError("EITR correction_lr must be positive")
+    if post_diagnostic_freq < 0:
+        raise ValueError("EITR post_diagnostic_freq must be non-negative")
     if log_ratio_clip <= 0:
         raise ValueError("EITR log_ratio_clip must be positive")
     if informative_js_threshold < 0:

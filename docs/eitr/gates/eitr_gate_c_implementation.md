@@ -1,8 +1,8 @@
-# Conditional EITR Phase 2：V5.1 实现与安全检查
+# Conditional EITR Phase 2：V6 实现与安全检查
 
-日期：2026-08-08
+日期：2026-08-09
 
-> 当前状态：V5.1 代码与 CPU 单元测试已完成；两卡 FSDP paired smoke 尚未运行，因此本文档不声称训练收益或服务器端运行通过。
+> 当前状态：V6 coverage-weighted correction、独立 SGD 与 CPU 单元测试已完成；新的两卡 FSDP smoke 尚未运行，因此本文档不声称训练收益或服务器端运行通过。
 
 ## 1. Phase 2 的作用
 
@@ -72,7 +72,9 @@ Adaptive dual beta 已删除。系数固定为 `lambda_env`。
 3. 执行 actor.ppo_epochs 次普通 GRPO（默认1次）
 4. candidate 对缓存 query 重新评分
 5. probe_only：只记录 JS/ESS/ratio，不更新参数
-6. eitr：只对 lambda_env * D_env 做 correction optimizer step
+6. eitr：在完整 rollout batch 上累积 lambda_env * D_env 梯度
+7. 使用独立、无 momentum/weight decay 的 SGD 执行一次 correction
+8. 按配置周期重新评分相同 cached probes，记录 D_pre/D_post/delta
 ```
 
 Correction 不是第二次 reward-bearing GRPO epoch。这样零有效 search 时，该 batch 的参数与 optimizer 更新都退化为原始普通 GRPO；EITR 也不会凭空获得额外任务梯度。
@@ -96,6 +98,9 @@ eitr:
   max_action_tokens: 500
   max_probe_prompt_tokens: 8692
   correction_passes: 1
+  correction_optimizer: sgd
+  correction_lr: 5e-7
+  post_diagnostic_freq: 10
   lambda_env: 0.1
   log_ratio_clip: 10.0
 ```
@@ -107,8 +112,10 @@ eitr:
 检索 observation 的单轮保留上限为 `1024` token，完整 trajectory 的累计保存上限与
 每轮提供给模型的 rolling prompt 均为 `8192` token。两者使用独立配置，当前取值相同。
 
-三种 paired 模式统一继承 Search-R1 Qwen2.5 GRPO 的 actor 优化参数：
-`lr=1e-6`、`lr_warmup_steps_ratio=0.285`。EITR 不单独调整学习率。
+三种 paired 模式的 GRPO 统一使用 Search-R1 v0.3 actor AdamW 参数。EITR
+correction 使用独立 SGD，`momentum=0, weight_decay=0`；默认 correction LR
+继承 actor LR，当前正式配置为 `5e-7`。实际一阶尺度同时记录
+`correction_lr * lambda_env * coverage`，不再继承 GRPO AdamW 的历史状态。
 
 三种 paired 模式统一使用 `rollout.top_p=1.0, top_k=-1`。EITR 的 SNIS ratio 使用 actor 完整 softmax 下的 query sequence log-prob，因此采样也必须来自同一个未截断分布；`probe_only/eitr` 若配置 nucleus 或 top-k 截断会在启动时直接拒绝。
 
@@ -142,8 +149,8 @@ LR scheduler 也以 outer update 为时间单位，因此 paired 的 `off/probe_
 - `actor/optimizer_step_count`
 - 对应的 `*_cumulative` 累计指标
 
-在默认 smoke 参数下，每个 outer update 有 5 次 GRPO optimizer steps；只有
-`eitr` 模式会在有效 state 上增加 0～5 次 correction optimizer steps。
+在默认 smoke 参数下，每个 outer update 有 5 次 GRPO AdamW steps；只有
+`eitr` 模式会在完整 rollout batch 梯度累积结束后增加 0或1次 EITR SGD step。
 
 ### 6.2 EITR 与环境指标
 
@@ -154,6 +161,9 @@ LR scheduler 也以 outer update 为时间单位，因此 paired 的 `off/probe_
 - `eitr/effective_probe_count_mean/min/max`
 - `eitr/deferred_additional_search_state_count`
 - `actor/eitr_global_induced_js`
+- `actor/eitr_env_drift_pre`
+- `actor/eitr_env_drift_post`
+- `actor/eitr_env_drift_delta`
 - `actor/eitr_global_probe_ess`
 - `actor/eitr_pass_*_raw_logprob_grad_norm`
 - `actor/eitr_pass_*_applied_logprob_grad_norm`
@@ -178,8 +188,10 @@ rollout，其中mask有效的EITR state为 `m_i=1`，则实际目标为
 `sum(m_i * D_env_i) / B`，而不是除以active state数量。名义
 `lambda_env=0.1`保持固定，batch级有效尺度记录为
 `actor/eitr_effective_lambda = lambda_env * actor/eitr_coverage`。完全没有有效
-state时仍严格跳过correction；当前最小实现继续复用GRPO的AdamW状态，以隔离
-coverage normalization这一项算法变化。
+state时仍严格跳过correction。所有 state chunk 都使用同一个完整 rollout batch
+分母并先累积梯度，之后只执行一次独立 SGD，因此 `D_pre` 对应同一个 GRPO 后策略，
+也不会推进 GRPO AdamW 的 momentum、second moment 或 weight decay。正式训练默认
+每10个 outer updates 额外执行一次无梯度 post-correction re-score；smoke 每步执行。
 
 正式训练默认读取 `data/nq_hotpotqa_train/train.parquet`，并开启 dataloader
 shuffle；该文件由NQ与HotpotQA顺序拼接而成，不打乱会让短预算训练偏向文件前部的

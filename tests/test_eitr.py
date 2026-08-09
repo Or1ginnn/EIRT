@@ -35,9 +35,12 @@ TRACKING_SPEC.loader.exec_module(TRACKING_MODULE)
 build_sibling_probe_tensors = EITR.build_sibling_probe_tensors
 build_online_probe_tensors = EITR.build_online_probe_tensors
 build_grpo_uids = EITR.build_grpo_uids
+build_eitr_correction_optimizer = EITR.build_eitr_correction_optimizer
 coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
 probe_effect_diversity = EITR.probe_effect_diversity
+rollout_averaged_env_drift = EITR.rollout_averaged_env_drift
+should_run_post_diagnostic = EITR.should_run_post_diagnostic
 resolve_eitr_mode = EITR.resolve_eitr_mode
 eitr_probe_enabled_for_pass = EITR.eitr_probe_enabled_for_pass
 eitr_loss_enabled_for_pass = EITR.eitr_loss_enabled_for_pass
@@ -177,6 +180,26 @@ class EITRMathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             coverage_weighted_state_scale(-1, 160)
 
+    def test_rollout_averaged_drift_uses_full_batch_denominator(self):
+        self.assertAlmostEqual(rollout_averaged_env_drift(0.8, 160), 0.005)
+        self.assertEqual(rollout_averaged_env_drift(0.0, 0), 0.0)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            rollout_averaged_env_drift(0.1, -1)
+
+    def test_post_diagnostic_schedule(self):
+        self.assertTrue(
+            should_run_post_diagnostic(10, 10, correction_applied=True)
+        )
+        self.assertFalse(
+            should_run_post_diagnostic(9, 10, correction_applied=True)
+        )
+        self.assertFalse(
+            should_run_post_diagnostic(10, 10, correction_applied=False)
+        )
+        self.assertFalse(
+            should_run_post_diagnostic(10, 0, correction_applied=True)
+        )
+
     def test_coverage_weighting_scales_eitr_gradient(self):
         old = torch.zeros(1, 4)
         docs = torch.eye(4).unsqueeze(0)
@@ -246,6 +269,50 @@ class EITRMathTest(unittest.TestCase):
         self.assertFalse(eitr_loss_enabled_for_pass({"mode": "probe_only"}, 1, grpo_passes=1))
         self.assertTrue(eitr_loss_enabled_for_pass({"mode": "eitr"}, 1, grpo_passes=1))
         validate_eitr_optimization_schedule({"mode": "eitr"}, ppo_epochs=1, correction_passes=1)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            validate_eitr_optimization_schedule(
+                {"mode": "eitr"},
+                ppo_epochs=1,
+                correction_passes=2,
+            )
+
+    def test_eitr_sgd_does_not_advance_grpo_adamw_state(self):
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        grpo_optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+        parameter.grad = torch.tensor([0.5])
+        grpo_optimizer.step()
+        grpo_optimizer.zero_grad()
+        adam_state_before = {
+            key: value.detach().clone() if torch.is_tensor(value) else value
+            for key, value in grpo_optimizer.state[parameter].items()
+        }
+
+        eitr_optimizer = build_eitr_correction_optimizer(
+            [parameter],
+            {"mode": "eitr", "correction_lr": 1e-2},
+            default_lr=1e-3,
+        )
+        self.assertIsInstance(eitr_optimizer, torch.optim.SGD)
+        self.assertEqual(eitr_optimizer.param_groups[0]["momentum"], 0.0)
+        self.assertEqual(eitr_optimizer.param_groups[0]["weight_decay"], 0.0)
+        parameter.grad = torch.tensor([0.25])
+        eitr_optimizer.step()
+
+        self.assertEqual(eitr_optimizer.state, {})
+        for key, expected in adam_state_before.items():
+            actual = grpo_optimizer.state[parameter][key]
+            if torch.is_tensor(expected):
+                self.assertTrue(torch.equal(actual, expected))
+            else:
+                self.assertEqual(actual, expected)
+
+        self.assertIsNone(
+            build_eitr_correction_optimizer(
+                [parameter],
+                {"mode": "probe_only"},
+                default_lr=1e-3,
+            )
+        )
 
     def test_variable_effective_k_has_finite_gradient(self):
         documents = torch.eye(4).unsqueeze(0)
@@ -397,6 +464,27 @@ class EITRProbeBatchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "min_informative_state_rate"):
             validate_eitr_config(
                 {"min_informative_state_rate": 1.1},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
+        with self.assertRaisesRegex(ValueError, "correction_optimizer"):
+            validate_eitr_config(
+                {"correction_optimizer": "adamw"},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
+        with self.assertRaisesRegex(ValueError, "correction_lr"):
+            validate_eitr_config(
+                {"correction_lr": 0},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
+        with self.assertRaisesRegex(ValueError, "post_diagnostic_freq"):
+            validate_eitr_config(
+                {"post_diagnostic_freq": -1},
                 n_agent=5,
                 max_queries_per_turn=1,
                 rollout_n=1,

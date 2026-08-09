@@ -36,6 +36,7 @@ from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.flops_counter import FlopsCounter
+from verl.trainer.ppo.eitr import build_eitr_correction_optimizer
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from codetiming import Timer
@@ -312,6 +313,14 @@ class ActorRolloutRefWorker(Worker):
             # get the original unwrapped module
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
+            self.eitr_optimizer = None
+            if self._is_actor:
+                self.eitr_optimizer = build_eitr_correction_optimizer(
+                    self.actor_module_fsdp.parameters(),
+                    self.config.actor.get('eitr', {}),
+                    default_lr=float(self.config.actor.optim.lr),
+                )
+
             if self._is_offload_param:
                 # param is require during state_dict in sharding manager
                 offload_fsdp_grad(module=self.actor_module_fsdp)
@@ -326,7 +335,8 @@ class ActorRolloutRefWorker(Worker):
                 self.config.actor.use_remove_padding = use_remove_padding
             self.actor = DataParallelPPOActor(config=self.config.actor,
                                               actor_module=self.actor_module_fsdp,
-                                              actor_optimizer=self.actor_optimizer)
+                                              actor_optimizer=self.actor_optimizer,
+                                              eitr_optimizer=self.eitr_optimizer)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
@@ -545,6 +555,11 @@ class ActorRolloutRefWorker(Worker):
             os.makedirs(trainer_state_dir, exist_ok=True)
             rank_state = {
                 'optimizer': self.actor_optimizer.state_dict(),
+                'eitr_optimizer': (
+                    self.eitr_optimizer.state_dict()
+                    if self.eitr_optimizer is not None
+                    else None
+                ),
                 'lr_scheduler': self.actor_lr_scheduler.state_dict(),
                 'grpo_optimizer_steps_completed': self.actor.grpo_optimizer_steps_completed,
                 'eitr_optimizer_steps_completed': self.actor.eitr_optimizer_steps_completed,
@@ -588,6 +603,14 @@ class ActorRolloutRefWorker(Worker):
             rank_state = torch.load(rank_state_path, map_location='cpu')
 
         self.actor_optimizer.load_state_dict(rank_state['optimizer'])
+        saved_eitr_optimizer = rank_state.get('eitr_optimizer')
+        if self.eitr_optimizer is not None:
+            if saved_eitr_optimizer is not None:
+                self.eitr_optimizer.load_state_dict(saved_eitr_optimizer)
+        elif saved_eitr_optimizer is not None:
+            raise ValueError(
+                'Checkpoint contains an EITR optimizer but the current mode does not'
+            )
         if not self._is_offload_optimizer:
             device = torch.device('cuda', torch.cuda.current_device())
             for state in self.actor_optimizer.state.values():
