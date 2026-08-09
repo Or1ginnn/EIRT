@@ -215,12 +215,15 @@ EXPERIMENT_NAME=eitr-nq-phase2-grpo-smoke \
 bash scripts/train/train_eitr_nq_gate_c_smoke.sh
 ```
 
-正式训练仍需显式给出预算：
+正式训练默认上限为8000个outer updates；仍可通过环境变量覆盖：
 
 ```bash
-TOTAL_TRAINING_STEPS=<与Search-R1预算一致> \
+TOTAL_TRAINING_STEPS=8000 \
 bash scripts/train/train_eitr_nq_gate_c_full.sh
 ```
+
+默认每100步保存一次轻量模型checkpoint。手动中断不会额外保存中断时刻的权重，
+因此应尽量在100的整数倍checkpoint完成写盘后停止。
 
 ## 8. Safety smoke 验收
 

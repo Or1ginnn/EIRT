@@ -113,6 +113,7 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('SHUFFLE_TRAIN_DATALOADER="${SHUFFLE_TRAIN_DATALOADER:-true}"', runner)
         self.assertIn('TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-null}"', runner)
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
+        self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
 
 
 class ObservationTruncationTest(unittest.TestCase):

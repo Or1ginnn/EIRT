@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Formal Phase-2 Conditional EITR run. The caller must deliberately choose the
-# training budget so a smoke default cannot be mistaken for a paper run.
-: "${TOTAL_TRAINING_STEPS:?Set TOTAL_TRAINING_STEPS to the Search-R1 baseline budget}"
+# Formal Phase-2 Conditional EITR run. The selected initial paper-run ceiling
+# is 8,000 outer updates; callers can still override it explicitly.
+export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"
 
 export EITR_MODE="${EITR_MODE:-eitr}"
 export EITR_PROBE_PROBABILITY="${EITR_PROBE_PROBABILITY:-1.0}"
