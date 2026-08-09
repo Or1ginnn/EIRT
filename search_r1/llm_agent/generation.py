@@ -96,19 +96,83 @@ class LLMGenerationManager:
         return responses, responses_str
 
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
-        """Process next observations from environment."""
-        
-        next_obs_ids = self.tokenizer(
-            next_obs, 
-            padding='longest',
-            return_tensors='pt',
-            add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
+        """Tokenize observations without ever truncating ``</information>``.
 
-        if next_obs_ids.shape[1] > self.config.max_obs_length:
-            print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
-            next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
+        Search-R1 originally sliced the already-tokenized observation from the
+        right.  A long retrieval could therefore lose its closing tag and make
+        the next model turn continue hallucinating more ``Doc N`` entries.
+        Keep the wrapper intact and spend the remaining budget on its body.
+        """
+        max_length = int(self.config.max_obs_length)
+        if max_length <= 0:
+            raise ValueError('max_obs_length must be positive')
 
+        def tokenize(text: str) -> List[int]:
+            token_ids = self.tokenizer(
+                text,
+                add_special_tokens=False,
+            )['input_ids']
+            return list(token_ids)
+
+        def truncate_one(text: str) -> List[int]:
+            original_ids = tokenize(text)
+            if len(original_ids) <= max_length:
+                return original_ids
+
+            print(
+                '[WARNING] OBSERVATION TOO LONG; truncating retrieval body '
+                f'while preserving closing tag, {len(original_ids)} & {max_length}'
+            )
+            open_marker = '<information>'
+            close_marker = '</information>'
+            open_start = text.find(open_marker)
+            close_start = text.rfind(close_marker)
+            if open_start < 0 or close_start < open_start + len(open_marker):
+                # Invalid-action feedback and any future non-retrieval
+                # observations retain the original Search-R1 truncation rule.
+                return original_ids[:max_length]
+
+            open_end = open_start + len(open_marker)
+            prefix = text[:open_end]
+            body = text[open_end:close_start]
+            suffix = text[close_start:]
+            wrapper_ids = tokenize(prefix + suffix)
+            if len(wrapper_ids) > max_length:
+                raise ValueError(
+                    'max_obs_length is too small to preserve the information wrapper'
+                )
+
+            # Tokenization at string boundaries is context-sensitive. Search
+            # over the original body characters and tokenize the reconstructed
+            # observation as a whole so the final length is exact.
+            low, high = 0, len(body)
+            best_ids = wrapper_ids
+            while low <= high:
+                midpoint = (low + high) // 2
+                candidate_ids = tokenize(prefix + body[:midpoint] + suffix)
+                if len(candidate_ids) <= max_length:
+                    best_ids = candidate_ids
+                    low = midpoint + 1
+                else:
+                    high = midpoint - 1
+            return best_ids
+
+        rows = [truncate_one(text) for text in next_obs]
+        padded_length = max((len(row) for row in rows), default=0)
+        next_obs_ids = torch.full(
+            (len(rows), padded_length),
+            self.tokenizer.pad_token_id,
+            dtype=torch.long,
+        )
+        padding_side = getattr(self.tokenizer, 'padding_side', 'right')
+        for row_index, row in enumerate(rows):
+            if not row:
+                continue
+            row_tensor = torch.tensor(row, dtype=torch.long)
+            if padding_side == 'left':
+                next_obs_ids[row_index, -len(row):] = row_tensor
+            else:
+                next_obs_ids[row_index, :len(row)] = row_tensor
         return next_obs_ids
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 

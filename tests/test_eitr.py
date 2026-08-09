@@ -85,6 +85,41 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn("trainer.logger=\"['console','wandb']\"", runner)
 
 
+class ObservationTruncationTest(unittest.TestCase):
+    class CharacterTokenizer:
+        pad_token_id = 0
+        padding_side = "right"
+
+        def __call__(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return {"input_ids": [ord(character) for character in text]}
+
+        def decode(self, token_ids):
+            return "".join(chr(token_id) for token_id in token_ids if token_id)
+
+    def test_long_information_preserves_both_tags(self):
+        manager = LLMGenerationManager.__new__(LLMGenerationManager)
+        manager.tokenizer = self.CharacterTokenizer()
+        manager.config = SimpleNamespace(max_obs_length=64)
+        observation = "\n<information>" + ("document text " * 20) + "</information>\n"
+
+        token_ids = manager._process_next_obs([observation])[0]
+        decoded = manager.tokenizer.decode(token_ids.tolist())
+
+        self.assertLessEqual(len(token_ids), 64)
+        self.assertIn("<information>", decoded)
+        self.assertTrue(decoded.endswith("</information>\n"))
+
+    def test_non_information_observation_keeps_legacy_prefix_truncation(self):
+        manager = LLMGenerationManager.__new__(LLMGenerationManager)
+        manager.tokenizer = self.CharacterTokenizer()
+        manager.config = SimpleNamespace(max_obs_length=8)
+
+        token_ids = manager._process_next_obs(["abcdefghijk"])[0]
+
+        self.assertEqual(manager.tokenizer.decode(token_ids.tolist()), "abcdefgh")
+
+
 class EITRMathTest(unittest.TestCase):
     def test_induced_js_is_zero_at_old_policy_and_has_finite_gradient(self):
         old = torch.zeros(1, 4)
