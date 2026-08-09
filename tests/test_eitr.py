@@ -35,6 +35,7 @@ TRACKING_SPEC.loader.exec_module(TRACKING_MODULE)
 build_sibling_probe_tensors = EITR.build_sibling_probe_tensors
 build_online_probe_tensors = EITR.build_online_probe_tensors
 build_grpo_uids = EITR.build_grpo_uids
+coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
 probe_effect_diversity = EITR.probe_effect_diversity
 resolve_eitr_mode = EITR.resolve_eitr_mode
@@ -162,6 +163,40 @@ class ObservationTruncationTest(unittest.TestCase):
 
 
 class EITRMathTest(unittest.TestCase):
+    def test_coverage_weighted_scale_tracks_rollout_coverage(self):
+        self.assertEqual(coverage_weighted_state_scale(0, 160), 0.0)
+        self.assertEqual(coverage_weighted_state_scale(40, 160), 0.25)
+        self.assertEqual(coverage_weighted_state_scale(160, 160), 1.0)
+        # Two FSDP ranks each contribute a local active-state mean. Gradient
+        # averaging recovers the same global 25% coverage scale.
+        self.assertEqual(
+            coverage_weighted_state_scale(20, 160, world_size=2),
+            0.25,
+        )
+        self.assertEqual(coverage_weighted_state_scale(0, 0), 0.0)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            coverage_weighted_state_scale(-1, 160)
+
+    def test_coverage_weighting_scales_eitr_gradient(self):
+        old = torch.zeros(1, 4)
+        docs = torch.eye(4).unsqueeze(0)
+        mask = torch.ones(1, 4, dtype=torch.bool)
+
+        gradients = []
+        for active_states in (40, 160):
+            current = torch.tensor([[2.0, -1.0, -2.0, -3.0]], requires_grad=True)
+            result = induced_js_from_cached_effects(
+                current_seq_logp=current,
+                old_seq_logp=old,
+                doc_probs=docs,
+                probe_mask=mask,
+            )
+            scale = coverage_weighted_state_scale(active_states, 160)
+            (result["js"].mean() * scale).backward()
+            gradients.append(current.grad.detach().clone())
+
+        self.assertTrue(torch.allclose(gradients[0], gradients[1] * 0.25))
+
     def test_mixed_dataset_grpo_uids_do_not_collide(self):
         uids = build_grpo_uids(
             ["nq", "nq", "hotpotqa", "hotpotqa"],

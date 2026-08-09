@@ -60,6 +60,32 @@ def resolve_eitr_mode(config: Any) -> str:
     return mode
 
 
+def coverage_weighted_state_scale(
+    valid_state_count: int,
+    global_rollout_state_count: float,
+    *,
+    world_size: int = 1,
+) -> float:
+    """Scale a local active-state mean into a global per-rollout mean.
+
+    FSDP averages gradients across ranks. Multiplying the local active-state
+    mean by ``local_active * world_size / global_rollouts`` therefore produces
+    ``sum(mask * D_env) / global_rollouts`` after distributed reduction.
+    """
+    valid_state_count = int(valid_state_count)
+    global_rollout_state_count = float(global_rollout_state_count)
+    world_size = int(world_size)
+    if valid_state_count < 0:
+        raise ValueError("valid_state_count must be non-negative")
+    if global_rollout_state_count < 0:
+        raise ValueError("global_rollout_state_count must be non-negative")
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if global_rollout_state_count == 0:
+        return 0.0
+    return valid_state_count * world_size / global_rollout_state_count
+
+
 def eitr_probe_enabled_for_pass(
     config: Any,
     pass_index: int,

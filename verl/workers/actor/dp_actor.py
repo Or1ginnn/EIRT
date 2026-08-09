@@ -27,6 +27,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.eitr import (
     EITR_BATCH_KEYS,
     eitr_loss_enabled_for_pass,
+    coverage_weighted_state_scale,
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
     resolve_eitr_mode,
@@ -442,6 +443,16 @@ class DataParallelPPOActor(BasePPOActor):
                     global_active_state_count,
                     op=torch.distributed.ReduceOp.SUM,
                 )
+            global_rollout_state_count = torch.tensor(
+                float(batch['eitr_state_valid'].numel()),
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            if distributed:
+                torch.distributed.all_reduce(
+                    global_rollout_state_count,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
 
             if global_active_state_count.item() > 0:
                 for correction_index in range(self.eitr_correction_passes):
@@ -472,6 +483,17 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         if mini_global_state_count.item() <= 0:
                             continue
+
+                        mini_global_rollout_state_count = torch.tensor(
+                            float(mini_batch['eitr_state_valid'].numel()),
+                            dtype=torch.float64,
+                            device=torch.cuda.current_device(),
+                        )
+                        if distributed:
+                            torch.distributed.all_reduce(
+                                mini_global_rollout_state_count,
+                                op=torch.distributed.ReduceOp.SUM,
+                            )
 
                         if self.config.use_dynamic_bsz:
                             max_token_len = (
@@ -522,10 +544,10 @@ class DataParallelPPOActor(BasePPOActor):
                                     continue
 
                                 valid_state_count = eitr_result['valid_state_count']
-                                state_weight = (
-                                    valid_state_count
-                                    * eitr_world_size
-                                    / max(float(mini_global_state_count.item()), 1.0)
+                                state_weight = coverage_weighted_state_scale(
+                                    valid_state_count,
+                                    float(mini_global_rollout_state_count.item()),
+                                    world_size=eitr_world_size,
                                 )
                                 raw_logprob_grad = torch.autograd.grad(
                                     eitr_result['loss'],
@@ -679,8 +701,21 @@ class DataParallelPPOActor(BasePPOActor):
                 'actor/eitr_active_state_count': float(
                     pass_stat_tensor[final_probe_pass, 1].item()
                 ),
+                'actor/eitr_coverage': float(
+                    global_active_state_count.item()
+                    / max(global_rollout_state_count.item(), 1.0)
+                ),
                 'actor/eitr_lambda_env': self.eitr_lambda_env,
-                'actor/eitr_loss_applied': float(self.eitr_mode == 'eitr'),
+                'actor/eitr_effective_lambda': float(
+                    self.eitr_lambda_env
+                    * global_active_state_count.item()
+                    / max(global_rollout_state_count.item(), 1.0)
+                    if self.eitr_mode == 'eitr'
+                    else 0.0
+                ),
+                'actor/eitr_loss_applied': float(
+                    eitr_correction_optimizer_step_count > 0
+                ),
                 'actor/eitr_probe_only': float(self.eitr_mode == 'probe_only'),
                 'actor/eitr_grpo_pass_count': float(self.ppo_epochs),
                 'actor/eitr_correction_pass_count': float(self.eitr_correction_passes),

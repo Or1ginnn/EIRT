@@ -173,6 +173,14 @@ Collector 的具体拒绝原因仍以 `eitr/collector_*` 记录，例如 missing
 EM，不加入格式 shaping。该奖励与 EITR correction 独立：GRPO 使用上述标量奖励，
 EITR 仍在随后的 correction pass 中最小化环境诱导分布漂移。
 
+V6 correction采用rollout coverage加权。若一个训练mini-batch共有 `B` 条
+rollout，其中mask有效的EITR state为 `m_i=1`，则实际目标为
+`sum(m_i * D_env_i) / B`，而不是除以active state数量。名义
+`lambda_env=0.1`保持固定，batch级有效尺度记录为
+`actor/eitr_effective_lambda = lambda_env * actor/eitr_coverage`。完全没有有效
+state时仍严格跳过correction；当前最小实现继续复用GRPO的AdamW状态，以隔离
+coverage normalization这一项算法变化。
+
 正式训练默认读取 `data/nq_hotpotqa_train/train.parquet`，并开启 dataloader
 shuffle；该文件由NQ与HotpotQA顺序拼接而成，不打乱会让短预算训练偏向文件前部的
 NQ。验证单独读取 `data/nq_search/test.parquet` 中固定抽样的256条NQ，因此训练集与
