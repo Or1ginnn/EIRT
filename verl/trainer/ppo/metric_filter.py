@@ -12,7 +12,9 @@ CORE_METRIC_NAMES = {
     # Agent behavior.
     "env/finish_ratio",
     "env/number_of_executed_search",
+    "env/trajectory_valid_search_rate",
     "eitr/real_valid_search_count",
+    "eitr/real_valid_search_per_rollout",
     "eitr/probe_candidate_valid_rate",
     "eitr/effective_probe_count_mean",
     # EITR mechanism. Pre/post names are reserved for the V6 diagnostic pass.
@@ -28,6 +30,7 @@ CORE_METRIC_NAMES = {
     "actor/eitr_env_drift_pre",
     "actor/eitr_env_drift_post",
     "actor/eitr_env_drift_delta",
+    "actor/eitr_env_drift_relative_reduction",
     "actor/eitr_post_diagnostic_ran",
     # Optimization stability.
     "actor/kl_loss",

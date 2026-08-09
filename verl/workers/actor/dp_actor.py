@@ -801,9 +801,20 @@ class DataParallelPPOActor(BasePPOActor):
                     post_drift_stat_tensor[0].item(),
                     rollout_denominator,
                 )
+                env_drift_delta = env_drift_post - env_drift_pre
+                # Positive reduction is good and is easier to read than the
+                # opposite-signed delta.  Keep the raw delta as the canonical
+                # quantity and report a scale-free diagnostic for smoke tests.
+                env_drift_relative_reduction = (
+                    (env_drift_pre - env_drift_post)
+                    / max(abs(env_drift_pre), 1e-12)
+                )
                 append_to_dict(metrics, {
                     'actor/eitr_env_drift_post': env_drift_post,
-                    'actor/eitr_env_drift_delta': env_drift_post - env_drift_pre,
+                    'actor/eitr_env_drift_delta': env_drift_delta,
+                    'actor/eitr_env_drift_relative_reduction': (
+                        env_drift_relative_reduction
+                    ),
                 })
 
         # Report GRPO AdamW and the single full-batch EITR SGD step separately

@@ -18,11 +18,28 @@ import numbers
 from typing import Dict
 
 
+HIGH_PRECISION_METRICS = {
+    'actor/eitr_env_drift_pre',
+    'actor/eitr_env_drift_post',
+    'actor/eitr_env_drift_delta',
+    'actor/eitr_env_drift_relative_reduction',
+    'actor/eitr_correction_lr',
+    'actor/eitr_effective_step_scale',
+}
+
+
+def format_metric_value(name, value):
+    """Keep tiny correction diagnostics visible in console smoke logs."""
+    if name in HIGH_PRECISION_METRICS:
+        return f'{value:.10e}'
+    return f'{value:.3f}'
+
+
 def concat_dict_to_str(dict: Dict, step):
     output = [f'step:{step}']
     for k, v in dict.items():
         if isinstance(v, numbers.Number):
-            output.append(f'{k}:{v:.3f}')
+            output.append(f'{k}:{format_metric_value(k, v)}')
     output_str = ' - '.join(output)
     return output_str
 

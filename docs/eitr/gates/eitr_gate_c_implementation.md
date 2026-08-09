@@ -164,6 +164,7 @@ LR scheduler 也以 outer update 为时间单位，因此 paired 的 `off/probe_
 - `actor/eitr_env_drift_pre`
 - `actor/eitr_env_drift_post`
 - `actor/eitr_env_drift_delta`
+- `actor/eitr_env_drift_relative_reduction`（正值表示 correction 降低了 drift）
 - `actor/eitr_global_probe_ess`
 - `actor/eitr_pass_*_raw_logprob_grad_norm`
 - `actor/eitr_pass_*_applied_logprob_grad_norm`
@@ -171,6 +172,13 @@ LR scheduler 也以 outer update 为时间单位，因此 paired 的 `off/probe_
 - `env/number_of_executed_search`
 - `env/final_generation_ratio`
 - `env/final_unexecuted_search_ratio`
+
+console 对上述 drift 指标使用高精度科学计数法，避免有效但很小的 correction 被
+格式化成 `0.000/-0.000`。20-step smoke 还记录
+`env/trajectory_valid_search_rate`（每条 trajectory 只判断是否至少执行过一次有效搜索）和
+`eitr/real_valid_search_per_rollout`（允许多轮搜索，因此可大于1），用于判断搜索行为
+是否在 correction 下被明显拖慢。前者直接来自真实环境执行记录，因此在
+`off/probe_only/eitr` 三种模式下口径一致，不使用 probe 选中率冒充搜索行为率。
 
 Collector 的具体拒绝原因仍以 `eitr/collector_*` 记录，例如 missing close tag、empty query 和 empty retrieval effect。
 

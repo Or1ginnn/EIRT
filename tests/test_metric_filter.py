@@ -27,6 +27,8 @@ class MetricFilterTest(unittest.TestCase):
         metrics = {
             "actor/pg_loss": 1.0,
             "actor/eitr_coverage": 0.5,
+            "actor/eitr_env_drift_relative_reduction": 0.02,
+            "env/trajectory_valid_search_rate": 0.4,
             "val/test_score/nq": 0.2,
             "reward/zero_rate": 0.3,
             "collector/internal_counter": 7.0,
@@ -37,6 +39,8 @@ class MetricFilterTest(unittest.TestCase):
             {
                 "actor/pg_loss": 1.0,
                 "actor/eitr_coverage": 0.5,
+                "actor/eitr_env_drift_relative_reduction": 0.02,
+                "env/trajectory_valid_search_rate": 0.4,
                 "val/test_score/nq": 0.2,
                 "reward/zero_rate": 0.3,
             },

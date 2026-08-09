@@ -1054,8 +1054,13 @@ def attach_eitr_probe_tensors(
     generated = float(collector_stats.get("probe_candidate_generated", 0.0))
     accepted = float(collector_stats.get("probe_query_accepted", 0.0))
     effective = float(collector_stats.get("probe_state_effective", 0.0))
+    rollout_count = float(len(uids))
     metrics.update({
         "eitr/real_valid_search_count": real_valid,
+        # This action count may exceed one because a trajectory can search on
+        # multiple turns.  The cross-mode trajectory-level rate is computed
+        # from the environment's valid_search_stats in ray_trainer instead.
+        "eitr/real_valid_search_per_rollout": real_valid / max(rollout_count, 1.0),
         "eitr/probe_selected_state_count": selected,
         "eitr/probe_candidate_valid_rate": accepted / max(generated, 1.0),
         "eitr/active_state_rate_given_selected": effective / max(selected, 1.0),

@@ -290,6 +290,12 @@ def compute_data_metrics(batch, use_critic=True):
         # only retriever calls executed inside the environment loop are counted.
         metrics['env/number_of_valid_search'] = float(executed_searches.mean())
         metrics['env/number_of_executed_search'] = float(executed_searches.mean())
+        # At most one vote per trajectory.  Unlike probe coverage, this exists
+        # in off/probe_only/eitr and therefore supports a fair 20-step check
+        # that EITR is not suppressing the emergence of valid search behavior.
+        metrics['env/trajectory_valid_search_rate'] = float(
+            np.greater(executed_searches, 0).mean()
+        )
     if 'final_generation_stats' in batch.meta_info:
         metrics['env/final_generation_ratio'] = float(
             np.array(batch.meta_info['final_generation_stats'], dtype=np.int16).mean()
