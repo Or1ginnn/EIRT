@@ -25,6 +25,10 @@ export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 export PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
 export EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-16}"
 export EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-8}"
+# Search-R1 v0.3 warms up for about 286 of its 1,005 outer updates. Preserve
+# that update count for the 8,000-step ceiling instead of incorrectly keeping
+# the 0.285 ratio (which would stretch warmup to 2,280 very slow EITR steps).
+export LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"
 export TOTAL_EPOCHS="${TOTAL_EPOCHS:-15}"
 export SAVE_FREQ="${SAVE_FREQ:-100}"
 export TEST_FREQ="${TEST_FREQ:-50}"

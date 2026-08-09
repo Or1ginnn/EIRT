@@ -123,6 +123,7 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-null}"', runner)
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
+        self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
 
 
 class ObservationTruncationTest(unittest.TestCase):
