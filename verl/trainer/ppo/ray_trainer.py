@@ -48,6 +48,7 @@ from verl.trainer.ppo.eitr import (
     validate_sibling_group_layout,
 )
 from verl.trainer.ppo.step_plan import resolve_training_step_plan
+from verl.trainer.ppo.metric_filter import filter_metrics_for_logging, normalize_metrics_level
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
@@ -776,6 +777,10 @@ class RayPPOTrainer(object):
         """
 
         logger = self.logger
+        metrics_level = normalize_metrics_level(
+            self.config.trainer.get('metrics_level', 'debug')
+        )
+        print(f'Logging metrics level: {metrics_level}')
         self.global_steps = 0
         resumed = self._load_checkpoint()
         # perform validation before training
@@ -787,7 +792,13 @@ class RayPPOTrainer(object):
         ):
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=self.global_steps)
+            logger.log(
+                data=filter_metrics_for_logging(
+                    val_metrics,
+                    metrics_level,
+                ),
+                step=self.global_steps,
+            )
             if self.config.trainer.get('val_only', False):
                 return
 
@@ -1122,7 +1133,13 @@ class RayPPOTrainer(object):
                 })
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                logger.log(
+                    data=filter_metrics_for_logging(
+                        metrics,
+                        metrics_level,
+                    ),
+                    step=self.global_steps,
+                )
 
                 if is_final_step:
                     return

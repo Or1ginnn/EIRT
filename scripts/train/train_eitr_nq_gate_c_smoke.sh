@@ -70,6 +70,7 @@ LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.285}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-smoke}"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
+METRICS_LEVEL="${METRICS_LEVEL:-debug}"
 # With an explicit TOTAL_TRAINING_STEPS budget, the trainer cycles the
 # dataloader until that exact number of outer updates is complete.  Keep the
 # smoke epoch default aligned as a readable fallback for its one-batch loader.
@@ -102,6 +103,14 @@ case "$SHUFFLE_TRAIN_DATALOADER" in
     true|false) ;;
     *)
         echo "SHUFFLE_TRAIN_DATALOADER must be true or false; got: $SHUFFLE_TRAIN_DATALOADER" >&2
+        exit 2
+        ;;
+esac
+
+case "$METRICS_LEVEL" in
+    core|debug) ;;
+    *)
+        echo "METRICS_LEVEL must be core or debug; got: $METRICS_LEVEL" >&2
         exit 2
         ;;
 esac
@@ -296,6 +305,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=false \
     trainer.logger="['console','wandb']" \
+    trainer.metrics_level="$METRICS_LEVEL" \
     +trainer.val_before_train=false \
     +trainer.val_only=false \
     trainer.n_gpus_per_node="$NUM_GPUS" \

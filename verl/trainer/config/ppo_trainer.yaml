@@ -214,6 +214,8 @@ trainer:
   project_name: verl_examples
   experiment_name: gsm8k
   logger: [ 'console', 'wandb' ]
+  # debug logs every internal diagnostic; core keeps the formal W&B view compact.
+  metrics_level: debug
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

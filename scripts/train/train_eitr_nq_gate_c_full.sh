@@ -9,6 +9,7 @@ export EITR_MODE="${EITR_MODE:-eitr}"
 export EITR_PROBE_PROBABILITY="${EITR_PROBE_PROBABILITY:-1.0}"
 export EITR_PROBE_COUNT="${EITR_PROBE_COUNT:-4}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-hotpotqa-v03-phase2-full}"
+export METRICS_LEVEL="${METRICS_LEVEL:-core}"
 FORMAL_STORAGE_ROOT="${STORAGE_ROOT:-/mnt/data1/zar/eitr_storage}"
 # Search-R1 trains on the concatenated NQ+HotpotQA pool. Keep paper validation
 # on the fixed NQ split so its EM remains directly comparable to prior runs.
