@@ -76,6 +76,13 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertEqual(finish_backend.calls, 1)
         self.assertEqual(flush_backend.calls, 1)
 
+    def test_both_ppo_entrypoints_finish_wandb(self):
+        trainer_dir = Path(__file__).resolve().parents[1] / "verl" / "trainer"
+        for entrypoint in ("main_ppo.py", "main_ppo_format.py"):
+            source = (trainer_dir / entrypoint).read_text()
+            self.assertIn("finally:", source, entrypoint)
+            self.assertIn("trainer.logger.finish()", source, entrypoint)
+
     def test_smoke_logs_to_console_and_wandb(self):
         runner = (
             Path(__file__).resolve().parents[1]

@@ -197,8 +197,13 @@ def main_task(config):
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn,
                             )
-    trainer.init_workers()
-    trainer.fit()
+    try:
+        trainer.init_workers()
+        trainer.fit()
+    finally:
+        # The format-reward driver is also a short-lived Ray task. Explicitly
+        # close W&B so the last (or only) history row is uploaded before exit.
+        trainer.logger.finish()
 
 
 if __name__ == '__main__':
