@@ -151,7 +151,10 @@ if (( VLLM_MAX_MODEL_LEN < MAX_PROMPT_LENGTH + 500 )); then
     exit 2
 fi
 
-export RAY_TMPDIR="${RAY_TMPDIR:-$STORAGE_ROOT/ray_tmp/$EXPERIMENT_NAME}"
+# Ray appends its own session/socket suffix. Keep this base path short because
+# Linux AF_UNIX socket paths are limited to 107 bytes; experiment names belong
+# in Hydra/log/checkpoint paths, not in RAY_TMPDIR.
+export RAY_TMPDIR="${RAY_TMPDIR:-$STORAGE_ROOT/r}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$STORAGE_ROOT/checkpoints/$EXPERIMENT_NAME}"
 LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
 HYDRA_RUN_DIR="${HYDRA_RUN_DIR:-$STORAGE_ROOT/hydra/$EXPERIMENT_NAME}"

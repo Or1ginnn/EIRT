@@ -186,6 +186,8 @@ ID，避免两个数据源中相同的局部编号被误合并。
 ```
 
 启动脚本会拒绝 `/mnt/data1/zar` 之外的 `STORAGE_ROOT`，并显式把 Ray session、Hydra 输出、HF/Torch/Triton/CUDA/Numba cache、W&B 和 `TMPDIR` 指向数据盘。`CHECK_ONLY` 也会先创建并校验这些目录，再报告预检通过。
+Ray根目录固定使用较短的 `$STORAGE_ROOT/r`，避免长实验名让AF_UNIX socket路径
+超过Linux的107字节限制；实验名仍完整保留在日志、Hydra和checkpoint目录中。
 
 预检：
 

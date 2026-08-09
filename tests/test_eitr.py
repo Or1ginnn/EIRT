@@ -84,6 +84,8 @@ class TrackingFlushTest(unittest.TestCase):
             / "train_eitr_nq_gate_c_smoke.sh"
         ).read_text()
         self.assertIn("trainer.logger=\"['console','wandb']\"", runner)
+        self.assertIn('RAY_TMPDIR="${RAY_TMPDIR:-$STORAGE_ROOT/r}"', runner)
+        self.assertNotIn('$STORAGE_ROOT/ray_tmp/$EXPERIMENT_NAME', runner)
 
     def test_smoke_uses_search_r1_v03_format_reward(self):
         runner = (
