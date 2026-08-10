@@ -66,6 +66,7 @@ EITR_LR="${EITR_LR:-$ACTOR_LR}"
 EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-1}"
 EITR_SAME_BATCH_SCALE_DIAGNOSTIC="${EITR_SAME_BATCH_SCALE_DIAGNOSTIC:-false}"
 EITR_UPDATE_DIRECTION_DIAGNOSTIC="${EITR_UPDATE_DIRECTION_DIAGNOSTIC:-false}"
+EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT="${EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT:-false}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
 STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"
 FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"
@@ -134,7 +135,14 @@ case "$EITR_UPDATE_DIRECTION_DIAGNOSTIC" in
         exit 2
         ;;
 esac
-if [[ "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" == "true" && "$EITR_UPDATE_DIRECTION_DIAGNOSTIC" == "true" ]]; then
+case "$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" in
+    true|false) ;;
+    *)
+        echo "EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT must be true or false; got: $EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" >&2
+        exit 2
+        ;;
+esac
+if [[ $(printf '%s\n' "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" "$EITR_UPDATE_DIRECTION_DIAGNOSTIC" "$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" | grep -c '^true$') -gt 1 ]]; then
     echo "Only one EITR diagnostic may be enabled at once" >&2
     exit 2
 fi
@@ -318,6 +326,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.eitr.post_diagnostic_freq="$EITR_POST_DIAGNOSTIC_FREQ" \
     actor_rollout_ref.actor.eitr.same_batch_scale_diagnostic="$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" \
     actor_rollout_ref.actor.eitr.update_direction_diagnostic="$EITR_UPDATE_DIRECTION_DIAGNOSTIC" \
+    actor_rollout_ref.actor.eitr.score_path_noop_direction_audit="$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" \
     actor_rollout_ref.actor.eitr.lambda_env="$EITR_LAMBDA_ENV" \
     actor_rollout_ref.actor.eitr.log_ratio_clip=10.0 \
     actor_rollout_ref.actor.ppo_epochs="$PPO_EPOCHS" \

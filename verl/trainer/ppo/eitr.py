@@ -9,6 +9,7 @@ constants. Sibling rollouts remain available only as an ablation fallback.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import hashlib
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -77,6 +78,14 @@ def eitr_update_direction_diagnostic_enabled(config: Any) -> bool:
     return bool(enabled)
 
 
+def eitr_score_path_noop_direction_audit_enabled(config: Any) -> bool:
+    """Enable the default-off one-batch score-path audit only when requested."""
+    enabled = _config_value(config, "score_path_noop_direction_audit", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() == "true"
+    return bool(enabled)
+
+
 def same_batch_cache_signature(batch: Mapping[str, torch.Tensor]) -> Tuple[Tuple[Any, ...], ...]:
     """Describe cached EITR tensors without copying or mutating them."""
     return tuple(
@@ -87,6 +96,38 @@ def same_batch_cache_signature(batch: Mapping[str, torch.Tensor]) -> Tuple[Tuple
             str(batch[key].dtype),
         )
         for key in EITR_BATCH_KEYS
+    )
+
+
+def cached_probe_fingerprint(batches: Sequence[Mapping[str, torch.Tensor]]) -> str:
+    """Content hash every cached field consumed by the EITR drift scorer."""
+    digest = hashlib.sha256()
+    for batch_index, batch in enumerate(batches):
+        digest.update(f"batch:{batch_index}".encode())
+        for key in EITR_BATCH_KEYS:
+            if key not in batch:
+                raise KeyError(f"Missing cached EITR probe field: {key}")
+            value = batch[key]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"Cached EITR probe field {key} is not a tensor")
+            cpu_value = value.detach().cpu().contiguous()
+            digest.update(key.encode())
+            digest.update(str(cpu_value.dtype).encode())
+            digest.update(str(tuple(cpu_value.shape)).encode())
+            digest.update(cpu_value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def score_path_audit_event_sequence(grpo_step_count: int) -> Tuple[str, ...]:
+    """Return the strict ordering enforced by the one-batch audit."""
+    if grpo_step_count <= 0:
+        raise ValueError("The audit requires at least one completed GRPO step")
+    return (
+        "probe_old_logp@v0",
+        *(f"GRPO_STEP_{step}" for step in range(1, grpo_step_count + 1)),
+        f"D_PRE_ALL_STATES@v{grpo_step_count}",
+        "EITR_SGD_STEP_1",
+        f"D_POST_ALL_STATES@v{grpo_step_count + 1}",
     )
 
 

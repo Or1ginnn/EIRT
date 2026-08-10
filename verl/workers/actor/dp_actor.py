@@ -26,7 +26,9 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.eitr import (
     EITR_BATCH_KEYS,
+    cached_probe_fingerprint,
     eitr_loss_enabled_for_pass,
+    eitr_score_path_noop_direction_audit_enabled,
     eitr_update_direction_diagnostic_enabled,
     coverage_weighted_state_scale,
     eitr_probe_enabled_for_pass,
@@ -34,6 +36,7 @@ from verl.trainer.ppo.eitr import (
     rollout_averaged_env_drift,
     same_batch_cache_signature,
     same_batch_scale_diagnostic_lrs,
+    score_path_audit_event_sequence,
     should_run_post_diagnostic,
     resolve_eitr_mode,
     validate_eitr_optimization_schedule,
@@ -82,6 +85,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_update_direction_diagnostic = eitr_update_direction_diagnostic_enabled(
             self.eitr_config
         )
+        self.eitr_score_path_noop_direction_audit = (
+            eitr_score_path_noop_direction_audit_enabled(self.eitr_config)
+        )
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
         self.grpo_optimizer_steps_completed = 0
@@ -99,7 +105,13 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError('Same-batch scale diagnostic requires EITR mode')
         if self.eitr_update_direction_diagnostic and self.eitr_mode != 'eitr':
             raise ValueError('Update-direction diagnostic requires EITR mode')
-        if self.eitr_same_batch_scale_lrs and self.eitr_update_direction_diagnostic:
+        if self.eitr_score_path_noop_direction_audit and self.eitr_mode != 'eitr':
+            raise ValueError('Score-path audit requires EITR mode')
+        if sum((
+            bool(self.eitr_same_batch_scale_lrs),
+            self.eitr_update_direction_diagnostic,
+            self.eitr_score_path_noop_direction_audit,
+        )) > 1:
             raise ValueError('Only one EITR diagnostic may be enabled at once')
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
@@ -469,6 +481,155 @@ class DataParallelPPOActor(BasePPOActor):
             torch.distributed.all_reduce(result_tensor, op=torch.distributed.ReduceOp.SUM)
         return result_tensor
 
+    def _audit_score_cached_eitr_drift(
+        self,
+        dataloader,
+        temperature,
+        *,
+        distributed,
+        global_rollout_state_count,
+        eitr_world_size,
+        build_grad,
+        capture_query_sample=False,
+    ):
+        """One numerical score path for every D value in the audit.
+
+        ``build_grad`` changes only autograd retention. The forwards, state
+        chunking, dtype/autocast path, cached tensors, and distributed reduction
+        are intentionally identical for D_old, no-op, and +/- candidates.
+        """
+        local = {
+            'js_sum': 0.0,
+            'state_count': 0.0,
+            'probe_count': 0.0,
+            'ess_sum': 0.0,
+            'clipfrac_sum': 0.0,
+        }
+        query_sample = None
+        for mini_batch in dataloader:
+            for state_chunk in self._iter_eitr_state_chunks(mini_batch):
+                state_chunk = state_chunk.cuda()
+                result = self._compute_eitr_micro_batch(
+                    state_chunk, temperature, track_model_grad=build_grad
+                )
+                if result is None:
+                    continue
+                valid_state_count = result['valid_state_count']
+                if valid_state_count > 0:
+                    local['js_sum'] += result['js_sum']
+                    local['state_count'] += valid_state_count
+                    local['probe_count'] += result['valid_probe_count']
+                    local['ess_sum'] += result['ess_mean'] * valid_state_count
+                    local['clipfrac_sum'] += result['log_ratio_clipfrac'] * valid_state_count
+                if build_grad and valid_state_count > 0:
+                    raw_logprob_grad = torch.autograd.grad(
+                        result['loss'], result['current_seq_logp'], retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    if capture_query_sample and query_sample is None and raw_logprob_grad is not None:
+                        state_slot = state_chunk['eitr_state_slot'].bool()
+                        state_valid = state_chunk['eitr_state_valid'][state_slot].bool()
+                        if state_valid.any():
+                            query_sample = tuple(
+                                value.detach().to(device='cpu', copy=True)
+                                for value in (
+                                    result['current_seq_logp'][state_valid],
+                                    raw_logprob_grad[state_valid],
+                                    state_chunk['eitr_probe_old_seq_logp'][state_slot][state_valid],
+                                    state_chunk['eitr_probe_doc_probs'][state_slot][state_valid],
+                                    state_chunk['eitr_probe_valid'][state_slot][state_valid],
+                                )
+                            )
+                    state_weight = coverage_weighted_state_scale(
+                        valid_state_count,
+                        float(global_rollout_state_count.item()),
+                        world_size=eitr_world_size,
+                    )
+                    (result['loss'] * self.eitr_lambda_env * state_weight).backward()
+                    del raw_logprob_grad
+                del result
+
+        tensor = torch.tensor(
+            [
+                local['js_sum'], local['state_count'], local['probe_count'],
+                local['ess_sum'], local['clipfrac_sum'],
+            ],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        if distributed:
+            torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+        if int(tensor[1].item()) <= 0:
+            raise RuntimeError('Score-path audit found no valid cached EITR states')
+        if not torch.isfinite(tensor).all():
+            raise RuntimeError('Score-path audit produced a non-finite cached-probe score')
+        return {
+            'drift': rollout_averaged_env_drift(
+                tensor[0].item(), global_rollout_state_count.item()
+            ),
+            'js_sum': float(tensor[0].item()),
+            'state_count': int(tensor[1].item()),
+            'probe_count': int(tensor[2].item()),
+            'ess': float(tensor[3].item() / max(tensor[1].item(), 1.0)),
+            'clipfrac': float(tensor[4].item() / max(tensor[1].item(), 1.0)),
+            'query_sample': query_sample,
+        }
+
+    def _audit_parameter_checksum(self, *, distributed):
+        local = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
+        for parameter in self.actor_module.parameters():
+            if parameter.requires_grad:
+                value = parameter.detach().float()
+                local[0] += value.sum(dtype=torch.float64)
+                local[1] += value.square().sum(dtype=torch.float64)
+                local[2] += value.abs().sum(dtype=torch.float64)
+        if distributed:
+            torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
+        return tuple(float(value.item()) for value in local)
+
+    def _audit_direction_statistics(self, snapshot, *, direction, distributed):
+        local_sums = torch.zeros(5, dtype=torch.float64, device=torch.cuda.current_device())
+        local_quantiles = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
+        saw_delta = False
+        for parameter, saved_parameter, saved_gradient in snapshot:
+            if saved_gradient is None:
+                continue
+            delta = parameter.detach().float().cpu() - saved_parameter.float()
+            gradient = saved_gradient.float()
+            absolute = delta.abs()
+            local_sums[0] += gradient.square().sum(dtype=torch.float64)
+            local_sums[1] += delta.square().sum(dtype=torch.float64)
+            local_sums[2] += (gradient * delta).sum(dtype=torch.float64)
+            local_sums[3] += (absolute > 0).sum(dtype=torch.float64)
+            local_sums[4] += absolute.numel()
+            if absolute.numel() > 0:
+                local_quantiles = torch.maximum(
+                    local_quantiles,
+                    torch.quantile(
+                        absolute, torch.tensor([0.5, 0.95, 0.99])
+                    ).to(local_quantiles.device),
+                )
+                saw_delta = True
+        if distributed:
+            torch.distributed.all_reduce(local_sums, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(local_quantiles, op=torch.distributed.ReduceOp.MAX)
+        grad_norm = float(local_sums[0].clamp_min(0).sqrt().item())
+        delta_norm = float(local_sums[1].clamp_min(0).sqrt().item())
+        g_dot_delta = float(local_sums[2].item())
+        signed_dot = -g_dot_delta if direction == 'minus' else g_dot_delta
+        cosine = signed_dot / max(grad_norm * delta_norm, 1e-30)
+        return {
+            'grad_norm': grad_norm,
+            'delta_norm': delta_norm,
+            'g_dot_delta': g_dot_delta,
+            'cosine': cosine,
+            'changed_fraction': float(local_sums[3].item() / max(local_sums[4].item(), 1.0)),
+            'delta_abs_shard_p50_max': float(local_quantiles[0].item()),
+            'delta_abs_shard_p95_max': float(local_quantiles[1].item()),
+            'delta_abs_shard_p99_max': float(local_quantiles[2].item()),
+            'saw_delta': saw_delta,
+        }
+
     def _run_same_batch_scale_diagnostic(
         self,
         dataloader,
@@ -746,6 +907,233 @@ class DataParallelPPOActor(BasePPOActor):
             )
         return metrics
 
+    def _run_score_path_noop_direction_audit(
+        self,
+        dataloader,
+        temperature,
+        *,
+        distributed,
+        eitr_world_size,
+        global_active_state_count,
+        global_rollout_state_count,
+        d_old,
+        theta_old_checksum,
+        theta_grpo_checksum,
+        epsilon=3e-5,
+    ):
+        """Audit score consistency and the local +/- EITR update direction.
+
+        The persistent policy is restored to theta_GRPO at exit.  The single
+        SGD call is diagnostic-only: it proves the exact correction placement
+        after all GRPO updates without creating a checkpoint or altering the
+        normal training path.
+        """
+        cache_hash = cached_probe_fingerprint(dataloader)
+        hashes = {'old': cache_hash}
+        event_sequence = score_path_audit_event_sequence(self.ppo_epochs)
+        if not distributed or torch.distributed.get_rank() == 0:
+            print(f'EITR_SCORE_AUDIT_EVENT {event_sequence[-3]}')
+
+        self.eitr_optimizer.zero_grad()
+        zero_stats = self._audit_score_cached_eitr_drift(
+            dataloader,
+            temperature,
+            distributed=distributed,
+            global_rollout_state_count=global_rollout_state_count,
+            eitr_world_size=eitr_world_size,
+            build_grad=True,
+            capture_query_sample=True,
+        )
+        if zero_stats['state_count'] != int(global_active_state_count.item()):
+            raise RuntimeError('Score-path audit D_zero did not cover every active state')
+        hashes['zero_grad'] = cached_probe_fingerprint(dataloader)
+        snapshot = self._snapshot_eitr_local_state()
+        metrics = {
+            'actor/eitr_score_path_noop_direction_audit': 1.0,
+            'actor/eitr_score_path_d_old': float(d_old),
+            'actor/eitr_score_path_d_zero_grad': float(zero_stats['drift']),
+            'actor/eitr_score_path_epsilon': float(epsilon),
+            'actor/eitr_score_path_state_count': float(zero_stats['state_count']),
+            'actor/eitr_score_path_probe_count': float(zero_stats['probe_count']),
+            'actor/eitr_score_path_coverage': float(
+                global_active_state_count.item()
+                / max(global_rollout_state_count.item(), 1.0)
+            ),
+            'actor/eitr_score_path_ess': float(zero_stats['ess']),
+            'actor/eitr_score_path_log_ratio_clipfrac': float(zero_stats['clipfrac']),
+            'actor/eitr_score_path_theta_old_checksum_sum': theta_old_checksum[0],
+            'actor/eitr_score_path_theta_grpo_checksum_sum': theta_grpo_checksum[0],
+        }
+        noop_values = []
+        noop_param_error = 0.0
+        for index in range(3):
+            self._restore_eitr_local_state(snapshot, restore_gradients=True)
+            noop_stats = self._audit_score_cached_eitr_drift(
+                dataloader,
+                temperature,
+                distributed=distributed,
+                global_rollout_state_count=global_rollout_state_count,
+                eitr_world_size=eitr_world_size,
+                build_grad=False,
+            )
+            if noop_stats['state_count'] != int(global_active_state_count.item()):
+                raise RuntimeError('Score-path audit no-op did not cover every active state')
+            noop_values.append(float(noop_stats['drift']))
+            hashes[f'noop_{index + 1}'] = cached_probe_fingerprint(dataloader)
+            noop_param_error = max(
+                noop_param_error,
+                self._distributed_scalar(
+                    self._local_snapshot_max_abs_error(snapshot),
+                    distributed=distributed,
+                    op=torch.distributed.ReduceOp.MAX,
+                ),
+            )
+
+        noop_mean = sum(noop_values) / len(noop_values)
+        noop_jitter = max(noop_values) - min(noop_values)
+        metrics.update({
+            'actor/eitr_score_path_d_noop_1': noop_values[0],
+            'actor/eitr_score_path_d_noop_2': noop_values[1],
+            'actor/eitr_score_path_d_noop_3': noop_values[2],
+            'actor/eitr_score_path_noop_mean': noop_mean,
+            'actor/eitr_score_path_noop_jitter': noop_jitter,
+            'actor/eitr_score_path_zero_grad_minus_noop_mean': zero_stats['drift'] - noop_mean,
+            'actor/eitr_score_path_noop_param_max_abs': noop_param_error,
+        })
+        if noop_param_error != 0.0:
+            raise RuntimeError('Score-path audit no-op changed theta_GRPO')
+
+        query_minus, query_zero, query_plus = self._query_logprob_direction_metrics(
+            zero_stats['query_sample'], epsilon=epsilon, distributed=distributed
+        )
+        metrics.update({
+            'actor/eitr_score_path_query_js_minus': query_minus,
+            'actor/eitr_score_path_query_js_zero': query_zero,
+            'actor/eitr_score_path_query_js_plus': query_plus,
+        })
+
+        original_lrs = [group['lr'] for group in self.eitr_optimizer.param_groups]
+        reports = {}
+        try:
+            # The minus candidate is the one true independent SGD step. It is
+            # performed once, after full-batch D_pre/gradient accumulation, and
+            # then restored so this audit cannot perturb training.
+            self._restore_eitr_local_state(snapshot, restore_gradients=True)
+            start_minus = self._distributed_scalar(
+                self._local_snapshot_max_abs_error(snapshot),
+                distributed=distributed,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+            if start_minus != 0.0:
+                raise RuntimeError('Score-path audit minus did not start from theta_GRPO')
+            for group in self.eitr_optimizer.param_groups:
+                group['lr'] = float(epsilon)
+            self.eitr_optimizer.step()
+            minus_stats = self._audit_direction_statistics(
+                snapshot, direction='minus', distributed=distributed
+            )
+            if minus_stats['delta_norm'] == 0.0:
+                raise RuntimeError('Score-path audit minus update was zero')
+            hashes['minus'] = cached_probe_fingerprint(dataloader)
+            if not distributed or torch.distributed.get_rank() == 0:
+                print(f'EITR_SCORE_AUDIT_EVENT {event_sequence[-2]}')
+            minus_score = self._audit_score_cached_eitr_drift(
+                dataloader,
+                temperature,
+                distributed=distributed,
+                global_rollout_state_count=global_rollout_state_count,
+                eitr_world_size=eitr_world_size,
+                build_grad=False,
+            )
+            if minus_score['state_count'] != int(global_active_state_count.item()):
+                raise RuntimeError('Score-path audit minus did not cover every active state')
+            reports['minus'] = (minus_score['drift'], minus_stats, start_minus)
+
+            self._restore_eitr_local_state(snapshot, restore_gradients=True)
+            start_plus = self._distributed_scalar(
+                self._local_snapshot_max_abs_error(snapshot),
+                distributed=distributed,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+            if start_plus != 0.0:
+                raise RuntimeError('Score-path audit plus did not start from theta_GRPO')
+            self._apply_snapshot_gradient(snapshot, epsilon)
+            plus_stats = self._audit_direction_statistics(
+                snapshot, direction='plus', distributed=distributed
+            )
+            if plus_stats['delta_norm'] == 0.0:
+                raise RuntimeError('Score-path audit plus update was zero')
+            hashes['plus'] = cached_probe_fingerprint(dataloader)
+            plus_score = self._audit_score_cached_eitr_drift(
+                dataloader,
+                temperature,
+                distributed=distributed,
+                global_rollout_state_count=global_rollout_state_count,
+                eitr_world_size=eitr_world_size,
+                build_grad=False,
+            )
+            if plus_score['state_count'] != int(global_active_state_count.item()):
+                raise RuntimeError('Score-path audit plus did not cover every active state')
+            reports['plus'] = (plus_score['drift'], plus_stats, start_plus)
+        finally:
+            self._restore_eitr_local_state(snapshot, restore_gradients=False)
+            self.eitr_optimizer.zero_grad()
+            for group, original_lr in zip(self.eitr_optimizer.param_groups, original_lrs):
+                group['lr'] = original_lr
+
+        restore_error = self._distributed_scalar(
+            self._local_snapshot_max_abs_error(snapshot),
+            distributed=distributed,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        theta_after_checksum = self._audit_parameter_checksum(distributed=distributed)
+        if restore_error != 0.0:
+            raise RuntimeError('Score-path audit failed to restore theta_GRPO')
+        if theta_after_checksum != theta_grpo_checksum:
+            raise RuntimeError('Score-path audit checksum changed after final restoration')
+        if len(set(hashes.values())) != 1:
+            raise RuntimeError(f'Score-path audit cached probe fingerprint mismatch: {hashes}')
+
+        for direction, (drift, stats, start_error) in reports.items():
+            metrics.update({
+                f'actor/eitr_score_path_d_{direction}': float(drift),
+                f'actor/eitr_score_path_d_delta_{direction}_vs_noop': float(drift - noop_mean),
+                f'actor/eitr_score_path_start_max_abs_{direction}': float(start_error),
+                f'actor/eitr_score_path_update_norm_{direction}': stats['delta_norm'],
+                f'actor/eitr_score_path_g_dot_delta_{direction}': stats['g_dot_delta'],
+                f'actor/eitr_score_path_cos_{direction}': stats['cosine'],
+                f'actor/eitr_score_path_changed_fraction_{direction}': stats['changed_fraction'],
+                f'actor/eitr_score_path_delta_abs_shard_p50_max_{direction}': (
+                    stats['delta_abs_shard_p50_max']
+                ),
+                f'actor/eitr_score_path_delta_abs_shard_p95_max_{direction}': (
+                    stats['delta_abs_shard_p95_max']
+                ),
+                f'actor/eitr_score_path_delta_abs_shard_p99_max_{direction}': (
+                    stats['delta_abs_shard_p99_max']
+                ),
+                f'actor/eitr_score_path_grad_norm_{direction}': stats['grad_norm'],
+            })
+        metrics['actor/eitr_score_path_final_restore_max_abs'] = restore_error
+        metrics['actor/eitr_score_path_theta_after_checksum_sum'] = theta_after_checksum[0]
+        metrics['actor/eitr_score_path_probe_hash_match'] = 1.0
+        if not distributed or torch.distributed.get_rank() == 0:
+            print(
+                'EITR_SCORE_PATH_AUDIT '
+                f'D_old={d_old:.12e} '
+                f'D_zero_grad={zero_stats["drift"]:.12e} '
+                f'D_noop_1={noop_values[0]:.12e} '
+                f'D_noop_2={noop_values[1]:.12e} '
+                f'D_noop_3={noop_values[2]:.12e} '
+                f'D_minus={reports["minus"][0]:.12e} '
+                f'D_plus={reports["plus"][0]:.12e} '
+                f'probe_hash={cache_hash} '
+                f'final_restore={restore_error:.12e}'
+            )
+            print(f'EITR_SCORE_AUDIT_EVENT {event_sequence[-1]}')
+            print('EITR_SCORE_AUDIT_SEQUENCE ' + ' -> '.join(event_sequence))
+        return metrics
+
     def update_policy(self, data: DataProto):
         self.actor_module.train()
 
@@ -788,6 +1176,42 @@ class DataParallelPPOActor(BasePPOActor):
         eitr_world_size = torch.distributed.get_world_size() if distributed else 1
         grpo_optimizer_step_count = 0
         eitr_correction_optimizer_step_count = 0
+        audit_d_old = None
+        audit_theta_old_checksum = None
+        if self.eitr_score_path_noop_direction_audit:
+            audit_global_active_state_count = torch.tensor(
+                float(batch['eitr_state_valid'].sum().item()),
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            audit_global_rollout_state_count = torch.tensor(
+                float(batch['eitr_state_valid'].numel()),
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            if distributed:
+                torch.distributed.all_reduce(
+                    audit_global_active_state_count, op=torch.distributed.ReduceOp.SUM
+                )
+                torch.distributed.all_reduce(
+                    audit_global_rollout_state_count, op=torch.distributed.ReduceOp.SUM
+                )
+            if audit_global_active_state_count.item() <= 0:
+                raise RuntimeError('Score-path audit found no active EITR states before GRPO')
+            audit_theta_old_checksum = self._audit_parameter_checksum(distributed=distributed)
+            if not distributed or torch.distributed.get_rank() == 0:
+                print('EITR_SCORE_AUDIT_EVENT probe_old_logp@v0')
+            audit_old_stats = self._audit_score_cached_eitr_drift(
+                dataloader,
+                temperature,
+                distributed=distributed,
+                global_rollout_state_count=audit_global_rollout_state_count,
+                eitr_world_size=eitr_world_size,
+                build_grad=False,
+            )
+            if audit_old_stats['state_count'] != int(audit_global_active_state_count.item()):
+                raise RuntimeError('Score-path audit D_old did not cover every active state')
+            audit_d_old = audit_old_stats['drift']
 
         for ppo_epoch in range(self.ppo_epochs):
             for mini_batch in dataloader:
@@ -847,6 +1271,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 grpo_optimizer_step_count += 1
+                if self.eitr_score_path_noop_direction_audit and (
+                    not distributed or torch.distributed.get_rank() == 0
+                ):
+                    print(f'EITR_SCORE_AUDIT_EVENT GRPO_STEP_{grpo_optimizer_step_count}')
                 append_to_dict(metrics, {
                     'actor/grad_norm': grad_norm.detach().item(),
                     'actor/ppo_epoch': float(ppo_epoch),
@@ -861,6 +1289,7 @@ class DataParallelPPOActor(BasePPOActor):
         post_diagnostic_ran = False
         same_batch_scale_diagnostic_ran = False
         update_direction_diagnostic_ran = False
+        score_path_noop_direction_audit_ran = False
         query_logprob_direction_sample = None
         if self.eitr_uses_probes:
             self.actor_optimizer.zero_grad()
@@ -885,7 +1314,46 @@ class DataParallelPPOActor(BasePPOActor):
                     op=torch.distributed.ReduceOp.SUM,
                 )
 
-            if global_active_state_count.item() > 0:
+            if self.eitr_score_path_noop_direction_audit:
+                if global_active_state_count.item() <= 0:
+                    raise RuntimeError('Score-path audit found no valid EITR states')
+                if int(global_active_state_count.item()) != int(
+                    audit_global_active_state_count.item()
+                ):
+                    raise RuntimeError('Score-path audit active-state count changed during GRPO')
+                audit_theta_grpo_checksum = self._audit_parameter_checksum(
+                    distributed=distributed
+                )
+                diagnostic_metrics = self._run_score_path_noop_direction_audit(
+                    dataloader,
+                    temperature,
+                    distributed=distributed,
+                    eitr_world_size=eitr_world_size,
+                    global_active_state_count=global_active_state_count,
+                    global_rollout_state_count=global_rollout_state_count,
+                    d_old=audit_d_old,
+                    theta_old_checksum=audit_theta_old_checksum,
+                    theta_grpo_checksum=audit_theta_grpo_checksum,
+                )
+                append_to_dict(metrics, diagnostic_metrics)
+                pass_index = self.ppo_epochs
+                pass_stats[pass_index].update({
+                    'js_sum': diagnostic_metrics['actor/eitr_score_path_d_zero_grad']
+                    * global_rollout_state_count.item(),
+                    'state_count': global_active_state_count.item(),
+                    'probe_count': diagnostic_metrics['actor/eitr_score_path_probe_count'],
+                    'ess_sum': diagnostic_metrics['actor/eitr_score_path_ess']
+                    * global_active_state_count.item(),
+                    'clipfrac_sum': diagnostic_metrics[
+                        'actor/eitr_score_path_log_ratio_clipfrac'
+                    ] * global_active_state_count.item(),
+                    'active_micro_batch_count': float(len(dataloader)),
+                })
+                # One real SGD invocation occurred inside the diagnostic, then
+                # theta_GRPO was restored. Count placement, not persistence.
+                eitr_correction_optimizer_step_count += 1
+                score_path_noop_direction_audit_ran = True
+            elif global_active_state_count.item() > 0:
                 for correction_index in range(self.eitr_correction_passes):
                     pass_index = self.ppo_epochs + correction_index
                     probe_forward_enabled = eitr_probe_enabled_for_pass(
@@ -1230,6 +1698,9 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 'actor/eitr_update_direction_diagnostic_ran': float(
                     update_direction_diagnostic_ran
+                ),
+                'actor/eitr_score_path_noop_direction_audit_ran': float(
+                    score_path_noop_direction_audit_ran
                 ),
                 'actor/eitr_loss_applied': float(
                     eitr_correction_optimizer_step_count > 0

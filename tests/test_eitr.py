@@ -39,7 +39,10 @@ build_eitr_correction_optimizer = EITR.build_eitr_correction_optimizer
 coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
 directional_parameter_candidates = EITR.directional_parameter_candidates
+cached_probe_fingerprint = EITR.cached_probe_fingerprint
 eitr_update_direction_diagnostic_enabled = EITR.eitr_update_direction_diagnostic_enabled
+eitr_score_path_noop_direction_audit_enabled = EITR.eitr_score_path_noop_direction_audit_enabled
+score_path_audit_event_sequence = EITR.score_path_audit_event_sequence
 same_batch_cache_signature = EITR.same_batch_cache_signature
 same_batch_scale_diagnostic_lrs = EITR.same_batch_scale_diagnostic_lrs
 same_batch_sgd_candidates = EITR.same_batch_sgd_candidates
@@ -958,6 +961,51 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         self.assertEqual(manager._eitr_probe_collection_stats["probe_generation_call_count"], 3)
         self.assertEqual(group["effective_probe_count"], 4)
         self.assertEqual(len({probe["query"] for probe in group["probes"]}), 4)
+
+class ScorePathNoopDirectionAuditTest(unittest.TestCase):
+    def _cached_batch(self):
+        return {
+            key: torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+            for key in EITR.EITR_BATCH_KEYS
+        }
+
+    def test_audit_defaults_to_disabled(self):
+        self.assertFalse(eitr_score_path_noop_direction_audit_enabled({}))
+        self.assertFalse(eitr_score_path_noop_direction_audit_enabled({
+            "score_path_noop_direction_audit": "false"
+        }))
+
+    def test_event_order_finishes_grpo_before_one_eitr_step(self):
+        sequence = score_path_audit_event_sequence(5)
+        self.assertEqual(sequence[0], "probe_old_logp@v0")
+        self.assertEqual(sequence[1:6], tuple(f"GRPO_STEP_{i}" for i in range(1, 6)))
+        self.assertEqual(sequence[6:], (
+            "D_PRE_ALL_STATES@v5", "EITR_SGD_STEP_1", "D_POST_ALL_STATES@v6"
+        ))
+
+    def test_fingerprint_detects_cached_probe_mismatch(self):
+        first = self._cached_batch()
+        second = {key: value.clone() for key, value in first.items()}
+        self.assertEqual(cached_probe_fingerprint([first]), cached_probe_fingerprint([second]))
+        second["eitr_probe_old_seq_logp"][0, 0, 0] += 1
+        self.assertNotEqual(cached_probe_fingerprint([first]), cached_probe_fingerprint([second]))
+
+    def test_noop_does_not_change_parameters_and_candidates_do_not_accumulate(self):
+        parameter = torch.tensor([2.0], dtype=torch.float32)
+        gradient = torch.tensor([4.0], dtype=torch.float32)
+        before = parameter.clone()
+        noop = parameter.clone()
+        candidates = directional_parameter_candidates([parameter], [gradient], 0.1)
+        self.assertTrue(torch.equal(parameter, before))
+        self.assertTrue(torch.equal(noop, before))
+        self.assertAlmostEqual(candidates["minus"][0].item(), 1.6, places=6)
+        self.assertAlmostEqual(candidates["plus"][0].item(), 2.4, places=6)
+
+    def test_tiny_fp32_convex_target_decreases_along_negative_gradient(self):
+        parameter = torch.tensor([2.0], dtype=torch.float32)
+        gradient = 2 * parameter
+        candidate = directional_parameter_candidates([parameter], [gradient], 0.1)["minus"][0]
+        self.assertLess((candidate.square()).item(), (parameter.square()).item())
 
 
 if __name__ == "__main__":
