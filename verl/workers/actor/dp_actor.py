@@ -521,12 +521,17 @@ class DataParallelPPOActor(BasePPOActor):
                     local['probe_count'] += result['valid_probe_count']
                     local['ess_sum'] += result['ess_mean'] * valid_state_count
                     local['clipfrac_sum'] += result['log_ratio_clipfrac'] * valid_state_count
-                if build_grad and valid_state_count > 0:
+                if build_grad:
                     raw_logprob_grad = torch.autograd.grad(
                         result['loss'], result['current_seq_logp'], retain_graph=True,
                         allow_unused=True,
                     )[0]
-                    if capture_query_sample and query_sample is None and raw_logprob_grad is not None:
+                    if (
+                        capture_query_sample
+                        and query_sample is None
+                        and valid_state_count > 0
+                        and raw_logprob_grad is not None
+                    ):
                         state_slot = state_chunk['eitr_state_slot'].bool()
                         state_valid = state_chunk['eitr_state_valid'][state_slot].bool()
                         if state_valid.any():
@@ -545,6 +550,10 @@ class DataParallelPPOActor(BasePPOActor):
                         float(global_rollout_state_count.item()),
                         world_size=eitr_world_size,
                     )
+                    # Every FSDP rank must execute the matching backward. For
+                    # an inactive local chunk ``loss`` and ``state_weight`` are
+                    # both zero, so this preserves collectives without changing
+                    # the full-batch gradient.
                     (result['loss'] * self.eitr_lambda_env * state_weight).backward()
                     del raw_logprob_grad
                 del result
