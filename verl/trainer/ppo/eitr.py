@@ -69,6 +69,14 @@ def same_batch_scale_diagnostic_lrs(config: Any) -> Tuple[float, ...]:
     return SAME_BATCH_SCALE_DIAGNOSTIC_LRS if bool(enabled) else ()
 
 
+def eitr_update_direction_diagnostic_enabled(config: Any) -> bool:
+    """Enable the one-shot +/- gradient direction audit only when requested."""
+    enabled = _config_value(config, "update_direction_diagnostic", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() == "true"
+    return bool(enabled)
+
+
 def same_batch_cache_signature(batch: Mapping[str, torch.Tensor]) -> Tuple[Tuple[Any, ...], ...]:
     """Describe cached EITR tensors without copying or mutating them."""
     return tuple(
@@ -98,6 +106,27 @@ def same_batch_sgd_candidates(
             for parameter, gradient in zip(parameters, gradients)
         )
         for learning_rate in learning_rates
+    }
+
+
+def directional_parameter_candidates(
+    parameters: Sequence[torch.Tensor],
+    gradients: Sequence[Optional[torch.Tensor]],
+    epsilon: float,
+) -> Dict[str, Tuple[torch.Tensor, ...]]:
+    """Return exact +/- gradient candidates from an immutable common start."""
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    if len(parameters) != len(gradients):
+        raise ValueError("parameters and gradients must have identical lengths")
+    return {
+        direction: tuple(
+            parameter.detach().clone()
+            if gradient is None
+            else parameter.detach().clone().add_(gradient, alpha=sign * epsilon)
+            for parameter, gradient in zip(parameters, gradients)
+        )
+        for direction, sign in (("minus", -1.0), ("plus", 1.0))
     }
 
 

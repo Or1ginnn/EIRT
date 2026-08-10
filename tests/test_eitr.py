@@ -38,6 +38,8 @@ build_grpo_uids = EITR.build_grpo_uids
 build_eitr_correction_optimizer = EITR.build_eitr_correction_optimizer
 coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
+directional_parameter_candidates = EITR.directional_parameter_candidates
+eitr_update_direction_diagnostic_enabled = EITR.eitr_update_direction_diagnostic_enabled
 same_batch_cache_signature = EITR.same_batch_cache_signature
 same_batch_scale_diagnostic_lrs = EITR.same_batch_scale_diagnostic_lrs
 same_batch_sgd_candidates = EITR.same_batch_sgd_candidates
@@ -297,6 +299,18 @@ class EITRMathTest(unittest.TestCase):
         before = same_batch_cache_signature(cached)
         same_batch_sgd_candidates([parameter], [gradient])
         self.assertEqual(before, same_batch_cache_signature(cached))
+
+    def test_direction_diagnostic_is_opt_in_and_has_opposite_non_accumulating_updates(self):
+        self.assertFalse(eitr_update_direction_diagnostic_enabled({}))
+        self.assertTrue(
+            eitr_update_direction_diagnostic_enabled({"update_direction_diagnostic": "true"})
+        )
+        parameter = torch.tensor([2.0, -1.0])
+        gradient = torch.tensor([4.0, 2.0])
+        candidates = directional_parameter_candidates([parameter], [gradient], 0.25)
+        self.assertTrue(torch.equal(parameter, torch.tensor([2.0, -1.0])))
+        self.assertTrue(torch.equal(candidates["minus"][0], torch.tensor([1.0, -1.5])))
+        self.assertTrue(torch.equal(candidates["plus"][0], torch.tensor([3.0, -0.5])))
 
     def test_eitr_sgd_does_not_advance_grpo_adamw_state(self):
         parameter = torch.nn.Parameter(torch.tensor([1.0]))

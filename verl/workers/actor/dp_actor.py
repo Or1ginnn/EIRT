@@ -27,6 +27,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.eitr import (
     EITR_BATCH_KEYS,
     eitr_loss_enabled_for_pass,
+    eitr_update_direction_diagnostic_enabled,
     coverage_weighted_state_scale,
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
@@ -78,6 +79,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_same_batch_scale_lrs = same_batch_scale_diagnostic_lrs(
             self.eitr_config
         )
+        self.eitr_update_direction_diagnostic = eitr_update_direction_diagnostic_enabled(
+            self.eitr_config
+        )
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
         self.grpo_optimizer_steps_completed = 0
@@ -93,6 +97,10 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError('Only EITR mode may own a correction optimizer')
         if self.eitr_same_batch_scale_lrs and self.eitr_mode != 'eitr':
             raise ValueError('Same-batch scale diagnostic requires EITR mode')
+        if self.eitr_update_direction_diagnostic and self.eitr_mode != 'eitr':
+            raise ValueError('Update-direction diagnostic requires EITR mode')
+        if self.eitr_same_batch_scale_lrs and self.eitr_update_direction_diagnostic:
+            raise ValueError('Only one EITR diagnostic may be enabled at once')
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
@@ -555,6 +563,189 @@ class DataParallelPPOActor(BasePPOActor):
             print(f'EITR_SAME_BATCH_SCALE_DIAGNOSTIC D_zero={d_zero:.12e} {values}')
         return metrics
 
+    @staticmethod
+    def _apply_snapshot_gradient(snapshot, scale):
+        """Apply one explicit +/- epsilon*g update to FSDP-local parameter shards."""
+        with torch.no_grad():
+            for parameter, _, saved_gradient in snapshot:
+                if saved_gradient is not None:
+                    parameter.add_(saved_gradient.to(
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                        non_blocking=True,
+                    ), alpha=float(scale))
+
+    def _directional_parameter_statistics(self, snapshot, *, direction, distributed):
+        local_grad_sq = 0.0
+        local_delta_sq = 0.0
+        local_g_dot_delta = 0.0
+        for parameter, saved_parameter, saved_gradient in snapshot:
+            if saved_gradient is None:
+                continue
+            delta = parameter.detach().float().cpu() - saved_parameter.float()
+            gradient = saved_gradient.float()
+            local_grad_sq += float(gradient.square().sum().item())
+            local_delta_sq += float(delta.square().sum().item())
+            local_g_dot_delta += float((gradient * delta).sum().item())
+        stats = torch.tensor(
+            [local_grad_sq, local_delta_sq, local_g_dot_delta],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        if distributed:
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+        grad_norm = float(stats[0].clamp_min(0).sqrt().item())
+        delta_norm = float(stats[1].clamp_min(0).sqrt().item())
+        g_dot_delta = float(stats[2].item())
+        signed_dot = -g_dot_delta if direction == 'minus' else g_dot_delta
+        cosine = signed_dot / max(grad_norm * delta_norm, 1e-30)
+        return grad_norm, delta_norm, g_dot_delta, cosine
+
+    def _query_logprob_direction_metrics(
+        self,
+        query_sample,
+        *,
+        epsilon,
+        distributed,
+    ):
+        """Check the induced-JS derivative directly in cached query-logprob space."""
+        if query_sample is None:
+            local = torch.zeros(4, dtype=torch.float64, device=torch.cuda.current_device())
+        else:
+            current, gradient, old, doc_probs, probe_mask = (
+                value.cuda() for value in query_sample
+            )
+            with torch.no_grad():
+                values = []
+                for scale in (-float(epsilon), 0.0, float(epsilon)):
+                    result = induced_js_from_cached_effects(
+                        current_seq_logp=current + scale * gradient,
+                        old_seq_logp=old,
+                        doc_probs=doc_probs,
+                        probe_mask=probe_mask,
+                        log_ratio_clip=float(self.eitr_config.get('log_ratio_clip', 10.0)),
+                    )
+                    values.append(float(result['js'].mean().item()))
+            local = torch.tensor(
+                [values[0], values[1], values[2], 1.0],
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+        if distributed:
+            torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
+        if local[3].item() <= 0:
+            raise RuntimeError('Update-direction diagnostic captured no query-logprob sample')
+        metrics = local[:3] / local[3]
+        if not torch.isfinite(metrics).all():
+            raise RuntimeError('Query-logprob direction diagnostic produced a non-finite JS')
+        return tuple(float(value.item()) for value in metrics)
+
+    def _run_update_direction_diagnostic(
+        self,
+        dataloader,
+        temperature,
+        *,
+        distributed,
+        global_active_state_count,
+        global_rollout_state_count,
+        d_zero,
+        query_sample,
+        epsilon=3e-5,
+    ):
+        """Audit +/- epsilon*g from the exact same theta_GRPO and cached probes."""
+        cache_signature = tuple(
+            same_batch_cache_signature(mini_batch) for mini_batch in dataloader
+        )
+        snapshot = self._snapshot_eitr_local_state()
+        metrics = {
+            'actor/eitr_update_direction_diagnostic': 1.0,
+            'actor/eitr_update_direction_cache_reused': 1.0,
+            'actor/eitr_update_direction_d_zero': float(d_zero),
+            'actor/eitr_update_direction_epsilon': float(epsilon),
+        }
+        query_minus, query_zero, query_plus = self._query_logprob_direction_metrics(
+            query_sample, epsilon=epsilon, distributed=distributed
+        )
+        metrics.update({
+            'actor/eitr_update_direction_query_js_minus': query_minus,
+            'actor/eitr_update_direction_query_js_zero': query_zero,
+            'actor/eitr_update_direction_query_js_plus': query_plus,
+        })
+        reports = {}
+        try:
+            for direction, scale in (('minus', -epsilon), ('plus', epsilon)):
+                self._restore_eitr_local_state(snapshot, restore_gradients=True)
+                start_error = self._distributed_scalar(
+                    self._local_snapshot_max_abs_error(snapshot),
+                    distributed=distributed,
+                    op=torch.distributed.ReduceOp.MAX,
+                )
+                if start_error != 0.0:
+                    raise RuntimeError(
+                        'Update-direction diagnostic could not restore theta_GRPO'
+                    )
+                self._apply_snapshot_gradient(snapshot, scale)
+                grad_norm, update_norm, g_dot_delta, cosine = (
+                    self._directional_parameter_statistics(
+                        snapshot, direction=direction, distributed=distributed
+                    )
+                )
+                if update_norm == 0.0:
+                    raise RuntimeError('Update-direction diagnostic produced a zero parameter update')
+                if tuple(
+                    same_batch_cache_signature(mini_batch) for mini_batch in dataloader
+                ) != cache_signature:
+                    raise RuntimeError('Update-direction diagnostic mutated cached probe tensors')
+                post_stats = self._score_cached_eitr_drift(
+                    dataloader, temperature, distributed=distributed
+                )
+                if int(post_stats[1].item()) != int(global_active_state_count.item()):
+                    raise RuntimeError(
+                        'Update-direction diagnostic re-score did not cover every active state'
+                    )
+                d_post = rollout_averaged_env_drift(
+                    post_stats[0].item(), global_rollout_state_count.item()
+                )
+                if not torch.isfinite(torch.tensor(d_post)):
+                    raise RuntimeError('Update-direction diagnostic produced a non-finite drift')
+                metrics.update({
+                    f'actor/eitr_update_direction_d_{direction}': float(d_post),
+                    f'actor/eitr_update_direction_d_delta_{direction}': float(d_post - d_zero),
+                    f'actor/eitr_update_direction_start_max_abs_{direction}': float(start_error),
+                    f'actor/eitr_update_direction_update_norm_{direction}': float(update_norm),
+                    f'actor/eitr_update_direction_g_dot_delta_{direction}': float(g_dot_delta),
+                    f'actor/eitr_update_direction_cos_{direction}': float(cosine),
+                    f'actor/eitr_update_direction_grad_norm_{direction}': float(grad_norm),
+                })
+                reports[direction] = (d_post, update_norm, g_dot_delta, cosine, start_error)
+        finally:
+            self._restore_eitr_local_state(snapshot, restore_gradients=False)
+            self.eitr_optimizer.zero_grad()
+
+        restore_error = self._distributed_scalar(
+            self._local_snapshot_max_abs_error(snapshot),
+            distributed=distributed,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if restore_error != 0.0:
+            raise RuntimeError('Update-direction diagnostic failed to restore theta_GRPO')
+        metrics['actor/eitr_update_direction_final_restore_max_abs'] = restore_error
+        if not distributed or torch.distributed.get_rank() == 0:
+            print(
+                'EITR_UPDATE_DIRECTION_DIAGNOSTIC '
+                f'D_zero={d_zero:.12e} '
+                f'D_minus={reports["minus"][0]:.12e} '
+                f'D_plus={reports["plus"][0]:.12e} '
+                f'g_dot_delta_minus={reports["minus"][2]:.12e} '
+                f'g_dot_delta_plus={reports["plus"][2]:.12e} '
+                f'cos_minus={reports["minus"][3]:.12e} '
+                f'cos_plus={reports["plus"][3]:.12e} '
+                f'query_minus={query_minus:.12e} '
+                f'query_zero={query_zero:.12e} '
+                f'query_plus={query_plus:.12e}'
+            )
+        return metrics
+
     def update_policy(self, data: DataProto):
         self.actor_module.train()
 
@@ -669,6 +860,8 @@ class DataParallelPPOActor(BasePPOActor):
         post_drift_stat_tensor = None
         post_diagnostic_ran = False
         same_batch_scale_diagnostic_ran = False
+        update_direction_diagnostic_ran = False
+        query_logprob_direction_sample = None
         if self.eitr_uses_probes:
             self.actor_optimizer.zero_grad()
             global_active_state_count = torch.tensor(
@@ -756,6 +949,25 @@ class DataParallelPPOActor(BasePPOActor):
                                 if raw_logprob_grad is not None
                                 else 0.0
                             )
+                            if (
+                                self.eitr_update_direction_diagnostic
+                                and query_logprob_direction_sample is None
+                                and raw_logprob_grad is not None
+                                and valid_state_count > 0
+                            ):
+                                state_slot = state_chunk['eitr_state_slot'].bool()
+                                state_valid = state_chunk['eitr_state_valid'][state_slot].bool()
+                                if state_valid.any():
+                                    query_logprob_direction_sample = tuple(
+                                        value.detach().to(device='cpu', copy=True)
+                                        for value in (
+                                            eitr_result['current_seq_logp'][state_valid],
+                                            raw_logprob_grad[state_valid],
+                                            state_chunk['eitr_probe_old_seq_logp'][state_slot][state_valid],
+                                            state_chunk['eitr_probe_doc_probs'][state_slot][state_valid],
+                                            state_chunk['eitr_probe_valid'][state_slot][state_valid],
+                                        )
+                                    )
                             applied_scale = (
                                 self.eitr_lambda_env * state_weight
                                 if eitr_loss_enabled and valid_state_count > 0
@@ -842,6 +1054,21 @@ class DataParallelPPOActor(BasePPOActor):
                                 )
                                 append_to_dict(metrics, diagnostic_metrics)
                                 same_batch_scale_diagnostic_ran = True
+                            elif self.eitr_update_direction_diagnostic:
+                                diagnostic_metrics = self._run_update_direction_diagnostic(
+                                    dataloader,
+                                    temperature,
+                                    distributed=distributed,
+                                    global_active_state_count=global_active_state_count,
+                                    global_rollout_state_count=global_rollout_state_count,
+                                    d_zero=rollout_averaged_env_drift(
+                                        pre_drift_stat_tensor[0].item(),
+                                        global_rollout_state_count.item(),
+                                    ),
+                                    query_sample=query_logprob_direction_sample,
+                                )
+                                append_to_dict(metrics, diagnostic_metrics)
+                                update_direction_diagnostic_ran = True
                             else:
                                 correction_grad_norm = self._optimizer_step(
                                     self.eitr_optimizer
@@ -851,7 +1078,10 @@ class DataParallelPPOActor(BasePPOActor):
                                     'actor/eitr_correction_grad_norm': correction_grad_norm.detach().item(),
                                     f'actor/grad_norm_pass_{pass_index}': correction_grad_norm.detach().item(),
                                 })
-                        elif self.eitr_same_batch_scale_lrs:
+                        elif (
+                            self.eitr_same_batch_scale_lrs
+                            or self.eitr_update_direction_diagnostic
+                        ):
                             raise RuntimeError(
                                 'Same-batch diagnostic found zero EITR gradient on the shared batch'
                             )
@@ -877,7 +1107,10 @@ class DataParallelPPOActor(BasePPOActor):
                                     'Post-correction EITR re-score did not cover the '
                                     'same active states as the pre-correction pass'
                                 )
-            elif self.eitr_same_batch_scale_lrs:
+            elif (
+                self.eitr_same_batch_scale_lrs
+                or self.eitr_update_direction_diagnostic
+            ):
                 raise RuntimeError('Same-batch diagnostic found no valid EITR states')
 
         self.actor_optimizer.zero_grad()
@@ -994,6 +1227,9 @@ class DataParallelPPOActor(BasePPOActor):
                 'actor/eitr_post_diagnostic_ran': float(post_diagnostic_ran),
                 'actor/eitr_same_batch_scale_diagnostic_ran': float(
                     same_batch_scale_diagnostic_ran
+                ),
+                'actor/eitr_update_direction_diagnostic_ran': float(
+                    update_direction_diagnostic_ran
                 ),
                 'actor/eitr_loss_applied': float(
                     eitr_correction_optimizer_step_count > 0

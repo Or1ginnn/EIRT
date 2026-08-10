@@ -65,6 +65,7 @@ ACTOR_LR="${ACTOR_LR:-5e-7}"
 EITR_LR="${EITR_LR:-$ACTOR_LR}"
 EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-1}"
 EITR_SAME_BATCH_SCALE_DIAGNOSTIC="${EITR_SAME_BATCH_SCALE_DIAGNOSTIC:-false}"
+EITR_UPDATE_DIRECTION_DIAGNOSTIC="${EITR_UPDATE_DIRECTION_DIAGNOSTIC:-false}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
 STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"
 FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"
@@ -125,6 +126,18 @@ case "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" in
         exit 2
         ;;
 esac
+
+case "$EITR_UPDATE_DIRECTION_DIAGNOSTIC" in
+    true|false) ;;
+    *)
+        echo "EITR_UPDATE_DIRECTION_DIAGNOSTIC must be true or false; got: $EITR_UPDATE_DIRECTION_DIAGNOSTIC" >&2
+        exit 2
+        ;;
+esac
+if [[ "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" == "true" && "$EITR_UPDATE_DIRECTION_DIAGNOSTIC" == "true" ]]; then
+    echo "Only one EITR diagnostic may be enabled at once" >&2
+    exit 2
+fi
 
 case "$BASE_MODEL" in
     *parallel_search*|*parallel-search*|*finance*)
@@ -304,6 +317,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.eitr.correction_lr="$EITR_LR" \
     actor_rollout_ref.actor.eitr.post_diagnostic_freq="$EITR_POST_DIAGNOSTIC_FREQ" \
     actor_rollout_ref.actor.eitr.same_batch_scale_diagnostic="$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" \
+    actor_rollout_ref.actor.eitr.update_direction_diagnostic="$EITR_UPDATE_DIRECTION_DIAGNOSTIC" \
     actor_rollout_ref.actor.eitr.lambda_env="$EITR_LAMBDA_ENV" \
     actor_rollout_ref.actor.eitr.log_ratio_clip=10.0 \
     actor_rollout_ref.actor.ppo_epochs="$PPO_EPOCHS" \
