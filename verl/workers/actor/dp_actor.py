@@ -575,17 +575,20 @@ class DataParallelPPOActor(BasePPOActor):
             'query_sample': query_sample,
         }
 
-    def _audit_parameter_checksum(self, *, distributed):
-        local = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
-        for parameter in self.actor_module.parameters():
-            if parameter.requires_grad:
-                value = parameter.detach().float()
-                local[0] += value.sum(dtype=torch.float64)
-                local[1] += value.square().sum(dtype=torch.float64)
-                local[2] += value.abs().sum(dtype=torch.float64)
-        if distributed:
-            torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
-        return tuple(float(value.item()) for value in local)
+    def _snapshot_checksum(self, snapshot, *, distributed):
+        """Checksum FSDP-local CPU shards without triggering a full all-gather."""
+        local = [0.0, 0.0, 0.0]
+        for _, saved_parameter, _ in snapshot:
+            value = saved_parameter.float()
+            local[0] += float(value.sum(dtype=torch.float64).item())
+            local[1] += float(value.square().sum(dtype=torch.float64).item())
+            local[2] += float(value.abs().sum(dtype=torch.float64).item())
+        return tuple(
+            self._distributed_scalar(
+                value, distributed=distributed, op=torch.distributed.ReduceOp.SUM
+            )
+            for value in local
+        )
 
     def _audit_direction_statistics(self, snapshot, *, direction, distributed):
         local_sums = torch.zeros(5, dtype=torch.float64, device=torch.cuda.current_device())
@@ -918,7 +921,6 @@ class DataParallelPPOActor(BasePPOActor):
         global_rollout_state_count,
         d_old,
         theta_old_checksum,
-        theta_grpo_checksum,
         grpo_step_count,
         epsilon=3e-5,
     ):
@@ -949,6 +951,7 @@ class DataParallelPPOActor(BasePPOActor):
             raise RuntimeError('Score-path audit D_zero did not cover every active state')
         hashes['zero_grad'] = cached_probe_fingerprint(dataloader)
         snapshot = self._snapshot_eitr_local_state()
+        theta_grpo_checksum = self._snapshot_checksum(snapshot, distributed=distributed)
         metrics = {
             'actor/eitr_score_path_noop_direction_audit': 1.0,
             'actor/eitr_score_path_d_old': float(d_old),
@@ -1087,7 +1090,7 @@ class DataParallelPPOActor(BasePPOActor):
             distributed=distributed,
             op=torch.distributed.ReduceOp.MAX,
         )
-        theta_after_checksum = self._audit_parameter_checksum(distributed=distributed)
+        theta_after_checksum = self._snapshot_checksum(snapshot, distributed=distributed)
         if restore_error != 0.0:
             raise RuntimeError('Score-path audit failed to restore theta_GRPO')
         if theta_after_checksum != theta_grpo_checksum:
@@ -1199,7 +1202,11 @@ class DataParallelPPOActor(BasePPOActor):
                 )
             if audit_global_active_state_count.item() <= 0:
                 raise RuntimeError('Score-path audit found no active EITR states before GRPO')
-            audit_theta_old_checksum = self._audit_parameter_checksum(distributed=distributed)
+            audit_old_snapshot = self._snapshot_eitr_local_state()
+            audit_theta_old_checksum = self._snapshot_checksum(
+                audit_old_snapshot, distributed=distributed
+            )
+            del audit_old_snapshot
             if not distributed or torch.distributed.get_rank() == 0:
                 print('EITR_SCORE_AUDIT_EVENT probe_old_logp@v0')
             audit_old_stats = self._audit_score_cached_eitr_drift(
@@ -1322,9 +1329,6 @@ class DataParallelPPOActor(BasePPOActor):
                     audit_global_active_state_count.item()
                 ):
                     raise RuntimeError('Score-path audit active-state count changed during GRPO')
-                audit_theta_grpo_checksum = self._audit_parameter_checksum(
-                    distributed=distributed
-                )
                 diagnostic_metrics = self._run_score_path_noop_direction_audit(
                     dataloader,
                     temperature,
@@ -1334,7 +1338,6 @@ class DataParallelPPOActor(BasePPOActor):
                     global_rollout_state_count=global_rollout_state_count,
                     d_old=audit_d_old,
                     theta_old_checksum=audit_theta_old_checksum,
-                    theta_grpo_checksum=audit_theta_grpo_checksum,
                     grpo_step_count=grpo_optimizer_step_count,
                 )
                 append_to_dict(metrics, diagnostic_metrics)
