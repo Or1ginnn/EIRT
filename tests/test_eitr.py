@@ -38,6 +38,9 @@ build_grpo_uids = EITR.build_grpo_uids
 build_eitr_correction_optimizer = EITR.build_eitr_correction_optimizer
 coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
+same_batch_cache_signature = EITR.same_batch_cache_signature
+same_batch_scale_diagnostic_lrs = EITR.same_batch_scale_diagnostic_lrs
+same_batch_sgd_candidates = EITR.same_batch_sgd_candidates
 probe_effect_diversity = EITR.probe_effect_diversity
 rollout_averaged_env_drift = EITR.rollout_averaged_env_drift
 should_run_post_diagnostic = EITR.should_run_post_diagnostic
@@ -275,6 +278,25 @@ class EITRMathTest(unittest.TestCase):
                 ppo_epochs=1,
                 correction_passes=2,
             )
+
+    def test_same_batch_scale_diagnostic_is_opt_in_and_non_accumulating(self):
+        self.assertEqual(same_batch_scale_diagnostic_lrs({}), ())
+        self.assertEqual(
+            same_batch_scale_diagnostic_lrs({"same_batch_scale_diagnostic": True}),
+            (1e-5, 3e-5, 1e-4),
+        )
+        parameter = torch.tensor([3.0, -2.0])
+        gradient = torch.tensor([2.0, -4.0])
+        candidates = same_batch_sgd_candidates([parameter], [gradient])
+        self.assertTrue(torch.equal(parameter, torch.tensor([3.0, -2.0])))
+        self.assertTrue(torch.equal(candidates[1e-5][0], parameter - 1e-5 * gradient))
+        self.assertTrue(torch.equal(candidates[3e-5][0], parameter - 3e-5 * gradient))
+        self.assertTrue(torch.equal(candidates[1e-4][0], parameter - 1e-4 * gradient))
+
+        cached = {key: torch.ones(2, 2) for key in EITR.EITR_BATCH_KEYS}
+        before = same_batch_cache_signature(cached)
+        same_batch_sgd_candidates([parameter], [gradient])
+        self.assertEqual(before, same_batch_cache_signature(cached))
 
     def test_eitr_sgd_does_not_advance_grpo_adamw_state(self):
         parameter = torch.nn.Parameter(torch.tensor([1.0]))

@@ -64,6 +64,7 @@ EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-$MAX_RESPONSE_LENGTH}"
 ACTOR_LR="${ACTOR_LR:-5e-7}"
 EITR_LR="${EITR_LR:-$ACTOR_LR}"
 EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-1}"
+EITR_SAME_BATCH_SCALE_DIAGNOSTIC="${EITR_SAME_BATCH_SCALE_DIAGNOSTIC:-false}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
 STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"
 FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"
@@ -113,6 +114,14 @@ case "$METRICS_LEVEL" in
     core|debug) ;;
     *)
         echo "METRICS_LEVEL must be core or debug; got: $METRICS_LEVEL" >&2
+        exit 2
+        ;;
+esac
+
+case "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" in
+    true|false) ;;
+    *)
+        echo "EITR_SAME_BATCH_SCALE_DIAGNOSTIC must be true or false; got: $EITR_SAME_BATCH_SCALE_DIAGNOSTIC" >&2
         exit 2
         ;;
 esac
@@ -294,6 +303,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.eitr.correction_optimizer=sgd \
     actor_rollout_ref.actor.eitr.correction_lr="$EITR_LR" \
     actor_rollout_ref.actor.eitr.post_diagnostic_freq="$EITR_POST_DIAGNOSTIC_FREQ" \
+    actor_rollout_ref.actor.eitr.same_batch_scale_diagnostic="$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" \
     actor_rollout_ref.actor.eitr.lambda_env="$EITR_LAMBDA_ENV" \
     actor_rollout_ref.actor.eitr.log_ratio_clip=10.0 \
     actor_rollout_ref.actor.ppo_epochs="$PPO_EPOCHS" \

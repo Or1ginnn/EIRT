@@ -79,6 +79,7 @@ actor_rollout_ref:
       correction_optimizer: sgd
       correction_lr: null  # null inherits actor.optim.lr
       post_diagnostic_freq: 0  # 0 disables the extra post-correction re-score
+      same_batch_scale_diagnostic: false  # debug-only, never enabled by formal runs
       lambda_env: 0.1
       log_ratio_clip: 10.0
     # Number of ordinary GRPO passes. EITR correction_passes are separate and

@@ -31,6 +31,8 @@ from verl.trainer.ppo.eitr import (
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
     rollout_averaged_env_drift,
+    same_batch_cache_signature,
+    same_batch_scale_diagnostic_lrs,
     should_run_post_diagnostic,
     resolve_eitr_mode,
     validate_eitr_optimization_schedule,
@@ -73,6 +75,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_post_diagnostic_freq = int(
             self.eitr_config.get('post_diagnostic_freq', 0)
         )
+        self.eitr_same_batch_scale_lrs = same_batch_scale_diagnostic_lrs(
+            self.eitr_config
+        )
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
         self.grpo_optimizer_steps_completed = 0
@@ -86,6 +91,8 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError('EITR mode requires an independent correction optimizer')
         if self.eitr_mode != 'eitr' and self.eitr_optimizer is not None:
             raise ValueError('Only EITR mode may own a correction optimizer')
+        if self.eitr_same_batch_scale_lrs and self.eitr_mode != 'eitr':
+            raise ValueError('Same-batch scale diagnostic requires EITR mode')
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
@@ -360,6 +367,194 @@ class DataParallelPPOActor(BasePPOActor):
             )
             yield from rollout_micro_batch.split(states_per_probe_chunk)
 
+    def _snapshot_eitr_local_state(self):
+        """Save only each rank's FSDP-local shard and correction gradient on CPU."""
+        snapshot = []
+        for parameter in self.actor_module.parameters():
+            if not parameter.requires_grad:
+                continue
+            snapshot.append((
+                parameter,
+                parameter.detach().to(device='cpu', copy=True),
+                None if parameter.grad is None else parameter.grad.detach().to(
+                    device='cpu', copy=True
+                ),
+            ))
+        if not snapshot:
+            raise RuntimeError('Same-batch diagnostic found no trainable actor shards')
+        return snapshot
+
+    @staticmethod
+    def _restore_eitr_local_state(snapshot, *, restore_gradients):
+        with torch.no_grad():
+            for parameter, saved_parameter, saved_gradient in snapshot:
+                parameter.copy_(saved_parameter.to(
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                    non_blocking=True,
+                ))
+                if restore_gradients:
+                    parameter.grad = (
+                        None if saved_gradient is None else saved_gradient.to(
+                            device=parameter.device,
+                            dtype=parameter.dtype,
+                            non_blocking=True,
+                        )
+                    )
+
+    @staticmethod
+    def _local_snapshot_max_abs_error(snapshot):
+        maximum = 0.0
+        for parameter, saved_parameter, _ in snapshot:
+            maximum = max(
+                maximum,
+                float((parameter.detach().float().cpu() - saved_parameter.float()).abs().max().item()),
+            )
+        return maximum
+
+    @staticmethod
+    def _local_snapshot_delta_sq(snapshot):
+        total = 0.0
+        for parameter, saved_parameter, _ in snapshot:
+            total += float((
+                parameter.detach().float().cpu() - saved_parameter.float()
+            ).square().sum().item())
+        return total
+
+    @staticmethod
+    def _distributed_scalar(value, *, distributed, op):
+        tensor = torch.tensor(
+            float(value), dtype=torch.float64, device=torch.cuda.current_device()
+        )
+        if distributed:
+            torch.distributed.all_reduce(tensor, op=op)
+        return float(tensor.item())
+
+    def _score_cached_eitr_drift(self, dataloader, temperature, *, distributed):
+        """Re-score exactly the existing cached probes without gradient or retrieval."""
+        js_sum = 0.0
+        state_count = 0.0
+        for mini_batch in dataloader:
+            mini_global_state_count = torch.tensor(
+                float(mini_batch['eitr_state_valid'].sum().item()),
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            if distributed:
+                torch.distributed.all_reduce(
+                    mini_global_state_count, op=torch.distributed.ReduceOp.SUM
+                )
+            if mini_global_state_count.item() <= 0:
+                continue
+            for state_chunk in self._iter_eitr_state_chunks(mini_batch):
+                result = self._compute_eitr_micro_batch(
+                    state_chunk.cuda(), temperature, track_model_grad=False
+                )
+                if result is not None:
+                    js_sum += result['js_sum']
+                    state_count += result['valid_state_count']
+                del result
+        result_tensor = torch.tensor(
+            [js_sum, state_count], dtype=torch.float64, device=torch.cuda.current_device()
+        )
+        if distributed:
+            torch.distributed.all_reduce(result_tensor, op=torch.distributed.ReduceOp.SUM)
+        return result_tensor
+
+    def _run_same_batch_scale_diagnostic(
+        self,
+        dataloader,
+        temperature,
+        *,
+        distributed,
+        global_active_state_count,
+        global_rollout_state_count,
+        d_zero,
+    ):
+        """Evaluate three stateless SGD scales from one exact theta_GRPO snapshot."""
+        if self.eitr_optimizer.state:
+            raise RuntimeError('Same-batch diagnostic requires stateless correction SGD')
+
+        cache_signature = tuple(
+            same_batch_cache_signature(mini_batch) for mini_batch in dataloader
+        )
+        snapshot = self._snapshot_eitr_local_state()
+        original_lrs = [group['lr'] for group in self.eitr_optimizer.param_groups]
+        metrics = {
+            'actor/eitr_same_batch_scale_diagnostic': 1.0,
+            'actor/eitr_same_batch_cache_reused': 1.0,
+            'actor/eitr_same_batch_d_zero': float(d_zero),
+        }
+        candidate_report = []
+        try:
+            for learning_rate in self.eitr_same_batch_scale_lrs:
+                self._restore_eitr_local_state(snapshot, restore_gradients=True)
+                start_error = self._distributed_scalar(
+                    self._local_snapshot_max_abs_error(snapshot),
+                    distributed=distributed,
+                    op=torch.distributed.ReduceOp.MAX,
+                )
+                if start_error != 0.0:
+                    raise RuntimeError(
+                        'Same-batch diagnostic could not restore the common theta_GRPO start'
+                    )
+                for group in self.eitr_optimizer.param_groups:
+                    group['lr'] = float(learning_rate)
+                correction_grad_norm = self._optimizer_step(self.eitr_optimizer)
+                update_norm = self._distributed_scalar(
+                    self._local_snapshot_delta_sq(snapshot),
+                    distributed=distributed,
+                    op=torch.distributed.ReduceOp.SUM,
+                ) ** 0.5
+                if tuple(
+                    same_batch_cache_signature(mini_batch) for mini_batch in dataloader
+                ) != cache_signature:
+                    raise RuntimeError('Same-batch diagnostic mutated cached probe tensors')
+                post_stats = self._score_cached_eitr_drift(
+                    dataloader, temperature, distributed=distributed
+                )
+                if int(post_stats[1].item()) != int(global_active_state_count.item()):
+                    raise RuntimeError(
+                        'Same-batch diagnostic re-score did not cover every active state'
+                    )
+                d_post = rollout_averaged_env_drift(
+                    post_stats[0].item(), global_rollout_state_count.item()
+                )
+                label = f'{learning_rate:.0e}'.replace('e-', 'e')
+                metrics.update({
+                    f'actor/eitr_same_batch_d_post_lr_{label}': float(d_post),
+                    f'actor/eitr_same_batch_d_delta_lr_{label}': float(d_post - d_zero),
+                    f'actor/eitr_same_batch_update_norm_lr_{label}': float(update_norm),
+                    f'actor/eitr_same_batch_start_max_abs_lr_{label}': float(start_error),
+                    f'actor/eitr_same_batch_grad_norm_lr_{label}': float(
+                        correction_grad_norm.detach().item()
+                    ),
+                })
+                candidate_report.append((learning_rate, d_post, update_norm, start_error))
+                self.eitr_optimizer.zero_grad()
+        finally:
+            self._restore_eitr_local_state(snapshot, restore_gradients=False)
+            self.eitr_optimizer.zero_grad()
+            for group, original_lr in zip(self.eitr_optimizer.param_groups, original_lrs):
+                group['lr'] = original_lr
+
+        final_restore_error = self._distributed_scalar(
+            self._local_snapshot_max_abs_error(snapshot),
+            distributed=distributed,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if final_restore_error != 0.0:
+            raise RuntimeError('Same-batch diagnostic failed to restore theta_GRPO')
+        metrics['actor/eitr_same_batch_final_restore_max_abs'] = final_restore_error
+        if not distributed or torch.distributed.get_rank() == 0:
+            values = ' '.join(
+                f'lr={lr:.0e} D_post={d_post:.12e} D_delta={d_post - d_zero:.12e} '
+                f'update_norm={update_norm:.12e} start_max_abs={start_error:.12e}'
+                for lr, d_post, update_norm, start_error in candidate_report
+            )
+            print(f'EITR_SAME_BATCH_SCALE_DIAGNOSTIC D_zero={d_zero:.12e} {values}')
+        return metrics
+
     def update_policy(self, data: DataProto):
         self.actor_module.train()
 
@@ -473,6 +668,7 @@ class DataParallelPPOActor(BasePPOActor):
         # and optimizer state exactly match ordinary GRPO.
         post_drift_stat_tensor = None
         post_diagnostic_ran = False
+        same_batch_scale_diagnostic_ran = False
         if self.eitr_uses_probes:
             self.actor_optimizer.zero_grad()
             global_active_state_count = torch.tensor(
@@ -613,14 +809,52 @@ class DataParallelPPOActor(BasePPOActor):
                                 op=torch.distributed.ReduceOp.SUM,
                             )
                         if global_applied_grad_sq.item() > 0:
-                            correction_grad_norm = self._optimizer_step(
-                                self.eitr_optimizer
+                            pre_drift_stat_tensor = torch.tensor(
+                                [
+                                    pass_stats[pass_index]['js_sum'],
+                                    pass_stats[pass_index]['state_count'],
+                                ],
+                                dtype=torch.float64,
+                                device=torch.cuda.current_device(),
                             )
-                            eitr_correction_optimizer_step_count += 1
-                            append_to_dict(metrics, {
-                                'actor/eitr_correction_grad_norm': correction_grad_norm.detach().item(),
-                                f'actor/grad_norm_pass_{pass_index}': correction_grad_norm.detach().item(),
-                            })
+                            if distributed:
+                                torch.distributed.all_reduce(
+                                    pre_drift_stat_tensor,
+                                    op=torch.distributed.ReduceOp.SUM,
+                                )
+                            if int(pre_drift_stat_tensor[1].item()) != int(
+                                global_active_state_count.item()
+                            ):
+                                raise RuntimeError(
+                                    'Same-batch diagnostic pre-score did not cover every active state'
+                                )
+                            if self.eitr_same_batch_scale_lrs:
+                                diagnostic_metrics = self._run_same_batch_scale_diagnostic(
+                                    dataloader,
+                                    temperature,
+                                    distributed=distributed,
+                                    global_active_state_count=global_active_state_count,
+                                    global_rollout_state_count=global_rollout_state_count,
+                                    d_zero=rollout_averaged_env_drift(
+                                        pre_drift_stat_tensor[0].item(),
+                                        global_rollout_state_count.item(),
+                                    ),
+                                )
+                                append_to_dict(metrics, diagnostic_metrics)
+                                same_batch_scale_diagnostic_ran = True
+                            else:
+                                correction_grad_norm = self._optimizer_step(
+                                    self.eitr_optimizer
+                                )
+                                eitr_correction_optimizer_step_count += 1
+                                append_to_dict(metrics, {
+                                    'actor/eitr_correction_grad_norm': correction_grad_norm.detach().item(),
+                                    f'actor/grad_norm_pass_{pass_index}': correction_grad_norm.detach().item(),
+                                })
+                        elif self.eitr_same_batch_scale_lrs:
+                            raise RuntimeError(
+                                'Same-batch diagnostic found zero EITR gradient on the shared batch'
+                            )
                         self.eitr_optimizer.zero_grad()
                         self.actor_optimizer.zero_grad()
 
@@ -633,42 +867,9 @@ class DataParallelPPOActor(BasePPOActor):
                             ),
                         )
                         if post_diagnostic_ran:
-                            post_js_sum = 0.0
-                            post_state_count = 0.0
-                            for mini_batch in dataloader:
-                                mini_global_state_count = torch.tensor(
-                                    float(mini_batch['eitr_state_valid'].sum().item()),
-                                    dtype=torch.float64,
-                                    device=torch.cuda.current_device(),
-                                )
-                                if distributed:
-                                    torch.distributed.all_reduce(
-                                        mini_global_state_count,
-                                        op=torch.distributed.ReduceOp.SUM,
-                                    )
-                                if mini_global_state_count.item() <= 0:
-                                    continue
-                                for state_chunk in self._iter_eitr_state_chunks(mini_batch):
-                                    state_chunk = state_chunk.cuda()
-                                    post_result = self._compute_eitr_micro_batch(
-                                        state_chunk,
-                                        temperature,
-                                        track_model_grad=False,
-                                    )
-                                    if post_result is not None:
-                                        post_js_sum += post_result['js_sum']
-                                        post_state_count += post_result['valid_state_count']
-                                    del post_result
-                            post_drift_stat_tensor = torch.tensor(
-                                [post_js_sum, post_state_count],
-                                dtype=torch.float64,
-                                device=torch.cuda.current_device(),
+                            post_drift_stat_tensor = self._score_cached_eitr_drift(
+                                dataloader, temperature, distributed=distributed
                             )
-                            if distributed:
-                                torch.distributed.all_reduce(
-                                    post_drift_stat_tensor,
-                                    op=torch.distributed.ReduceOp.SUM,
-                                )
                             if int(post_drift_stat_tensor[1].item()) != int(
                                 global_active_state_count.item()
                             ):
@@ -676,6 +877,8 @@ class DataParallelPPOActor(BasePPOActor):
                                     'Post-correction EITR re-score did not cover the '
                                     'same active states as the pre-correction pass'
                                 )
+            elif self.eitr_same_batch_scale_lrs:
+                raise RuntimeError('Same-batch diagnostic found no valid EITR states')
 
         self.actor_optimizer.zero_grad()
 
@@ -789,6 +992,9 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 'actor/eitr_env_drift_pre': env_drift_pre,
                 'actor/eitr_post_diagnostic_ran': float(post_diagnostic_ran),
+                'actor/eitr_same_batch_scale_diagnostic_ran': float(
+                    same_batch_scale_diagnostic_ran
+                ),
                 'actor/eitr_loss_applied': float(
                     eitr_correction_optimizer_step_count > 0
                 ),

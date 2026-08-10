@@ -29,6 +29,7 @@ EITR_BATCH_KEYS = (
 )
 
 EITR_MODES = ("off", "probe_only", "eitr")
+SAME_BATCH_SCALE_DIAGNOSTIC_LRS = (1e-5, 3e-5, 1e-4)
 
 
 def _config_value(config: Any, key: str, default: Any) -> Any:
@@ -58,6 +59,46 @@ def resolve_eitr_mode(config: Any) -> str:
             f"Unsupported EITR mode={configured_mode!r}; expected one of {EITR_MODES}"
         )
     return mode
+
+
+def same_batch_scale_diagnostic_lrs(config: Any) -> Tuple[float, ...]:
+    """Return the fixed, debug-only scale sweep when explicitly enabled."""
+    enabled = _config_value(config, "same_batch_scale_diagnostic", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() == "true"
+    return SAME_BATCH_SCALE_DIAGNOSTIC_LRS if bool(enabled) else ()
+
+
+def same_batch_cache_signature(batch: Mapping[str, torch.Tensor]) -> Tuple[Tuple[Any, ...], ...]:
+    """Describe cached EITR tensors without copying or mutating them."""
+    return tuple(
+        (
+            key,
+            int(batch[key].data_ptr()),
+            tuple(batch[key].shape),
+            str(batch[key].dtype),
+        )
+        for key in EITR_BATCH_KEYS
+    )
+
+
+def same_batch_sgd_candidates(
+    parameters: Sequence[torch.Tensor],
+    gradients: Sequence[Optional[torch.Tensor]],
+    learning_rates: Sequence[float] = SAME_BATCH_SCALE_DIAGNOSTIC_LRS,
+) -> Dict[float, Tuple[torch.Tensor, ...]]:
+    """Pure CPU test helper proving candidate updates do not accumulate."""
+    if len(parameters) != len(gradients):
+        raise ValueError("parameters and gradients must have identical lengths")
+    return {
+        float(learning_rate): tuple(
+            parameter.detach().clone()
+            if gradient is None
+            else parameter.detach().clone().add_(gradient, alpha=-float(learning_rate))
+            for parameter, gradient in zip(parameters, gradients)
+        )
+        for learning_rate in learning_rates
+    }
 
 
 def coverage_weighted_state_scale(
