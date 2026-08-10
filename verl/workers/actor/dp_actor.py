@@ -919,6 +919,7 @@ class DataParallelPPOActor(BasePPOActor):
         d_old,
         theta_old_checksum,
         theta_grpo_checksum,
+        grpo_step_count,
         epsilon=3e-5,
     ):
         """Audit score consistency and the local +/- EITR update direction.
@@ -930,7 +931,7 @@ class DataParallelPPOActor(BasePPOActor):
         """
         cache_hash = cached_probe_fingerprint(dataloader)
         hashes = {'old': cache_hash}
-        event_sequence = score_path_audit_event_sequence(self.ppo_epochs)
+        event_sequence = score_path_audit_event_sequence(grpo_step_count)
         if not distributed or torch.distributed.get_rank() == 0:
             print(f'EITR_SCORE_AUDIT_EVENT {event_sequence[-3]}')
 
@@ -1334,6 +1335,7 @@ class DataParallelPPOActor(BasePPOActor):
                     d_old=audit_d_old,
                     theta_old_checksum=audit_theta_old_checksum,
                     theta_grpo_checksum=audit_theta_grpo_checksum,
+                    grpo_step_count=grpo_optimizer_step_count,
                 )
                 append_to_dict(metrics, diagnostic_metrics)
                 pass_index = self.ppo_epochs
