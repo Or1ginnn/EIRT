@@ -85,13 +85,22 @@ class ActorRolloutRefWorker(Worker):
         self._is_offload_param = False
         self._is_offload_grad = False
         self._is_offload_optimizer = False
+        self._is_ref_offload_param = bool(
+            self._is_ref
+            and self.config.ref.fsdp_config.get('param_offload', False)
+        )
+        self._is_ref_offload_grad = bool(
+            self._is_ref
+            and self.config.ref.fsdp_config.get('grad_offload', False)
+        )
         if self._is_actor:
             self._is_offload_param = self.config.actor.fsdp_config.get('param_offload', False)
             self._is_offload_grad = self.config.actor.fsdp_config.get('grad_offload', False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get('optimizer_offload', False)
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
-            self._is_offload_param = self.config.ref.fsdp_config.get('param_offload', False)
+            self._is_offload_param = self._is_ref_offload_param
+            self._is_offload_grad = self._is_ref_offload_grad
 
         # normalize config
         if self._is_actor:
@@ -349,8 +358,11 @@ class ActorRolloutRefWorker(Worker):
                                                                use_remove_padding=use_remove_padding,
                                                                trust_remote_code=self.config.model.get(
                                                                    'trust_remote_code', False))[0]
-            if self._is_offload_param:
-                offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
+            if self._is_ref_offload_param:
+                offload_fsdp_param_and_grad(
+                    module=self.ref_module_fsdp,
+                    offload_grad=self._is_ref_offload_grad,
+                )
 
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
@@ -502,10 +514,10 @@ class ActorRolloutRefWorker(Worker):
 
         data = data.to('cuda')
 
-        if self._is_offload_param:
+        if self._is_ref_offload_param:
             load_fsdp_param_and_grad(module=self.ref_module_fsdp,
                                      device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+                                     load_grad=self._is_ref_offload_grad)
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size
         data.meta_info['micro_batch_size'] = micro_batch_size
@@ -520,8 +532,11 @@ class ActorRolloutRefWorker(Worker):
 
         output = output.to('cpu')
 
-        if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
+        if self._is_ref_offload_param:
+            offload_fsdp_param_and_grad(
+                module=self.ref_module_fsdp,
+                offload_grad=self._is_ref_offload_grad,
+            )
         torch.cuda.empty_cache()
         return output
 

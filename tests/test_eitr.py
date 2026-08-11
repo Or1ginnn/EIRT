@@ -133,6 +133,22 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('reward_model.final_format_score="$FINAL_FORMAT_SCORE"', runner)
         self.assertIn('reward_model.retrieval_score="$RETRIEVAL_SCORE"', runner)
         self.assertIn('ACTOR_LR="${ACTOR_LR:-5e-7}"', runner)
+        self.assertIn(
+            'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
+            runner,
+        )
+        self.assertIn(
+            'REF_FSDP_PARAM_OFFLOAD="${REF_FSDP_PARAM_OFFLOAD:-false}"',
+            runner,
+        )
+        self.assertIn(
+            'actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_FSDP_PARAM_OFFLOAD"',
+            runner,
+        )
+        self.assertIn(
+            'actor_rollout_ref.ref.fsdp_config.param_offload="$REF_FSDP_PARAM_OFFLOAD"',
+            runner,
+        )
 
     def test_formal_run_uses_mixed_train_and_nq_validation(self):
         runner = (
@@ -148,6 +164,15 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
         self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
+        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"', runner)
+        self.assertIn(
+            'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
+            runner,
+        )
+        self.assertIn(
+            'REF_FSDP_PARAM_OFFLOAD="${REF_FSDP_PARAM_OFFLOAD:-true}"',
+            runner,
+        )
         self.assertIn(
             'EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"',
             runner,
@@ -156,6 +181,37 @@ class TrackingFlushTest(unittest.TestCase):
             'EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"',
             runner,
         )
+
+    def test_combined_worker_offloads_reference_without_offloading_actor(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "fsdp_workers.py"
+        ).read_text()
+
+        init_flags = source[
+            source.index("self._is_ref_offload_param = bool("):
+            source.index("# normalize config")
+        ]
+        self.assertIn("self.config.ref.fsdp_config.get('param_offload', False)", init_flags)
+        self.assertIn("self.config.actor.fsdp_config.get('param_offload', False)", init_flags)
+
+        ref_build = source[
+            source.index("if self._is_ref:\n", source.index("def init_model")):
+            source.index("if self._is_actor:\n", source.index("if self._is_ref:\n", source.index("def init_model")))
+        ]
+        self.assertIn("if self._is_ref_offload_param:", ref_build)
+        self.assertIn("offload_fsdp_param_and_grad(", ref_build)
+
+        ref_compute = source[
+            source.index("def compute_ref_log_prob"):
+            source.index("def save_checkpoint")
+        ]
+        self.assertIn("if self._is_ref_offload_param:", ref_compute)
+        self.assertIn("load_fsdp_param_and_grad(", ref_compute)
+        self.assertIn("offload_fsdp_param_and_grad(", ref_compute)
+        self.assertNotIn("if self._is_offload_param:", ref_compute)
 
     def test_audit_failure_is_logged_before_raise_and_skips_side_effects(self):
         source = (

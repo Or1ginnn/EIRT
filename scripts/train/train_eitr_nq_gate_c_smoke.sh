@@ -88,6 +88,8 @@ VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
 SHUFFLE_TRAIN_DATALOADER="${SHUFFLE_TRAIN_DATALOADER:-false}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
+ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"
+REF_FSDP_PARAM_OFFLOAD="${REF_FSDP_PARAM_OFFLOAD:-false}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-8192}"
 MAX_PROBE_PROMPT_TOKENS="${MAX_PROBE_PROMPT_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((MAX_PROBE_PROMPT_TOKENS + EITR_MAX_QUERY_TOKENS))}"
@@ -111,6 +113,16 @@ case "$SHUFFLE_TRAIN_DATALOADER" in
         exit 2
         ;;
 esac
+
+for offload_value in "$ACTOR_FSDP_PARAM_OFFLOAD" "$REF_FSDP_PARAM_OFFLOAD"; do
+    case "$offload_value" in
+        true|false) ;;
+        *)
+            echo "FSDP param offload flags must be true or false; got: $offload_value" >&2
+            exit 2
+            ;;
+    esac
+done
 
 case "$METRICS_LEVEL" in
     core|debug) ;;
@@ -314,7 +326,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.ppo_micro_batch_size="$PPO_MICRO_BATCH_SIZE" \
     actor_rollout_ref.actor.use_dynamic_bsz=false \
     actor_rollout_ref.actor.state_masking=true \
-    actor_rollout_ref.actor.fsdp_config.param_offload=false \
+    actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_FSDP_PARAM_OFFLOAD" \
     actor_rollout_ref.actor.fsdp_config.grad_offload=false \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
     actor_rollout_ref.actor.eitr.mode="$EITR_MODE" \
@@ -354,7 +366,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=false \
+    actor_rollout_ref.ref.fsdp_config.param_offload="$REF_FSDP_PARAM_OFFLOAD" \
     trainer.logger="['console','wandb']" \
     trainer.metrics_level="$METRICS_LEVEL" \
     +trainer.val_before_train=false \
