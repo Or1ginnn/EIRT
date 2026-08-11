@@ -319,6 +319,12 @@ update，但在 `EITR correction_loss.backward()` 再次 OOM：
 probe micro-batch=4、同一loss/reward/LR/lambda。新增W&B指标分别记录batch streaming
 开关以及AdamW state的load/offload耗时，用于量化该显存修复的速度代价。
 
+该内存安全路径使正式 batch 能越过 correction backward，但4/4/4的保守
+micro-batch 带来明显调度开销。下一轮性能 smoke 因此在不改变全局 batch、K、loss
+或更新次数的前提下测试8/8/8，并新增 probe generation、probe retrieval、old
+scoring、GRPO update 与 EITR correction 的独立 wall-time 指标；8/8/8在1-step
+实测通过前不能宣称稳定。
+
 ## 7. 这次 PASS 能证明和不能证明什么
 
 ### 已经证明

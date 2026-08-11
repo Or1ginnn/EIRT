@@ -1681,6 +1681,8 @@ class DataParallelPPOActor(BasePPOActor):
                 raise RuntimeError('Score-path audit D_old did not cover every active state')
             audit_d_old = audit_old_stats['drift']
 
+        torch.cuda.synchronize()
+        grpo_update_start = time.perf_counter()
         for ppo_epoch in range(self.ppo_epochs):
             for mini_batch in dataloader:
                 if self.config.use_dynamic_bsz:
@@ -1753,6 +1755,13 @@ class DataParallelPPOActor(BasePPOActor):
                     f'actor/grad_norm_pass_{ppo_epoch}': grad_norm.detach().item(),
                 })
 
+        torch.cuda.synchronize()
+        append_to_dict(metrics, {
+            'timing_s/grpo_update': float(
+                time.perf_counter() - grpo_update_start
+            ),
+        })
+
         optimizer_offload_seconds = 0.0
         optimizer_offloaded_for_eitr = False
         if self.eitr_uses_probes:
@@ -1789,6 +1798,8 @@ class DataParallelPPOActor(BasePPOActor):
         score_path_noop_direction_audit_ran = False
         query_logprob_direction_sample = None
         if self.eitr_uses_probes:
+            torch.cuda.synchronize()
+            eitr_correction_start = time.perf_counter()
             self.actor_optimizer.zero_grad()
             global_active_state_count = torch.tensor(
                 float(batch['eitr_state_valid'].sum().item()),
@@ -2082,6 +2093,13 @@ class DataParallelPPOActor(BasePPOActor):
                 or self.eitr_update_direction_diagnostic
             ):
                 raise RuntimeError('Same-batch diagnostic found no valid EITR states')
+
+            torch.cuda.synchronize()
+            append_to_dict(metrics, {
+                'timing_s/eitr_correction': float(
+                    time.perf_counter() - eitr_correction_start
+                ),
+            })
 
         self.actor_optimizer.zero_grad()
 

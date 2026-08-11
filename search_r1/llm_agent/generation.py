@@ -1,6 +1,7 @@
 import torch
 import re
 import random
+import time
 from collections import Counter, defaultdict
 import os
 from typing import List, Dict, Any, Optional, Tuple
@@ -55,6 +56,7 @@ class LLMGenerationManager:
         self._eitr_probe_call_index = 0
         self._eitr_rollout_call_index = 0
         self._eitr_current_rollout_index = 0
+        self.timing_raw = {}
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -62,6 +64,14 @@ class LLMGenerationManager:
             max_obs_length=config.max_obs_length,
             max_start_length=config.max_start_length
         ))
+
+    def _record_timing(self, name: str, elapsed_seconds: float) -> None:
+        """Accumulate rollout sub-stage wall time in the trainer timing map."""
+        timing_raw = getattr(self, 'timing_raw', None)
+        if isinstance(timing_raw, dict):
+            timing_raw[name] = float(timing_raw.get(name, 0.0)) + float(
+                elapsed_seconds
+            )
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
@@ -549,7 +559,11 @@ class LLMGenerationManager:
         
         search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
         if do_search:
+            retrieval_start = time.perf_counter()
             search_results = self.batch_search(search_queries)
+            self._record_timing(
+                'real_retrieval', time.perf_counter() - retrieval_start
+            )
             assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
         else:
             search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
@@ -1024,7 +1038,12 @@ If I want to give the final answer, I should put the answer between <answer> and
                 },
             })
             self._eitr_probe_call_index += 1
+            probe_generation_start = time.perf_counter()
             probe_outputs = self._generate_with_gpu_padding(probe_prompts)
+            self._record_timing(
+                'eitr_probe_generation',
+                time.perf_counter() - probe_generation_start,
+            )
             stats['probe_generation_call_count'] += 1
             stats['probe_candidate_generated'] += len(state_groups)
             generated_candidates.extend(
@@ -1060,7 +1079,12 @@ If I want to give the final answer, I should put the answer between <answer> and
             accepted_candidates_by_owner[owner] += 1
             stats['probe_query_accepted'] += 1
 
+        probe_retrieval_start = time.perf_counter()
         retrieval_results = self.batch_search(flat_queries) if flat_queries else []
+        self._record_timing(
+            'eitr_probe_retrieval',
+            time.perf_counter() - probe_retrieval_start,
+        )
         for (owner, query, action_ids), retrieval_result in zip(valid_candidates, retrieval_results):
             group = state_groups[owner]
             group['extra_retrieval_calls'] = int(

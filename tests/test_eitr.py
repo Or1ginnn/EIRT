@@ -180,7 +180,7 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
         self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
-        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"', runner)
+        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-8}"', runner)
         self.assertIn(
             'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
             runner,
@@ -198,11 +198,11 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
         self.assertIn(
-            'EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"',
+            'EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-8}"',
             runner,
         )
         self.assertIn(
-            'EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"',
+            'EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-8}"',
             runner,
         )
 
@@ -371,6 +371,15 @@ class ObservationTruncationTest(unittest.TestCase):
 
         def decode(self, token_ids):
             return "".join(chr(token_id) for token_id in token_ids if token_id)
+
+    def test_rollout_substage_timings_accumulate(self):
+        manager = LLMGenerationManager.__new__(LLMGenerationManager)
+        manager.timing_raw = {}
+
+        manager._record_timing("eitr_probe_generation", 1.25)
+        manager._record_timing("eitr_probe_generation", 0.75)
+
+        self.assertEqual(manager.timing_raw["eitr_probe_generation"], 2.0)
 
     def test_long_information_preserves_both_tags(self):
         manager = LLMGenerationManager.__new__(LLMGenerationManager)

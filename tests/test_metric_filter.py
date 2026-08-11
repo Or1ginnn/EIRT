@@ -37,6 +37,11 @@ class MetricFilterTest(unittest.TestCase):
             "actor/batch_cpu_streaming": 1.0,
             "timing_s/actor_optimizer_offload_after_grpo": 3.0,
             "timing_s/actor_optimizer_load_before_grpo": 2.0,
+            "timing_s/eitr_probe_generation": 30.0,
+            "timing_s/eitr_probe_retrieval": 4.0,
+            "timing_s/eitr_probe_old_logprob": 12.0,
+            "timing_s/grpo_update": 80.0,
+            "timing_s/eitr_correction": 70.0,
         }
         self.assertEqual(
             METRIC_FILTER.filter_metrics_for_logging(metrics, "core"),
@@ -51,6 +56,11 @@ class MetricFilterTest(unittest.TestCase):
                 "actor/batch_cpu_streaming": 1.0,
                 "timing_s/actor_optimizer_offload_after_grpo": 3.0,
                 "timing_s/actor_optimizer_load_before_grpo": 2.0,
+                "timing_s/eitr_probe_generation": 30.0,
+                "timing_s/eitr_probe_retrieval": 4.0,
+                "timing_s/eitr_probe_old_logprob": 12.0,
+                "timing_s/grpo_update": 80.0,
+                "timing_s/eitr_correction": 70.0,
             },
         )
 
