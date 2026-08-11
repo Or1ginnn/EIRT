@@ -82,6 +82,7 @@ actor_rollout_ref:
       same_batch_scale_diagnostic: false  # debug-only, never enabled by formal runs
       update_direction_diagnostic: false  # one-shot +/- gradient audit only
       score_path_noop_direction_audit: false  # one-shot score-path audit only
+      score_path_anchor_max_abs_logprob_diff: 1.0e-3
       lambda_env: 0.1
       log_ratio_clip: 10.0
     # Number of ordinary GRPO passes. EITR correction_passes are separate and

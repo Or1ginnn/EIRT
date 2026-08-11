@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import hashlib
+import math
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -182,6 +183,124 @@ def bounded_quantile_sample_stride(total_values: int, sample_budget: int) -> int
     if total_values == 0:
         return 1
     return max(1, (total_values + sample_budget - 1) // sample_budget)
+
+
+def resolved_query_direction_candidates(
+    current: torch.Tensor,
+    gradient: torch.Tensor,
+    *,
+    base_logp_delta: float = 1e-3,
+    max_logp_delta: float = 5e-2,
+    min_resolved_grad_energy: float = 0.99,
+) -> Dict[str, Any]:
+    """Build numerically resolved +/- query-logprob gradient candidates.
+
+    The parameter-space audit epsilon is far too small for sequence log-probs
+    whose magnitude is often in the hundreds.  This helper normalizes by the
+    largest gradient coordinate and increases the requested log-prob movement
+    until float32 represents both directions for almost all gradient energy.
+    It never changes the estimator or the model parameters.
+    """
+    current = current.detach().float()
+    gradient = gradient.detach().float()
+    if current.shape != gradient.shape:
+        raise ValueError("current and gradient must have identical shapes")
+    if not torch.isfinite(current).all() or not torch.isfinite(gradient).all():
+        raise ValueError("query direction inputs must be finite")
+    base_logp_delta = float(base_logp_delta)
+    max_logp_delta = float(max_logp_delta)
+    min_resolved_grad_energy = float(min_resolved_grad_energy)
+    if not (
+        math.isfinite(base_logp_delta)
+        and math.isfinite(max_logp_delta)
+        and 0 < base_logp_delta <= max_logp_delta
+    ):
+        raise ValueError("query log-prob deltas must be finite and satisfy 0 < base <= max")
+    if not (
+        math.isfinite(min_resolved_grad_energy)
+        and 0 < min_resolved_grad_energy <= 1
+    ):
+        raise ValueError("min_resolved_grad_energy must be in (0, 1]")
+
+    grad_energy = gradient.double().square().sum()
+    grad_abs_max = gradient.abs().max()
+    if grad_energy.item() <= 0 or grad_abs_max.item() <= 0:
+        raise ValueError("query direction gradient must be non-zero")
+    direction = gradient / grad_abs_max
+
+    target_delta = base_logp_delta
+    while True:
+        minus = current - target_delta * direction
+        plus = current + target_delta * direction
+        resolved = (minus != current) & (plus != current)
+        resolved_energy = (
+            gradient.double().square().masked_select(resolved).sum()
+            / grad_energy
+        )
+        if (
+            resolved_energy.item() >= min_resolved_grad_energy
+            or target_delta >= max_logp_delta
+        ):
+            return {
+                "minus": minus,
+                "zero": current,
+                "plus": plus,
+                "target_logp_delta": float(target_delta),
+                "resolved_grad_energy": float(resolved_energy.item()),
+                "grad_norm": float(grad_energy.sqrt().item()),
+                "resolved": bool(
+                    resolved_energy.item() >= min_resolved_grad_energy
+                ),
+            }
+        target_delta = min(target_delta * 2.0, max_logp_delta)
+
+
+def directional_descent_diagnostics(
+    *,
+    minus: float,
+    zero: float,
+    plus: float,
+    jitter: float = 0.0,
+    rtol: float = 1e-6,
+    atol: float = 1e-12,
+) -> Dict[str, float]:
+    """Measure whether minus is descent and plus is ascent beyond noise."""
+    minus = float(minus)
+    zero = float(zero)
+    plus = float(plus)
+    jitter = float(jitter)
+    rtol = float(rtol)
+    atol = float(atol)
+    if not all(math.isfinite(value) for value in (minus, zero, plus, jitter, rtol, atol)):
+        raise ValueError("direction diagnostic inputs must be finite")
+    if min(jitter, rtol, atol) < 0:
+        raise ValueError("direction diagnostic tolerances must be non-negative")
+    noise = max(jitter, abs(zero) * rtol, atol)
+    minus_margin = zero - minus
+    plus_margin = plus - zero
+    return {
+        "minus_margin": minus_margin,
+        "plus_margin": plus_margin,
+        "noise": noise,
+        "pass": float(minus_margin > noise and plus_margin > noise),
+    }
+
+
+def rank_owned_global_additive_stats(
+    values: Mapping[str, float],
+    *,
+    distributed: bool,
+    rank: int,
+) -> Dict[str, float]:
+    """Seed already-global additive stats on one rank before a later SUM."""
+    rank = int(rank)
+    if rank < 0:
+        raise ValueError("rank must be non-negative")
+    owner = not bool(distributed) or rank == 0
+    return {
+        str(key): float(value) if owner else 0.0
+        for key, value in values.items()
+    }
 
 
 def coverage_weighted_state_scale(
@@ -376,6 +495,17 @@ def validate_eitr_config(
         raise ValueError("EITR probe_oversample must be non-negative")
     if min(probe_micro_batch_size, probe_logprob_micro_batch_size) <= 0:
         raise ValueError("EITR probe micro-batch sizes must be positive")
+    if probe_logprob_micro_batch_size != probe_micro_batch_size:
+        raise ValueError(
+            "EITR probe_logprob_micro_batch_size must equal "
+            "probe_micro_batch_size so old/current probe scores use identical "
+            "forward chunking"
+        )
+    if probe_micro_batch_size % probe_count != 0:
+        raise ValueError(
+            "EITR probe_micro_batch_size must be divisible by probe_count so "
+            "each scoring chunk contains complete same-state probe groups"
+        )
     if min(
         max_query_tokens,
         max_action_tokens,

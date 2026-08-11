@@ -1,8 +1,10 @@
+import ast
 import unittest
 import importlib.util
 import sys
 import types
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +42,7 @@ bounded_quantile_sample_stride = EITR.bounded_quantile_sample_stride
 coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
 directional_parameter_candidates = EITR.directional_parameter_candidates
+directional_descent_diagnostics = EITR.directional_descent_diagnostics
 cached_probe_fingerprint = EITR.cached_probe_fingerprint
 eitr_update_direction_diagnostic_enabled = EITR.eitr_update_direction_diagnostic_enabled
 eitr_score_path_noop_direction_audit_enabled = EITR.eitr_score_path_noop_direction_audit_enabled
@@ -49,6 +52,8 @@ same_batch_scale_diagnostic_lrs = EITR.same_batch_scale_diagnostic_lrs
 same_batch_sgd_candidates = EITR.same_batch_sgd_candidates
 probe_effect_diversity = EITR.probe_effect_diversity
 rollout_averaged_env_drift = EITR.rollout_averaged_env_drift
+rank_owned_global_additive_stats = EITR.rank_owned_global_additive_stats
+resolved_query_direction_candidates = EITR.resolved_query_direction_candidates
 should_run_post_diagnostic = EITR.should_run_post_diagnostic
 resolve_eitr_mode = EITR.resolve_eitr_mode
 eitr_probe_enabled_for_pass = EITR.eitr_probe_enabled_for_pass
@@ -106,6 +111,10 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn("trainer.logger=\"['console','wandb']\"", runner)
         self.assertIn('RAY_TMPDIR="${RAY_TMPDIR:-$STORAGE_ROOT/r}"', runner)
         self.assertNotIn('$STORAGE_ROOT/ray_tmp/$EXPERIMENT_NAME', runner)
+        self.assertIn(
+            "EITR score-path audit requires METRICS_LEVEL=debug",
+            runner,
+        )
 
     def test_smoke_uses_search_r1_v03_format_reward(self):
         runner = (
@@ -137,6 +146,47 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
         self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
+        self.assertIn(
+            'EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"',
+            runner,
+        )
+        self.assertIn(
+            'EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"',
+            runner,
+        )
+
+    def test_audit_failure_is_logged_before_raise_and_skips_side_effects(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "trainer"
+            / "ppo"
+            / "ray_trainer.py"
+        ).read_text()
+        fit_start = source.index("    def fit(self):")
+        pending_failure_start = source.index(
+            "pending_audit_failure = {", fit_start
+        )
+        validation_call = source.index("val_metrics: dict = self._validate()", fit_start)
+        checkpoint_call = source.index("self._save_checkpoint()", fit_start)
+        logger_call = source.index("                logger.log(", fit_start)
+        failure_guard = source.index(
+            "                if pending_audit_failure is not None:", logger_call
+        )
+        finish_call = source.index("                    logger.finish()", failure_guard)
+        failure_raise = source.index("                    raise RuntimeError(", finish_call)
+
+        validation_guard = source[source.rfind("if ", fit_start, validation_call):validation_call]
+        checkpoint_guard = source[source.rfind("if ", fit_start, checkpoint_call):checkpoint_call]
+        self.assertIn("pending_audit_failure is None", validation_guard)
+        self.assertIn("pending_audit_failure is None", checkpoint_guard)
+        self.assertLess(pending_failure_start, validation_call)
+        self.assertLess(pending_failure_start, checkpoint_call)
+        self.assertLess(validation_call, logger_call)
+        self.assertLess(checkpoint_call, logger_call)
+        self.assertLess(logger_call, failure_guard)
+        self.assertLess(failure_guard, finish_call)
+        self.assertLess(finish_call, failure_raise)
 
 
 class ObservationTruncationTest(unittest.TestCase):
@@ -525,6 +575,27 @@ class EITRProbeBatchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "post_diagnostic_freq"):
             validate_eitr_config(
                 {"post_diagnostic_freq": -1},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
+        with self.assertRaisesRegex(ValueError, "must equal"):
+            validate_eitr_config(
+                {
+                    "probe_micro_batch_size": 4,
+                    "probe_logprob_micro_batch_size": 8,
+                },
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
+        with self.assertRaisesRegex(ValueError, "divisible by probe_count"):
+            validate_eitr_config(
+                {
+                    "probe_count": 4,
+                    "probe_micro_batch_size": 6,
+                    "probe_logprob_micro_batch_size": 6,
+                },
                 n_agent=5,
                 max_queries_per_turn=1,
                 rollout_n=1,
@@ -1017,6 +1088,158 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
         gradient = 2 * parameter
         candidate = directional_parameter_candidates([parameter], [gradient], 0.1)["minus"][0]
         self.assertLess((candidate.square()).item(), (parameter.square()).item())
+
+    def test_resolved_query_candidates_follow_the_js_descent_direction(self):
+        old = torch.zeros(1, 4)
+        current = torch.tensor(
+            [[0.4, -0.2, 0.1, -0.3]], dtype=torch.float32, requires_grad=True
+        )
+        documents = torch.eye(4).unsqueeze(0)
+        probe_mask = torch.ones(1, 4, dtype=torch.bool)
+        zero_result = induced_js_from_cached_effects(
+            current_seq_logp=current,
+            old_seq_logp=old,
+            doc_probs=documents,
+            probe_mask=probe_mask,
+        )
+        gradient = torch.autograd.grad(zero_result["js"].mean(), current)[0]
+        candidates = resolved_query_direction_candidates(current, gradient)
+
+        values = {}
+        for direction in ("minus", "zero", "plus"):
+            values[direction] = float(
+                induced_js_from_cached_effects(
+                    current_seq_logp=candidates[direction],
+                    old_seq_logp=old,
+                    doc_probs=documents,
+                    probe_mask=probe_mask,
+                )["js"].mean().item()
+            )
+        diagnostic = directional_descent_diagnostics(**values, atol=1e-10)
+
+        self.assertTrue(candidates["resolved"])
+        self.assertGreaterEqual(candidates["resolved_grad_energy"], 0.99)
+        self.assertLess(values["minus"], values["zero"])
+        self.assertLess(values["zero"], values["plus"])
+        self.assertEqual(diagnostic["pass"], 1.0)
+
+    def test_direction_diagnostic_rejects_reversed_flat_and_nonfinite_values(self):
+        self.assertEqual(
+            directional_descent_diagnostics(minus=0.9, zero=1.0, plus=1.1)["pass"],
+            1.0,
+        )
+        self.assertEqual(
+            directional_descent_diagnostics(minus=1.1, zero=1.0, plus=0.9)["pass"],
+            0.0,
+        )
+        self.assertEqual(
+            directional_descent_diagnostics(
+                minus=1.0 - 1e-9,
+                zero=1.0,
+                plus=1.0 + 1e-9,
+                jitter=1e-8,
+            )["pass"],
+            0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "finite"):
+            directional_descent_diagnostics(
+                minus=float("nan"), zero=1.0, plus=1.1
+            )
+
+    def test_two_rank_global_additive_stats_are_owned_only_once(self):
+        global_stats = {
+            "js_sum": 0.125,
+            "state_count": 93.0,
+            "probe_count": 358.0,
+            "ess_sum": 360.5,
+            "clipfrac_sum": 0.25,
+            "active_micro_batch_count": 5.0,
+        }
+        per_rank = [
+            rank_owned_global_additive_stats(
+                global_stats, distributed=True, rank=rank
+            )
+            for rank in range(2)
+        ]
+        reduced = {
+            key: sum(rank_stats[key] for rank_stats in per_rank)
+            for key in global_stats
+        }
+
+        self.assertEqual(per_rank[0], global_stats)
+        self.assertTrue(all(value == 0.0 for value in per_rank[1].values()))
+        self.assertEqual(reduced, global_stats)
+        self.assertEqual(
+            rank_owned_global_additive_stats(
+                global_stats, distributed=False, rank=7
+            ),
+            global_stats,
+        )
+
+    def test_temporary_probe_eval_restores_mode_on_success_and_exception(self):
+        actor_source_path = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "actor"
+            / "dp_actor.py"
+        )
+        actor_source = actor_source_path.read_text()
+        actor_tree = ast.parse(actor_source)
+        actor_class = next(
+            node
+            for node in actor_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DataParallelPPOActor"
+        )
+        method = next(
+            node
+            for node in actor_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_temporary_probe_eval"
+        )
+        namespace = {"contextmanager": contextmanager}
+        method_module = ast.fix_missing_locations(
+            ast.Module(body=[method], type_ignores=[])
+        )
+        exec(compile(method_module, str(actor_source_path), "exec"), namespace)
+        temporary_probe_eval = namespace["_temporary_probe_eval"]
+
+        class FakeModule:
+            def __init__(self, training):
+                self.training = training
+
+            def eval(self):
+                self.training = False
+                return self
+
+            def train(self, mode=True):
+                self.training = bool(mode)
+                return self
+
+        for initial_mode in (True, False):
+            with self.subTest(initial_mode=initial_mode):
+                fake_actor = SimpleNamespace(actor_module=FakeModule(initial_mode))
+                with temporary_probe_eval(fake_actor):
+                    self.assertFalse(fake_actor.actor_module.training)
+                self.assertEqual(fake_actor.actor_module.training, initial_mode)
+
+        fake_actor = SimpleNamespace(actor_module=FakeModule(True))
+        with self.assertRaisesRegex(RuntimeError, "forward failed"):
+            with temporary_probe_eval(fake_actor):
+                self.assertFalse(fake_actor.actor_module.training)
+                raise RuntimeError("forward failed")
+        self.assertTrue(fake_actor.actor_module.training)
+
+        compute_log_prob_start = actor_source.index("    def compute_log_prob(")
+        compute_eitr_start = actor_source.index("    def _compute_eitr_micro_batch(")
+        iter_chunks_start = actor_source.index("    def _iter_eitr_state_chunks(")
+        self.assertIn(
+            "with self._temporary_probe_eval():",
+            actor_source[compute_log_prob_start:compute_eitr_start],
+        )
+        self.assertIn(
+            "with self._temporary_probe_eval():",
+            actor_source[compute_eitr_start:iter_chunks_start],
+        )
 
 
 if __name__ == "__main__":

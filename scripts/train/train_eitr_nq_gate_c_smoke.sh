@@ -146,6 +146,19 @@ if [[ $(printf '%s\n' "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" "$EITR_UPDATE_DIRECTIO
     echo "Only one EITR diagnostic may be enabled at once" >&2
     exit 2
 fi
+if [[ "$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" == true && "$METRICS_LEVEL" != debug ]]; then
+    echo "EITR score-path audit requires METRICS_LEVEL=debug so all scientific diagnostics are persisted" >&2
+    exit 2
+fi
+
+if (( EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE != EITR_PROBE_MICRO_BATCH_SIZE )); then
+    echo "EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE must equal EITR_PROBE_MICRO_BATCH_SIZE for invariant probe scoring" >&2
+    exit 2
+fi
+if (( EITR_PROBE_MICRO_BATCH_SIZE % EITR_PROBE_COUNT != 0 )); then
+    echo "EITR_PROBE_MICRO_BATCH_SIZE must be divisible by EITR_PROBE_COUNT" >&2
+    exit 2
+fi
 
 case "$BASE_MODEL" in
     *parallel_search*|*parallel-search*|*finance*)

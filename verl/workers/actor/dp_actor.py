@@ -16,6 +16,7 @@ Single Process Actor
 """
 
 import itertools
+from contextlib import contextmanager
 from typing import Iterable, Tuple
 
 import torch
@@ -28,12 +29,15 @@ from verl.trainer.ppo.eitr import (
     EITR_BATCH_KEYS,
     bounded_quantile_sample_stride,
     cached_probe_fingerprint,
+    directional_descent_diagnostics,
     eitr_loss_enabled_for_pass,
     eitr_score_path_noop_direction_audit_enabled,
     eitr_update_direction_diagnostic_enabled,
     coverage_weighted_state_scale,
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
+    rank_owned_global_additive_stats,
+    resolved_query_direction_candidates,
     rollout_averaged_env_drift,
     same_batch_cache_signature,
     same_batch_scale_diagnostic_lrs,
@@ -88,6 +92,11 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.eitr_score_path_noop_direction_audit = (
             eitr_score_path_noop_direction_audit_enabled(self.eitr_config)
+        )
+        self.eitr_score_path_anchor_max_abs_logprob_diff = float(
+            self.eitr_config.get(
+                'score_path_anchor_max_abs_logprob_diff', 1e-3
+            )
         )
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
@@ -224,7 +233,22 @@ class DataParallelPPOActor(BasePPOActor):
         optimizer.step()
         return grad_norm
 
+    @contextmanager
+    def _temporary_probe_eval(self):
+        """Use one deterministic probe-scoring mode and always restore it."""
+        actor_was_training = self.actor_module.training
+        self.actor_module.eval()
+        try:
+            yield
+        finally:
+            self.actor_module.train(actor_was_training)
+
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+        """Compute cached old log-probs in the canonical probe eval mode."""
+        with self._temporary_probe_eval():
+            return self._compute_log_prob_eval(data)
+
+    def _compute_log_prob_eval(self, data: DataProto) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -242,9 +266,6 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             torch.Tensor: the log_prob tensor
         """
-        # set to eval
-        self.actor_module.eval()
-
         micro_batch_size = data.meta_info['micro_batch_size']
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
@@ -301,19 +322,23 @@ class DataParallelPPOActor(BasePPOActor):
         # Every valid global probe batch gives each FSDP rank the same number of
         # physical row slots. Fixed-size chunking therefore preserves identical
         # forward/collective counts while avoiding one K*actor_microbatch prefill.
-        for chunk_start in range(0, flat_probe_count, probe_micro_batch_size):
-            chunk_end = min(chunk_start + probe_micro_batch_size, flat_probe_count)
-            probe_chunk = {
-                key: value[chunk_start:chunk_end]
-                for key, value in probe_batch.items()
-            }
-            with torch.set_grad_enabled(track_model_grad):
-                _, chunk_log_probs = self._forward_micro_batch(
-                    micro_batch=probe_chunk,
-                    temperature=temperature,
-                    compute_entropy=False,
-                )
-            token_log_prob_chunks.append(chunk_log_probs)
+        # Eval mode is shared by cached-old, gradient, no-op, and candidate
+        # probe scores.  Eval does not disable autograd, so the correction still
+        # backpropagates while avoiding a train/eval scoring mismatch.
+        with self._temporary_probe_eval():
+            for chunk_start in range(0, flat_probe_count, probe_micro_batch_size):
+                chunk_end = min(chunk_start + probe_micro_batch_size, flat_probe_count)
+                probe_chunk = {
+                    key: value[chunk_start:chunk_end]
+                    for key, value in probe_batch.items()
+                }
+                with torch.set_grad_enabled(track_model_grad):
+                    _, chunk_log_probs = self._forward_micro_batch(
+                        micro_batch=probe_chunk,
+                        temperature=temperature,
+                        compute_entropy=False,
+                    )
+                token_log_prob_chunks.append(chunk_log_probs)
         token_log_probs = torch.cat(token_log_prob_chunks, dim=0)
         response_mask = data['eitr_probe_response_mask'][state_slot].flatten(0, 1).float()
         current_seq_logp = (token_log_probs.float() * response_mask).sum(dim=-1).view(
@@ -505,8 +530,10 @@ class DataParallelPPOActor(BasePPOActor):
             'probe_count': 0.0,
             'ess_sum': 0.0,
             'clipfrac_sum': 0.0,
+            'log_ratio_abs_max': 0.0,
         }
         query_sample = None
+        query_sample_grad_energy = -1.0
         for mini_batch in dataloader:
             for state_chunk in self._iter_eitr_state_chunks(mini_batch):
                 state_chunk = state_chunk.cuda()
@@ -522,6 +549,9 @@ class DataParallelPPOActor(BasePPOActor):
                     local['probe_count'] += result['valid_probe_count']
                     local['ess_sum'] += result['ess_mean'] * valid_state_count
                     local['clipfrac_sum'] += result['log_ratio_clipfrac'] * valid_state_count
+                    local['log_ratio_abs_max'] = max(
+                        local['log_ratio_abs_max'], result['log_ratio_abs_max']
+                    )
                 if build_grad:
                     raw_logprob_grad = torch.autograd.grad(
                         result['loss'], result['current_seq_logp'], retain_graph=True,
@@ -529,23 +559,42 @@ class DataParallelPPOActor(BasePPOActor):
                     )[0]
                     if (
                         capture_query_sample
-                        and query_sample is None
                         and valid_state_count > 0
                         and raw_logprob_grad is not None
                     ):
                         state_slot = state_chunk['eitr_state_slot'].bool()
                         state_valid = state_chunk['eitr_state_valid'][state_slot].bool()
                         if state_valid.any():
-                            query_sample = tuple(
-                                value.detach().to(device='cpu', copy=True)
-                                for value in (
-                                    result['current_seq_logp'][state_valid],
-                                    raw_logprob_grad[state_valid],
-                                    state_chunk['eitr_probe_old_seq_logp'][state_slot][state_valid],
-                                    state_chunk['eitr_probe_doc_probs'][state_slot][state_valid],
-                                    state_chunk['eitr_probe_valid'][state_slot][state_valid],
-                                )
+                            valid_gradient = raw_logprob_grad[state_valid]
+                            gradient_energy = (
+                                valid_gradient.detach().float().square().sum(dim=-1)
                             )
+                            finite_positive = torch.isfinite(gradient_energy) & (
+                                gradient_energy > 0
+                            )
+                            if finite_positive.any():
+                                ranked_energy = gradient_energy.masked_fill(
+                                    ~finite_positive, float('-inf')
+                                )
+                                best_index = int(ranked_energy.argmax().item())
+                                best_energy = float(ranked_energy[best_index].item())
+                            else:
+                                best_index = -1
+                                best_energy = -1.0
+                            if best_index >= 0 and best_energy > query_sample_grad_energy:
+                                query_sample_grad_energy = best_energy
+                                query_sample = tuple(
+                                    value[best_index:best_index + 1].detach().to(
+                                        device='cpu', copy=True
+                                    )
+                                    for value in (
+                                        result['current_seq_logp'][state_valid],
+                                        valid_gradient,
+                                        state_chunk['eitr_probe_old_seq_logp'][state_slot][state_valid],
+                                        state_chunk['eitr_probe_doc_probs'][state_slot][state_valid],
+                                        state_chunk['eitr_probe_valid'][state_slot][state_valid],
+                                    )
+                                )
                     state_weight = coverage_weighted_state_scale(
                         valid_state_count,
                         float(global_rollout_state_count.item()),
@@ -569,6 +618,15 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if distributed:
             torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+        log_ratio_abs_max = torch.tensor(
+            local['log_ratio_abs_max'],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        if distributed:
+            torch.distributed.all_reduce(
+                log_ratio_abs_max, op=torch.distributed.ReduceOp.MAX
+            )
         if int(tensor[1].item()) <= 0:
             raise RuntimeError('Score-path audit found no valid cached EITR states')
         if not torch.isfinite(tensor).all():
@@ -582,6 +640,7 @@ class DataParallelPPOActor(BasePPOActor):
             'probe_count': int(tensor[2].item()),
             'ess': float(tensor[3].item() / max(tensor[1].item(), 1.0)),
             'clipfrac': float(tensor[4].item() / max(tensor[1].item(), 1.0)),
+            'log_ratio_abs_max': float(log_ratio_abs_max.item()),
             'query_sample': query_sample,
         }
 
@@ -844,40 +903,112 @@ class DataParallelPPOActor(BasePPOActor):
         self,
         query_sample,
         *,
-        epsilon,
         distributed,
     ):
-        """Check the induced-JS derivative directly in cached query-logprob space."""
-        if query_sample is None:
-            local = torch.zeros(4, dtype=torch.float64, device=torch.cuda.current_device())
-        else:
-            current, gradient, old, doc_probs, probe_mask = (
-                value.cuda() for value in query_sample
-            )
-            with torch.no_grad():
-                values = []
-                for scale in (-float(epsilon), 0.0, float(epsilon)):
-                    result = induced_js_from_cached_effects(
-                        current_seq_logp=current + scale * gradient,
-                        old_seq_logp=old,
-                        doc_probs=doc_probs,
-                        probe_mask=probe_mask,
-                        log_ratio_clip=float(self.eitr_config.get('log_ratio_clip', 10.0)),
-                    )
-                    values.append(float(result['js'].mean().item()))
-            local = torch.tensor(
-                [values[0], values[1], values[2], 1.0],
-                dtype=torch.float64,
-                device=torch.cuda.current_device(),
-            )
+        """Check the JS derivative in resolved query-logprob space."""
+        device = torch.cuda.current_device()
+        local_sums = torch.zeros(5, dtype=torch.float64, device=device)
+        local_bounds = torch.tensor(
+            [float('inf'), float('inf'), float('inf'), 0.0, 0.0],
+            dtype=torch.float64,
+            device=device,
+        )
+        local_invalid = torch.zeros(1, dtype=torch.float64, device=device)
+        if query_sample is not None:
+            try:
+                current, gradient, old, doc_probs, probe_mask = (
+                    value.cuda() for value in query_sample
+                )
+                candidates = resolved_query_direction_candidates(current, gradient)
+                with torch.no_grad():
+                    values = []
+                    for candidate in (
+                        candidates['minus'],
+                        candidates['zero'],
+                        candidates['plus'],
+                    ):
+                        result = induced_js_from_cached_effects(
+                            current_seq_logp=candidate,
+                            old_seq_logp=old,
+                            doc_probs=doc_probs,
+                            probe_mask=probe_mask,
+                            log_ratio_clip=float(
+                                self.eitr_config.get('log_ratio_clip', 10.0)
+                            ),
+                        )
+                        values.append(float(result['js'].mean().item()))
+                diagnostic = directional_descent_diagnostics(
+                    minus=values[0], zero=values[1], plus=values[2], atol=1e-8
+                )
+                sample_count = float(current.size(0))
+                local_sums = torch.tensor(
+                    [
+                        values[0] * sample_count,
+                        values[1] * sample_count,
+                        values[2] * sample_count,
+                        candidates['grad_norm'],
+                        sample_count,
+                    ],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                local_bounds = torch.tensor(
+                    [
+                        diagnostic['minus_margin'],
+                        diagnostic['plus_margin'],
+                        candidates['resolved_grad_energy'],
+                        diagnostic['noise'],
+                        candidates['target_logp_delta'],
+                    ],
+                    dtype=torch.float64,
+                    device=device,
+                )
+            except ValueError:
+                # A data-dependent failure on only one rank must not leave the
+                # other ranks blocked in the reductions below.  Convert it to
+                # a synchronized integrity failure after every rank arrives.
+                local_invalid.fill_(1.0)
         if distributed:
-            torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
-        if local[3].item() <= 0:
+            torch.distributed.all_reduce(
+                local_invalid, op=torch.distributed.ReduceOp.MAX
+            )
+            torch.distributed.all_reduce(
+                local_sums, op=torch.distributed.ReduceOp.SUM
+            )
+            torch.distributed.all_reduce(
+                local_bounds[:3], op=torch.distributed.ReduceOp.MIN
+            )
+            torch.distributed.all_reduce(
+                local_bounds[3:], op=torch.distributed.ReduceOp.MAX
+            )
+        if local_invalid.item() > 0:
+            raise RuntimeError(
+                'Query-logprob direction diagnostic received a non-finite or '
+                'numerically unresolved local sample'
+            )
+        if local_sums[4].item() <= 0:
             raise RuntimeError('Update-direction diagnostic captured no query-logprob sample')
-        metrics = local[:3] / local[3]
-        if not torch.isfinite(metrics).all():
+        averages = local_sums[:3] / local_sums[4]
+        if not torch.isfinite(averages).all() or not torch.isfinite(local_bounds).all():
             raise RuntimeError('Query-logprob direction diagnostic produced a non-finite JS')
-        return tuple(float(value.item()) for value in metrics)
+        query_pass = bool(
+            local_bounds[0].item() > local_bounds[3].item()
+            and local_bounds[1].item() > local_bounds[3].item()
+            and local_bounds[2].item() >= 0.99
+        )
+        return {
+            'minus': float(averages[0].item()),
+            'zero': float(averages[1].item()),
+            'plus': float(averages[2].item()),
+            'minus_margin_min': float(local_bounds[0].item()),
+            'plus_margin_min': float(local_bounds[1].item()),
+            'resolved_grad_energy_min': float(local_bounds[2].item()),
+            'noise_max': float(local_bounds[3].item()),
+            'target_logp_delta_max': float(local_bounds[4].item()),
+            'grad_norm_sum': float(local_sums[3].item()),
+            'sample_count': int(local_sums[4].item()),
+            'pass': float(query_pass),
+        }
 
     def _run_update_direction_diagnostic(
         self,
@@ -902,13 +1033,20 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/eitr_update_direction_d_zero': float(d_zero),
             'actor/eitr_update_direction_epsilon': float(epsilon),
         }
-        query_minus, query_zero, query_plus = self._query_logprob_direction_metrics(
-            query_sample, epsilon=epsilon, distributed=distributed
+        query_direction = self._query_logprob_direction_metrics(
+            query_sample, distributed=distributed
         )
         metrics.update({
-            'actor/eitr_update_direction_query_js_minus': query_minus,
-            'actor/eitr_update_direction_query_js_zero': query_zero,
-            'actor/eitr_update_direction_query_js_plus': query_plus,
+            'actor/eitr_update_direction_query_js_minus': query_direction['minus'],
+            'actor/eitr_update_direction_query_js_zero': query_direction['zero'],
+            'actor/eitr_update_direction_query_js_plus': query_direction['plus'],
+            'actor/eitr_update_direction_query_minus_margin_min': query_direction['minus_margin_min'],
+            'actor/eitr_update_direction_query_plus_margin_min': query_direction['plus_margin_min'],
+            'actor/eitr_update_direction_query_noise_max': query_direction['noise_max'],
+            'actor/eitr_update_direction_query_resolved_energy_min': query_direction['resolved_grad_energy_min'],
+            'actor/eitr_update_direction_query_target_delta_max': query_direction['target_logp_delta_max'],
+            'actor/eitr_update_direction_query_sample_count': query_direction['sample_count'],
+            'actor/eitr_update_direction_query_pass': query_direction['pass'],
         })
         reports = {}
         try:
@@ -979,9 +1117,10 @@ class DataParallelPPOActor(BasePPOActor):
                 f'g_dot_delta_plus={reports["plus"][2]:.12e} '
                 f'cos_minus={reports["minus"][3]:.12e} '
                 f'cos_plus={reports["plus"][3]:.12e} '
-                f'query_minus={query_minus:.12e} '
-                f'query_zero={query_zero:.12e} '
-                f'query_plus={query_plus:.12e}'
+                f'query_minus={query_direction["minus"]:.12e} '
+                f'query_zero={query_direction["zero"]:.12e} '
+                f'query_plus={query_direction["plus"]:.12e} '
+                f'query_pass={int(query_direction["pass"])}'
             )
         return metrics
 
@@ -995,6 +1134,7 @@ class DataParallelPPOActor(BasePPOActor):
         global_active_state_count,
         global_rollout_state_count,
         d_old,
+        old_log_ratio_abs_max,
         theta_old_checksum,
         grpo_step_count,
         epsilon=3e-5,
@@ -1030,6 +1170,16 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {
             'actor/eitr_score_path_noop_direction_audit': 1.0,
             'actor/eitr_score_path_d_old': float(d_old),
+            'actor/eitr_score_path_old_log_ratio_abs_max': float(
+                old_log_ratio_abs_max
+            ),
+            'actor/eitr_score_path_anchor_threshold': float(
+                self.eitr_score_path_anchor_max_abs_logprob_diff
+            ),
+            'actor/eitr_score_path_anchor_pass': float(
+                old_log_ratio_abs_max
+                <= self.eitr_score_path_anchor_max_abs_logprob_diff
+            ),
             'actor/eitr_score_path_d_zero_grad': float(zero_stats['drift']),
             'actor/eitr_score_path_epsilon': float(epsilon),
             'actor/eitr_score_path_state_count': float(zero_stats['state_count']),
@@ -1082,13 +1232,21 @@ class DataParallelPPOActor(BasePPOActor):
         if noop_param_error != 0.0:
             raise RuntimeError('Score-path audit no-op changed theta_GRPO')
 
-        query_minus, query_zero, query_plus = self._query_logprob_direction_metrics(
-            zero_stats['query_sample'], epsilon=epsilon, distributed=distributed
+        query_direction = self._query_logprob_direction_metrics(
+            zero_stats['query_sample'], distributed=distributed
         )
         metrics.update({
-            'actor/eitr_score_path_query_js_minus': query_minus,
-            'actor/eitr_score_path_query_js_zero': query_zero,
-            'actor/eitr_score_path_query_js_plus': query_plus,
+            'actor/eitr_score_path_query_js_minus': query_direction['minus'],
+            'actor/eitr_score_path_query_js_zero': query_direction['zero'],
+            'actor/eitr_score_path_query_js_plus': query_direction['plus'],
+            'actor/eitr_score_path_query_minus_margin_min': query_direction['minus_margin_min'],
+            'actor/eitr_score_path_query_plus_margin_min': query_direction['plus_margin_min'],
+            'actor/eitr_score_path_query_noise_max': query_direction['noise_max'],
+            'actor/eitr_score_path_query_resolved_energy_min': query_direction['resolved_grad_energy_min'],
+            'actor/eitr_score_path_query_target_delta_max': query_direction['target_logp_delta_max'],
+            'actor/eitr_score_path_query_grad_norm_sum': query_direction['grad_norm_sum'],
+            'actor/eitr_score_path_query_sample_count': query_direction['sample_count'],
+            'actor/eitr_score_path_query_pass': query_direction['pass'],
         })
 
         original_lrs = [group['lr'] for group in self.eitr_optimizer.param_groups]
@@ -1202,6 +1360,33 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 f'actor/eitr_score_path_grad_norm_{direction}': stats['grad_norm'],
             })
+        parameter_direction = directional_descent_diagnostics(
+            minus=reports['minus'][0],
+            zero=noop_mean,
+            plus=reports['plus'][0],
+            jitter=noop_jitter,
+        )
+        zero_noop_error = abs(zero_stats['drift'] - noop_mean)
+        score_path_pass = bool(zero_noop_error <= parameter_direction['noise'])
+        anchor_pass = bool(
+            old_log_ratio_abs_max
+            <= self.eitr_score_path_anchor_max_abs_logprob_diff
+        )
+        audit_pass = bool(
+            anchor_pass
+            and score_path_pass
+            and query_direction['pass'] > 0.5
+            and parameter_direction['pass'] > 0.5
+        )
+        metrics.update({
+            'actor/eitr_score_path_parameter_minus_margin': parameter_direction['minus_margin'],
+            'actor/eitr_score_path_parameter_plus_margin': parameter_direction['plus_margin'],
+            'actor/eitr_score_path_parameter_noise': parameter_direction['noise'],
+            'actor/eitr_score_path_parameter_pass': parameter_direction['pass'],
+            'actor/eitr_score_path_zero_noop_abs_error': zero_noop_error,
+            'actor/eitr_score_path_score_mode_pass': float(score_path_pass),
+            'actor/eitr_score_path_audit_pass': float(audit_pass),
+        })
         metrics['actor/eitr_score_path_final_restore_max_abs'] = restore_error
         metrics['actor/eitr_score_path_theta_after_checksum_sum'] = theta_after_checksum[0]
         metrics['actor/eitr_score_path_probe_hash_match'] = 1.0
@@ -1215,11 +1400,22 @@ class DataParallelPPOActor(BasePPOActor):
                 f'D_noop_3={noop_values[2]:.12e} '
                 f'D_minus={reports["minus"][0]:.12e} '
                 f'D_plus={reports["plus"][0]:.12e} '
+                f'query_minus={query_direction["minus"]:.12e} '
+                f'query_zero={query_direction["zero"]:.12e} '
+                f'query_plus={query_direction["plus"]:.12e} '
+                f'query_pass={int(query_direction["pass"])} '
+                f'parameter_pass={int(parameter_direction["pass"])} '
+                f'anchor_pass={int(anchor_pass)} '
+                f'audit_pass={int(audit_pass)} '
                 f'probe_hash={cache_hash} '
-                f'final_restore={restore_error:.12e}'
+                f'final_restore={restore_error:.12e}',
+                flush=True,
             )
-            print(f'EITR_SCORE_AUDIT_EVENT {event_sequence[-1]}')
-            print('EITR_SCORE_AUDIT_SEQUENCE ' + ' -> '.join(event_sequence))
+            print(f'EITR_SCORE_AUDIT_EVENT {event_sequence[-1]}', flush=True)
+            print(
+                'EITR_SCORE_AUDIT_SEQUENCE ' + ' -> '.join(event_sequence),
+                flush=True,
+            )
         return metrics
 
     def update_policy(self, data: DataProto):
@@ -1421,12 +1617,13 @@ class DataParallelPPOActor(BasePPOActor):
                     global_active_state_count=global_active_state_count,
                     global_rollout_state_count=global_rollout_state_count,
                     d_old=audit_d_old,
+                    old_log_ratio_abs_max=audit_old_stats['log_ratio_abs_max'],
                     theta_old_checksum=audit_theta_old_checksum,
                     grpo_step_count=grpo_optimizer_step_count,
                 )
                 append_to_dict(metrics, diagnostic_metrics)
                 pass_index = self.ppo_epochs
-                pass_stats[pass_index].update({
+                audit_additive_stats = rank_owned_global_additive_stats({
                     'js_sum': diagnostic_metrics['actor/eitr_score_path_d_zero_grad']
                     * global_rollout_state_count.item(),
                     'state_count': global_active_state_count.item(),
@@ -1437,7 +1634,10 @@ class DataParallelPPOActor(BasePPOActor):
                         'actor/eitr_score_path_log_ratio_clipfrac'
                     ] * global_active_state_count.item(),
                     'active_micro_batch_count': float(len(dataloader)),
-                })
+                }, distributed=distributed, rank=(
+                    torch.distributed.get_rank() if distributed else 0
+                ))
+                pass_stats[pass_index].update(audit_additive_stats)
                 # One real SGD invocation occurred inside the diagnostic, then
                 # theta_GRPO was restored. Count placement, not persistence.
                 eitr_correction_optimizer_step_count += 1

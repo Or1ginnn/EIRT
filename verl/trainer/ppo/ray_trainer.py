@@ -898,6 +898,7 @@ class RayPPOTrainer(object):
                 current_step = self.global_steps + 1
                 print(f'epoch {epoch}, outer update {current_step}/{self.total_training_steps}')
                 metrics = {}
+                pending_audit_failure = None
                 timing_raw = {}
                 eitr_rollout_meta = {}
 
@@ -990,27 +991,6 @@ class RayPPOTrainer(object):
                                 eitr_config,
                                 pad_token_id=self.tokenizer.pad_token_id,
                             )
-                            if bool(batch.batch['eitr_state_slot'].any().item()):
-                                probe_logprob_tensors, probe_response_mask = flatten_probe_logprob_inputs(batch)
-                                probe_logprob_batch = DataProto.from_dict(probe_logprob_tensors)
-                                probe_logprob_batch.meta_info['micro_batch_size'] = int(
-                                    eitr_config.get('probe_logprob_micro_batch_size', 4)
-                                )
-                                probe_logprob_batch.meta_info['temperature'] = float(
-                                    batch.meta_info['temperature']
-                                )
-                                probe_logprob_batch.meta_info['use_dynamic_bsz'] = False
-                                with torch.no_grad():
-                                    probe_logprob_output = self.actor_rollout_wg.compute_log_prob(
-                                        probe_logprob_batch
-                                    )
-                                batch = assign_probe_old_log_probs(
-                                    batch,
-                                    probe_logprob_output.batch['old_log_probs'],
-                                    probe_response_mask,
-                                )
-                            else:
-                                metrics['eitr/probe_old_logprob_skipped_zero_active'] = 1.0
                             metrics.update(eitr_probe_metrics)
 
                     # balance the number of valid tokens on each dp rank.
@@ -1032,6 +1012,38 @@ class RayPPOTrainer(object):
                         # exact same balancing path. A zero-active EITR batch can
                         # therefore reduce to the same ordinary GRPO update.
                         self._balance_batch(batch, metrics=metrics)
+
+                    if eitr_uses_probes and actor_update_ready:
+                        # Cache old probe scores only after rollout rows have
+                        # reached their final balanced order.  Cached-old and
+                        # current scoring then dispatch identical state groups
+                        # with the same fixed probe micro-batch size.
+                        with _timer('eitr_probe_old_logprob', timing_raw):
+                            if bool(batch.batch['eitr_state_slot'].any().item()):
+                                probe_logprob_tensors, probe_response_mask = (
+                                    flatten_probe_logprob_inputs(batch)
+                                )
+                                probe_logprob_batch = DataProto.from_dict(
+                                    probe_logprob_tensors
+                                )
+                                probe_logprob_batch.meta_info['micro_batch_size'] = int(
+                                    eitr_config.get('probe_micro_batch_size', 4)
+                                )
+                                probe_logprob_batch.meta_info['temperature'] = float(
+                                    batch.meta_info['temperature']
+                                )
+                                probe_logprob_batch.meta_info['use_dynamic_bsz'] = False
+                                with torch.no_grad():
+                                    probe_logprob_output = self.actor_rollout_wg.compute_log_prob(
+                                        probe_logprob_batch
+                                    )
+                                batch = assign_probe_old_log_probs(
+                                    batch,
+                                    probe_logprob_output.batch['old_log_probs'],
+                                    probe_response_mask,
+                                )
+                            else:
+                                metrics['eitr/probe_old_logprob_skipped_zero_active'] = 1.0
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
@@ -1104,6 +1116,28 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                        score_path_audit_pass = actor_output_metrics.get(
+                            'actor/eitr_score_path_audit_pass'
+                        )
+                        if (
+                            score_path_audit_pass is not None
+                            and float(score_path_audit_pass) < 0.5
+                        ):
+                            pending_audit_failure = {
+                                'query_pass': float(actor_output_metrics.get(
+                                    'actor/eitr_score_path_query_pass', 0.0
+                                )),
+                                'parameter_pass': float(actor_output_metrics.get(
+                                    'actor/eitr_score_path_parameter_pass', 0.0
+                                )),
+                                'anchor_pass': float(actor_output_metrics.get(
+                                    'actor/eitr_score_path_anchor_pass', 0.0
+                                )),
+                            }
+                        if score_path_audit_pass is not None:
+                            metrics['trainer/eitr_score_path_audit_pass'] = float(
+                                score_path_audit_pass
+                            )
 
                     # The update is now complete.  All logging, validation and
                     # checkpoint names use this completed-update count.
@@ -1115,7 +1149,7 @@ class RayPPOTrainer(object):
                     )
                     if self.val_reward_fn is not None and (
                         is_periodic_validation_step or is_final_step
-                    ):
+                    ) and pending_audit_failure is None:
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
@@ -1124,7 +1158,7 @@ class RayPPOTrainer(object):
 
                     if self.config.trainer.save_freq > 0 and (
                             self.global_steps % self.config.trainer.save_freq == 0
-                            or is_final_step):
+                            or is_final_step) and pending_audit_failure is None:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
 
@@ -1147,6 +1181,19 @@ class RayPPOTrainer(object):
                     ),
                     step=self.global_steps,
                 )
+
+                if pending_audit_failure is not None:
+                    # Scientific direction failure is expected audit output,
+                    # not a broken FSDP state.  Persist the complete row first,
+                    # then stop with a non-zero status. Integrity failures such
+                    # as hash/restore/nonfinite mismatches still raise earlier.
+                    logger.finish()
+                    raise RuntimeError(
+                        'EITR score-path audit FAIL after metrics flush: '
+                        f'query_pass={pending_audit_failure["query_pass"]:.0f}, '
+                        f'parameter_pass={pending_audit_failure["parameter_pass"]:.0f}, '
+                        f'anchor_pass={pending_audit_failure["anchor_pass"]:.0f}'
+                    )
 
                 if is_final_step:
                     return

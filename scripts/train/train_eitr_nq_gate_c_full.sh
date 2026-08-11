@@ -25,8 +25,11 @@ export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-256}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 export PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
-export EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-16}"
-export EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-8}"
+# Cached-old and current probe scores must use the same chunking.  Keep the
+# formal default conservative because current scoring now runs in eval mode
+# with gradients enabled for the EITR correction.
+export EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"
+export EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"
 # Search-R1 v0.3 warms up for about 286 of its 1,005 outer updates. Preserve
 # that update count for the 8,000-step ceiling instead of incorrectly keeping
 # the 0.285 ratio (which would stretch warmup to 2,280 very slow EITR steps).
