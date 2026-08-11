@@ -50,6 +50,10 @@ from verl.trainer.ppo.eitr import (
     resolve_eitr_mode,
     validate_eitr_optimization_schedule,
 )
+from verl.trainer.ppo.eitr_checkpointing import (
+    deterministic_probe_checkpointing_mode,
+    validate_deterministic_probe_checkpointing,
+)
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.fsdp_utils import offload_fsdp_optimizer
@@ -109,6 +113,18 @@ class DataParallelPPOActor(BasePPOActor):
         if isinstance(compact_invalid_states, str):
             compact_invalid_states = compact_invalid_states.strip().lower() == 'true'
         self.eitr_compact_invalid_states = bool(compact_invalid_states)
+        probe_gradient_checkpointing = self.eitr_config.get(
+            'probe_gradient_checkpointing', False
+        )
+        if isinstance(probe_gradient_checkpointing, str):
+            probe_gradient_checkpointing = (
+                probe_gradient_checkpointing.strip().lower() == 'true'
+            )
+        self.eitr_probe_gradient_checkpointing_active = bool(
+            probe_gradient_checkpointing and self.eitr_mode == 'eitr'
+        )
+        if self.eitr_probe_gradient_checkpointing_active:
+            validate_deterministic_probe_checkpointing(self.actor_module)
         self.offload_actor_optimizer_after_grpo = bool(
             self.config.fsdp_config.get('optimizer_offload', False)
         )
@@ -255,9 +271,29 @@ class DataParallelPPOActor(BasePPOActor):
         finally:
             self.actor_module.train(actor_was_training)
 
+    @contextmanager
+    def _temporary_eitr_probe_checkpoint_train(self):
+        """Enable deterministic train-mode scoring so HF checkpoints activate."""
+        if not self.eitr_probe_gradient_checkpointing_active:
+            with self._temporary_probe_eval():
+                yield
+            return
+        with deterministic_probe_checkpointing_mode(self.actor_module):
+            if not self.actor_module.training:
+                raise RuntimeError(
+                    'EITR probe gradient checkpointing failed to enter train mode'
+                )
+            yield
+
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
-        """Compute cached old log-probs in the canonical probe eval mode."""
-        with self._temporary_probe_eval():
+        """Compute old log-probs in the matching ordinary/probe score mode."""
+        is_eitr_probe_score = bool(data.meta_info.get('eitr_probe_score', False))
+        score_context = (
+            self._temporary_eitr_probe_checkpoint_train
+            if is_eitr_probe_score
+            else self._temporary_probe_eval
+        )
+        with score_context():
             return self._compute_log_prob_eval(data)
 
     def _compute_log_prob_eval(self, data: DataProto) -> torch.Tensor:
@@ -334,10 +370,11 @@ class DataParallelPPOActor(BasePPOActor):
         # Every valid global probe batch gives each FSDP rank the same number of
         # physical row slots. Fixed-size chunking therefore preserves identical
         # forward/collective counts while avoiding one K*actor_microbatch prefill.
-        # Eval mode is shared by cached-old, gradient, no-op, and candidate
-        # probe scores.  Eval does not disable autograd, so the correction still
-        # backpropagates while avoiding a train/eval scoring mismatch.
-        with self._temporary_probe_eval():
+        # Cached-old, gradient, no-op, and candidate probe scores share this
+        # deterministic mode. For Qwen2.5, zero-dropout train mode activates
+        # Hugging Face layer checkpointing and avoids retaining every long-state
+        # activation until the EITR correction backward.
+        with self._temporary_eitr_probe_checkpoint_train():
             for chunk_start in range(0, flat_probe_count, probe_micro_batch_size):
                 chunk_end = min(chunk_start + probe_micro_batch_size, flat_probe_count)
                 probe_chunk = {
@@ -1767,6 +1804,12 @@ class DataParallelPPOActor(BasePPOActor):
         # configured GRPO epoch has finished.
         dataloader = list(batch.split(self.config.ppo_mini_batch_size))
         metrics = {}
+        if self.eitr_uses_probes:
+            append_to_dict(metrics, {
+                'actor/eitr_probe_gradient_checkpointing_active': float(
+                    self.eitr_probe_gradient_checkpointing_active
+                ),
+            })
         total_pass_count = self.ppo_epochs + (
             self.eitr_correction_passes if self.eitr_uses_probes else 0
         )

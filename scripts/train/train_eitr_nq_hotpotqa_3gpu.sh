@@ -8,7 +8,9 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3}"
 export NUM_GPUS="${NUM_GPUS:-3}"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-30}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-30}"
-export PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-6}"
+# One rollout per rank per GRPO micro-batch leaves headroom for other users on
+# the shared A800s. The global mini-batch and its five AdamW steps are unchanged.
+export PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-3}"
 export ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE:-30}"
 export REF_LOG_PROB_MICRO_BATCH_SIZE="${REF_LOG_PROB_MICRO_BATCH_SIZE:-30}"
 

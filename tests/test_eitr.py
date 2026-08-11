@@ -34,6 +34,19 @@ TRACKING_SPEC = importlib.util.spec_from_file_location("tracking_module", TRACKI
 TRACKING_MODULE = importlib.util.module_from_spec(TRACKING_SPEC)
 TRACKING_SPEC.loader.exec_module(TRACKING_MODULE)
 
+CHECKPOINTING_MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "verl"
+    / "trainer"
+    / "ppo"
+    / "eitr_checkpointing.py"
+)
+CHECKPOINTING_SPEC = importlib.util.spec_from_file_location(
+    "eitr_checkpointing_module", CHECKPOINTING_MODULE_PATH
+)
+CHECKPOINTING = importlib.util.module_from_spec(CHECKPOINTING_SPEC)
+CHECKPOINTING_SPEC.loader.exec_module(CHECKPOINTING)
+
 build_sibling_probe_tensors = EITR.build_sibling_probe_tensors
 build_online_probe_tensors = EITR.build_online_probe_tensors
 build_grpo_uids = EITR.build_grpo_uids
@@ -227,7 +240,7 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('NUM_GPUS="${NUM_GPUS:-3}"', profile)
         self.assertIn('TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-30}"', profile)
         self.assertIn('PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-30}"', profile)
-        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-6}"', profile)
+        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-3}"', profile)
         self.assertIn(
             'ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-true}"',
             profile,
@@ -1632,12 +1645,106 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
         compute_eitr_start = actor_source.index("    def _compute_eitr_micro_batch(")
         iter_chunks_start = actor_source.index("    def _iter_eitr_state_chunks(")
         self.assertIn(
-            "with self._temporary_probe_eval():",
+            "else self._temporary_probe_eval",
             actor_source[compute_log_prob_start:compute_eitr_start],
         )
         self.assertIn(
-            "with self._temporary_probe_eval():",
+            "with self._temporary_eitr_probe_checkpoint_train():",
             actor_source[compute_eitr_start:iter_chunks_start],
+        )
+
+    def test_deterministic_probe_checkpointing_enables_and_restores_train_mode(self):
+        class CheckpointBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gradient_checkpointing = True
+                self.attention_dropout = 0.0
+                self.dropout = torch.nn.Dropout(p=0.0)
+
+        root = torch.nn.Module()
+        root.block = CheckpointBlock()
+        root.eval()
+        original_states = {
+            name: child.training for name, child in root.named_modules()
+        }
+
+        CHECKPOINTING.validate_deterministic_probe_checkpointing(root)
+        with CHECKPOINTING.deterministic_probe_checkpointing_mode(root):
+            self.assertTrue(root.training)
+            self.assertTrue(root.block.training)
+        self.assertEqual(
+            {name: child.training for name, child in root.named_modules()},
+            original_states,
+        )
+
+        root.train(True)
+        root.block.dropout.eval()
+        original_mixed_states = {
+            name: child.training for name, child in root.named_modules()
+        }
+        with self.assertRaisesRegex(RuntimeError, "probe failed"):
+            with CHECKPOINTING.deterministic_probe_checkpointing_mode(root):
+                self.assertTrue(root.block.dropout.training)
+                raise RuntimeError("probe failed")
+        self.assertEqual(
+            {name: child.training for name, child in root.named_modules()},
+            original_mixed_states,
+        )
+
+    def test_probe_checkpointing_rejects_missing_checkpoint_or_dropout(self):
+        plain = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        with self.assertRaisesRegex(ValueError, "gradient_checkpointing=True"):
+            CHECKPOINTING.validate_deterministic_probe_checkpointing(plain)
+
+        class StochasticBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gradient_checkpointing = True
+                self.attention_dropout = 0.1
+
+        stochastic = StochasticBlock()
+        with self.assertRaisesRegex(ValueError, "zero dropout"):
+            CHECKPOINTING.validate_deterministic_probe_checkpointing(stochastic)
+
+        stochastic.attention_dropout = 0.0
+        stochastic.dropout_layer = torch.nn.Dropout(p=0.2)
+        with self.assertRaisesRegex(ValueError, "dropout_layer.p=0.2"):
+            CHECKPOINTING.validate_deterministic_probe_checkpointing(stochastic)
+
+    def test_old_and_current_eitr_scores_share_checkpoint_train_mode(self):
+        root = Path(__file__).resolve().parents[1]
+        actor_source = (
+            root / "verl" / "workers" / "actor" / "dp_actor.py"
+        ).read_text()
+        trainer_source = (
+            root / "verl" / "trainer" / "ppo" / "ray_trainer.py"
+        ).read_text()
+        runner = (
+            root / "scripts" / "train" / "train_eitr_nq_gate_c_smoke.sh"
+        ).read_text()
+
+        compute_log_prob = actor_source[
+            actor_source.index("    def compute_log_prob("):
+            actor_source.index("    def _compute_log_prob_eval(")
+        ]
+        compute_eitr = actor_source[
+            actor_source.index("    def _compute_eitr_micro_batch("):
+            actor_source.index("    def _iter_eitr_state_chunks(")
+        ]
+        self.assertIn("data.meta_info.get('eitr_probe_score', False)", compute_log_prob)
+        self.assertIn("self._temporary_eitr_probe_checkpoint_train", compute_log_prob)
+        self.assertIn("self._temporary_eitr_probe_checkpoint_train()", compute_eitr)
+        self.assertIn(
+            "probe_logprob_batch.meta_info['eitr_probe_score'] = True",
+            trainer_source,
+        )
+        self.assertIn(
+            'EITR_PROBE_GRADIENT_CHECKPOINTING="${EITR_PROBE_GRADIENT_CHECKPOINTING:-true}"',
+            runner,
+        )
+        self.assertIn(
+            'actor_rollout_ref.actor.eitr.probe_gradient_checkpointing="$EITR_PROBE_GRADIENT_CHECKPOINTING"',
+            runner,
         )
 
     def test_zero_warmup_uses_base_lr_from_the_first_optimizer_step(self):

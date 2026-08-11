@@ -271,6 +271,23 @@ outer updates。这保留Search-R1 v0.3原1005步配置中的约286步actor warm
 step数，但真实4/4/4任务已在第8个随机长batch的EITR correction backward发生OOM，
 因此在释放训练GPU上的Retriever显存前，8/8/8不再是可接受候选。
 
+共享三卡profile进一步把全局 `PPO_MICRO_BATCH_SIZE` 降为3，即每个data-parallel
+rank一次只处理一条普通GRPO trajectory；全局train batch=30、mini-batch=30与每个
+outer update的5次GRPO AdamW steps不变。EITR仍以完整K=4 state为最小评分单元。
+
+另一个已定位的峰值来源是probe correction先前统一使用 `model.eval()`：虽然配置已
+执行Hugging Face `gradient_checkpointing_enable()`，Qwen decoder仍会以
+`module.training` 作为层级checkpoint开关，因而eval-mode correction保留了全部长序列
+激活。当前EITR模式改为对cached-old/current/no-op/post probe统一使用确定性train-mode
+评分，从而真正启用已有的layer checkpointing。该路径启动时会检查actor确实启用了
+gradient checkpointing，并拒绝任何非零dropout设置；`use_cache=False`继续保持。
+普通old/ref log-prob仍使用eval模式。此改动只改变激活的保存/重计算方式，不改变
+query、retrieval effect、SNIS/JS、coverage、K、loss、LR或optimizer step。
+
+新增 `actor/eitr_probe_gradient_checkpointing_active` 指标作为运行时证据。该显存修复
+在本地仅通过了单元与静态检查，必须先在真实三卡FSDP任务重新通过anchor、1-step方向
+审计与短期显存smoke，不能仅凭代码检查宣称正式训练已稳定。
+
 性能诊断继续记录 `timing_s/real_retrieval`、
 `timing_s/eitr_probe_generation`、`timing_s/eitr_probe_retrieval`、
 `timing_s/eitr_probe_old_logprob`、`timing_s/grpo_update` 和

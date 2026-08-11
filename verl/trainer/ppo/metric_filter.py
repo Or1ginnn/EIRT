@@ -32,6 +32,7 @@ CORE_METRIC_NAMES = {
     "actor/eitr_compacted_state_forward_count",
     "actor/eitr_dummy_state_forward_count",
     "actor/eitr_state_forward_reduction_rate",
+    "actor/eitr_probe_gradient_checkpointing_active",
     "actor/eitr_env_drift_pre",
     "actor/eitr_env_drift_post",
     "actor/eitr_env_drift_delta",

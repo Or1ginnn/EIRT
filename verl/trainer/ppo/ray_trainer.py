@@ -1035,6 +1035,7 @@ class RayPPOTrainer(object):
                                     batch.meta_info['temperature']
                                 )
                                 probe_logprob_batch.meta_info['use_dynamic_bsz'] = False
+                                probe_logprob_batch.meta_info['eitr_probe_score'] = True
                                 with torch.no_grad():
                                     probe_logprob_output = self.actor_rollout_wg.compute_log_prob(
                                         probe_logprob_batch

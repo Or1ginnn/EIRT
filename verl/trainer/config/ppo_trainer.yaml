@@ -59,6 +59,10 @@ actor_rollout_ref:
       # Remove invalid rows before correction and pad only to the busiest FSDP
       # rank. This changes neither active states nor the full-rollout loss.
       compact_invalid_states: true
+      # HF decoder checkpointing is gated on model.training. Formal EITR runs
+      # use deterministic zero-dropout train-mode probe scoring so correction
+      # backward can recompute layers instead of retaining all activations.
+      probe_gradient_checkpointing: false
       # Match the real per-turn generation budget. At runtime each state uses
       # only the suffix budget remaining after reasoning + <search>.
       max_query_tokens: ${data.max_response_length}
