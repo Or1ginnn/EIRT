@@ -171,6 +171,19 @@ def directional_parameter_candidates(
     }
 
 
+def bounded_quantile_sample_stride(total_values: int, sample_budget: int) -> int:
+    """Return a deterministic stride whose sample never exceeds the budget."""
+    total_values = int(total_values)
+    sample_budget = int(sample_budget)
+    if total_values < 0:
+        raise ValueError("total_values must be non-negative")
+    if sample_budget <= 0:
+        raise ValueError("sample_budget must be positive")
+    if total_values == 0:
+        return 1
+    return max(1, (total_values + sample_budget - 1) // sample_budget)
+
+
 def coverage_weighted_state_scale(
     valid_state_count: int,
     global_rollout_state_count: float,

@@ -36,6 +36,7 @@ build_sibling_probe_tensors = EITR.build_sibling_probe_tensors
 build_online_probe_tensors = EITR.build_online_probe_tensors
 build_grpo_uids = EITR.build_grpo_uids
 build_eitr_correction_optimizer = EITR.build_eitr_correction_optimizer
+bounded_quantile_sample_stride = EITR.bounded_quantile_sample_stride
 coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
 directional_parameter_candidates = EITR.directional_parameter_candidates
@@ -974,6 +975,16 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
         self.assertFalse(eitr_score_path_noop_direction_audit_enabled({
             "score_path_noop_direction_audit": "false"
         }))
+
+    def test_large_flat_shard_quantile_sample_is_bounded(self):
+        total_values = 1_600_000_000
+        per_rank_budget = 131_072
+        stride = bounded_quantile_sample_stride(total_values, per_rank_budget)
+        sample_count = (total_values + stride - 1) // stride
+        self.assertLessEqual(sample_count, per_rank_budget)
+        self.assertEqual(bounded_quantile_sample_stride(0, per_rank_budget), 1)
+        with self.assertRaisesRegex(ValueError, "sample_budget"):
+            bounded_quantile_sample_stride(total_values, 0)
 
     def test_event_order_finishes_grpo_before_one_eitr_step(self):
         sequence = score_path_audit_event_sequence(5)

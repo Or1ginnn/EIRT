@@ -26,6 +26,7 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.eitr import (
     EITR_BATCH_KEYS,
+    bounded_quantile_sample_stride,
     cached_probe_fingerprint,
     eitr_loss_enabled_for_pass,
     eitr_score_path_noop_direction_audit_enabled,
@@ -600,31 +601,93 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
     def _audit_direction_statistics(self, snapshot, *, direction, distributed):
-        local_sums = torch.zeros(5, dtype=torch.float64, device=torch.cuda.current_device())
-        local_quantiles = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
-        saw_delta = False
+        # Exact norms/dot/counts are accumulated a bounded CPU chunk at a time.
+        # Quantiles are diagnostic only and use a deterministic, candidate-
+        # independent strided sample. Never concatenate a 3B-parameter delta or
+        # pass an FSDP flat shard directly to torch.quantile().
+        chunk_size = 1_048_576
+        global_sample_budget = 262_144
+        world_size = torch.distributed.get_world_size() if distributed else 1
+        local_sample_budget = max(1, global_sample_budget // world_size)
+        local_total_values = sum(
+            int(saved_parameter.numel())
+            for _, saved_parameter, saved_gradient in snapshot
+            if saved_gradient is not None
+        )
+        sample_stride = bounded_quantile_sample_stride(
+            local_total_values, local_sample_budget
+        )
+        local_values = [0.0] * 6
+        local_max_abs = 0.0
+        local_offset = 0
+        sampled_absolute = []
         for parameter, saved_parameter, saved_gradient in snapshot:
             if saved_gradient is None:
                 continue
-            delta = parameter.detach().float().cpu() - saved_parameter.float()
-            gradient = saved_gradient.float()
-            absolute = delta.abs()
-            local_sums[0] += gradient.square().sum(dtype=torch.float64)
-            local_sums[1] += delta.square().sum(dtype=torch.float64)
-            local_sums[2] += (gradient * delta).sum(dtype=torch.float64)
-            local_sums[3] += (absolute > 0).sum(dtype=torch.float64)
-            local_sums[4] += absolute.numel()
-            if absolute.numel() > 0:
-                local_quantiles = torch.maximum(
-                    local_quantiles,
-                    torch.quantile(
-                        absolute, torch.tensor([0.5, 0.95, 0.99])
-                    ).to(local_quantiles.device),
+            parameter_flat = parameter.detach().reshape(-1)
+            saved_flat = saved_parameter.reshape(-1)
+            gradient_flat = saved_gradient.reshape(-1)
+            if not (
+                parameter_flat.numel()
+                == saved_flat.numel()
+                == gradient_flat.numel()
+            ):
+                raise RuntimeError(
+                    'Score-path audit parameter/snapshot/gradient shapes changed'
                 )
-                saw_delta = True
+            for chunk_start in range(0, parameter_flat.numel(), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, parameter_flat.numel())
+                current_chunk = parameter_flat[chunk_start:chunk_end].to(
+                    device='cpu', dtype=torch.float32, copy=True
+                )
+                saved_chunk = saved_flat[chunk_start:chunk_end].float()
+                gradient_chunk = gradient_flat[chunk_start:chunk_end].float()
+                delta = current_chunk - saved_chunk
+                absolute = delta.abs()
+                local_values[0] += float(
+                    gradient_chunk.square().sum(dtype=torch.float64).item()
+                )
+                local_values[1] += float(
+                    delta.square().sum(dtype=torch.float64).item()
+                )
+                local_values[2] += float(
+                    (gradient_chunk * delta).sum(dtype=torch.float64).item()
+                )
+                local_values[3] += float((absolute > 0).sum().item())
+                local_values[4] += float(absolute.numel())
+                if absolute.numel() > 0:
+                    local_max_abs = max(local_max_abs, float(absolute.max().item()))
+                    first_sample = (-local_offset) % sample_stride
+                    if first_sample < absolute.numel():
+                        sampled_absolute.append(
+                            absolute[first_sample::sample_stride].clone()
+                        )
+                local_offset += absolute.numel()
+
+        if sampled_absolute:
+            absolute_sample = torch.cat(sampled_absolute)[:local_sample_budget]
+            local_values[5] = float(absolute_sample.numel())
+            local_quantiles_cpu = torch.quantile(
+                absolute_sample,
+                torch.tensor([0.5, 0.95, 0.99], dtype=torch.float32),
+            ).double()
+        else:
+            local_quantiles_cpu = torch.zeros(3, dtype=torch.float64)
+
+        local_sums = torch.tensor(
+            local_values, dtype=torch.float64, device=torch.cuda.current_device()
+        )
+        audit_device = torch.device('cuda', torch.cuda.current_device())
+        local_quantiles = local_quantiles_cpu.to(device=audit_device)
+        local_maxima = torch.tensor(
+            [local_max_abs, float(sample_stride)],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
         if distributed:
             torch.distributed.all_reduce(local_sums, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(local_quantiles, op=torch.distributed.ReduceOp.MAX)
+            torch.distributed.all_reduce(local_maxima, op=torch.distributed.ReduceOp.MAX)
         grad_norm = float(local_sums[0].clamp_min(0).sqrt().item())
         delta_norm = float(local_sums[1].clamp_min(0).sqrt().item())
         g_dot_delta = float(local_sums[2].item())
@@ -639,7 +702,10 @@ class DataParallelPPOActor(BasePPOActor):
             'delta_abs_shard_p50_max': float(local_quantiles[0].item()),
             'delta_abs_shard_p95_max': float(local_quantiles[1].item()),
             'delta_abs_shard_p99_max': float(local_quantiles[2].item()),
-            'saw_delta': saw_delta,
+            'delta_abs_max': float(local_maxima[0].item()),
+            'quantile_sample_count': int(local_sums[5].item()),
+            'quantile_sample_stride_max': int(local_maxima[1].item()),
+            'saw_delta': bool(local_sums[3].item() > 0),
         }
 
     def _run_same_batch_scale_diagnostic(
@@ -1124,6 +1190,15 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 f'actor/eitr_score_path_delta_abs_shard_p99_max_{direction}': (
                     stats['delta_abs_shard_p99_max']
+                ),
+                f'actor/eitr_score_path_delta_abs_max_{direction}': (
+                    stats['delta_abs_max']
+                ),
+                f'actor/eitr_score_path_quantile_sample_count_{direction}': (
+                    stats['quantile_sample_count']
+                ),
+                f'actor/eitr_score_path_quantile_sample_stride_max_{direction}': (
+                    stats['quantile_sample_stride_max']
                 ),
                 f'actor/eitr_score_path_grad_norm_{direction}': stats['grad_norm'],
             })
