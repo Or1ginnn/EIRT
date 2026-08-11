@@ -264,7 +264,7 @@ def directional_descent_diagnostics(
     rtol: float = 1e-6,
     atol: float = 1e-12,
 ) -> Dict[str, float]:
-    """Measure whether minus is descent and plus is ascent beyond noise."""
+    """Measure one-sided descent and optional bidirectional smoothness."""
     minus = float(minus)
     zero = float(zero)
     plus = float(plus)
@@ -278,11 +278,55 @@ def directional_descent_diagnostics(
     noise = max(jitter, abs(zero) * rtol, atol)
     minus_margin = zero - minus
     plus_margin = plus - zero
+    minus_pass = bool(minus_margin > noise)
+    plus_pass = bool(plus_margin > noise)
     return {
         "minus_margin": minus_margin,
         "plus_margin": plus_margin,
         "noise": noise,
-        "pass": float(minus_margin > noise and plus_margin > noise),
+        "minus_pass": float(minus_pass),
+        "plus_pass": float(plus_pass),
+        "pass": float(minus_pass and plus_pass),
+    }
+
+
+def parameter_correction_diagnostics(
+    *,
+    minus: float,
+    zero: float,
+    plus: float,
+    minus_g_dot_delta: float,
+    minus_cosine: float,
+    jitter: float = 0.0,
+    rtol: float = 1e-6,
+    atol: float = 1e-12,
+) -> Dict[str, float]:
+    """Validate the actual -gradient correction and report smoothness separately."""
+    minus_g_dot_delta = float(minus_g_dot_delta)
+    minus_cosine = float(minus_cosine)
+    if not all(math.isfinite(value) for value in (minus_g_dot_delta, minus_cosine)):
+        raise ValueError("parameter correction direction inputs must be finite")
+    direction = directional_descent_diagnostics(
+        minus=minus,
+        zero=zero,
+        plus=plus,
+        jitter=jitter,
+        rtol=rtol,
+        atol=atol,
+    )
+    update_direction_pass = bool(
+        minus_g_dot_delta < 0.0 and minus_cosine > 0.0
+    )
+    correction_pass = bool(
+        direction["minus_pass"] > 0.5 and update_direction_pass
+    )
+    bidirectional_pass = bool(direction["pass"] > 0.5)
+    return {
+        **direction,
+        "update_direction_pass": float(update_direction_pass),
+        "correction_pass": float(correction_pass),
+        "bidirectional_pass": float(bidirectional_pass),
+        "nonsmooth_warning": float(correction_pass and not bidirectional_pass),
     }
 
 

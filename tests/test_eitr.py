@@ -51,6 +51,7 @@ same_batch_cache_signature = EITR.same_batch_cache_signature
 same_batch_scale_diagnostic_lrs = EITR.same_batch_scale_diagnostic_lrs
 same_batch_sgd_candidates = EITR.same_batch_sgd_candidates
 probe_effect_diversity = EITR.probe_effect_diversity
+parameter_correction_diagnostics = EITR.parameter_correction_diagnostics
 proposal_signal_diagnostics = EITR.proposal_signal_diagnostics
 rollout_averaged_env_drift = EITR.rollout_averaged_env_drift
 rank_owned_global_additive_stats = EITR.rank_owned_global_additive_stats
@@ -1189,10 +1190,10 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
         self.assertEqual(diagnostic["pass"], 1.0)
 
     def test_direction_diagnostic_rejects_reversed_flat_and_nonfinite_values(self):
-        self.assertEqual(
-            directional_descent_diagnostics(minus=0.9, zero=1.0, plus=1.1)["pass"],
-            1.0,
-        )
+        resolved = directional_descent_diagnostics(minus=0.9, zero=1.0, plus=1.1)
+        self.assertEqual(resolved["minus_pass"], 1.0)
+        self.assertEqual(resolved["plus_pass"], 1.0)
+        self.assertEqual(resolved["pass"], 1.0)
         self.assertEqual(
             directional_descent_diagnostics(minus=1.1, zero=1.0, plus=0.9)["pass"],
             0.0,
@@ -1210,6 +1211,76 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
             directional_descent_diagnostics(
                 minus=float("nan"), zero=1.0, plus=1.1
             )
+
+    def test_parameter_gate_accepts_real_minus_descent_and_reports_nonsmooth_plus(self):
+        diagnostic = parameter_correction_diagnostics(
+            minus=9.326941658561e-4,
+            zero=1.053403202048e-3,
+            plus=8.439664564913e-4,
+            minus_g_dot_delta=-2.856884e-7,
+            minus_cosine=0.767159,
+            jitter=0.0,
+        )
+
+        self.assertEqual(diagnostic["minus_pass"], 1.0)
+        self.assertEqual(diagnostic["plus_pass"], 0.0)
+        self.assertEqual(diagnostic["bidirectional_pass"], 0.0)
+        self.assertEqual(diagnostic["update_direction_pass"], 1.0)
+        self.assertEqual(diagnostic["correction_pass"], 1.0)
+        self.assertEqual(diagnostic["nonsmooth_warning"], 1.0)
+
+    def test_parameter_gate_rejects_wrong_update_sign_or_no_minus_descent(self):
+        wrong_sign = parameter_correction_diagnostics(
+            minus=0.9,
+            zero=1.0,
+            plus=1.1,
+            minus_g_dot_delta=1e-3,
+            minus_cosine=-0.5,
+        )
+        no_descent = parameter_correction_diagnostics(
+            minus=1.1,
+            zero=1.0,
+            plus=0.9,
+            minus_g_dot_delta=-1e-3,
+            minus_cosine=0.5,
+        )
+        self.assertEqual(wrong_sign["correction_pass"], 0.0)
+        self.assertEqual(no_descent["correction_pass"], 0.0)
+        with self.assertRaisesRegex(ValueError, "finite"):
+            parameter_correction_diagnostics(
+                minus=0.9,
+                zero=1.0,
+                plus=1.1,
+                minus_g_dot_delta=float("nan"),
+                minus_cosine=0.5,
+            )
+
+    def test_actor_gate_uses_correction_pass_and_keeps_bidirectional_diagnostic(self):
+        actor_source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "actor"
+            / "dp_actor.py"
+        ).read_text()
+        gate_start = actor_source.index(
+            "        parameter_direction = parameter_correction_diagnostics("
+        )
+        gate_end = actor_source.index(
+            "        metrics['actor/eitr_score_path_final_restore_max_abs']",
+            gate_start,
+        )
+        gate_block = actor_source[gate_start:gate_end]
+        self.assertIn("and parameter_correction_pass", gate_block)
+        self.assertNotIn("and parameter_bidirectional_pass", gate_block)
+        self.assertIn(
+            "'actor/eitr_score_path_parameter_bidirectional_pass'",
+            gate_block,
+        )
+        self.assertIn(
+            "'actor/eitr_score_path_parameter_nonsmooth_warning'",
+            gate_block,
+        )
 
     def test_two_rank_global_additive_stats_are_owned_only_once(self):
         global_stats = {

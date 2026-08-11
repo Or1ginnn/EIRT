@@ -36,6 +36,7 @@ from verl.trainer.ppo.eitr import (
     coverage_weighted_state_scale,
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
+    parameter_correction_diagnostics,
     proposal_signal_diagnostics,
     rank_owned_global_additive_stats,
     resolved_query_direction_candidates,
@@ -1313,6 +1314,11 @@ class DataParallelPPOActor(BasePPOActor):
                 'actor/eitr_score_path_candidate_sgd_ran': 0.0,
                 'actor/eitr_score_path_query_pass': 0.0,
                 'actor/eitr_score_path_parameter_pass': 0.0,
+                'actor/eitr_score_path_parameter_minus_descent_pass': 0.0,
+                'actor/eitr_score_path_parameter_update_direction_pass': 0.0,
+                'actor/eitr_score_path_parameter_bidirectional_pass': 0.0,
+                'actor/eitr_score_path_parameter_plus_ascent_pass': 0.0,
+                'actor/eitr_score_path_parameter_nonsmooth_warning': 0.0,
                 'actor/eitr_score_path_audit_inconclusive': float(no_signal),
                 'actor/eitr_score_path_audit_fail': float(integrity_fail),
                 'actor/eitr_score_path_audit_pass': 0.0,
@@ -1332,6 +1338,8 @@ class DataParallelPPOActor(BasePPOActor):
                     f'floor={proposal_signal["numerical_floor"]:.12e} '
                     f'signal={proposal_signal["signal"]:.12e} '
                     f'snr={proposal_signal["signal_to_floor_ratio"]:.12e} '
+                    f'anchor_log_ratio_abs_max={old_log_ratio_abs_max:.12e} '
+                    f'post_grpo_log_ratio_abs_max={zero_stats["log_ratio_abs_max"]:.12e} '
                     f'anchor_pass={int(anchor_pass)} '
                     f'score_mode_pass={int(proposal_signal["score_mode_pass"])} '
                     f'probe_hash={cache_hash} '
@@ -1477,24 +1485,59 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 f'actor/eitr_score_path_grad_norm_{direction}': stats['grad_norm'],
             })
-        parameter_direction = directional_descent_diagnostics(
+        parameter_direction = parameter_correction_diagnostics(
             minus=reports['minus'][0],
             zero=noop_mean,
             plus=reports['plus'][0],
+            minus_g_dot_delta=reports['minus'][1]['g_dot_delta'],
+            minus_cosine=reports['minus'][1]['cosine'],
             jitter=noop_jitter,
+        )
+        # Gate C validates the correction the algorithm actually applies:
+        # theta <- theta - lr * grad(D_env).  The opposite candidate remains a
+        # useful smoothness diagnostic, but FSDP/BF16 parameter re-scoring is
+        # piecewise quantized and need not be locally symmetric at a finite
+        # epsilon.  Query-logprob space remains the strict bidirectional sign
+        # check; parameter space requires a real, correctly directed -g step
+        # that lowers the same cached-batch drift beyond numerical noise.
+        parameter_update_direction_pass = bool(
+            parameter_direction['update_direction_pass'] > 0.5
+        )
+        parameter_correction_pass = bool(
+            parameter_direction['correction_pass'] > 0.5
+        )
+        parameter_bidirectional_pass = bool(
+            parameter_direction['bidirectional_pass'] > 0.5
         )
         score_path_pass = bool(proposal_signal['score_mode_pass'] > 0.5)
         audit_pass = bool(
             anchor_pass
             and score_path_pass
             and query_direction['pass'] > 0.5
-            and parameter_direction['pass'] > 0.5
+            and parameter_correction_pass
         )
         metrics.update({
             'actor/eitr_score_path_parameter_minus_margin': parameter_direction['minus_margin'],
             'actor/eitr_score_path_parameter_plus_margin': parameter_direction['plus_margin'],
             'actor/eitr_score_path_parameter_noise': parameter_direction['noise'],
-            'actor/eitr_score_path_parameter_pass': parameter_direction['pass'],
+            'actor/eitr_score_path_parameter_minus_descent_pass': (
+                parameter_direction['minus_pass']
+            ),
+            'actor/eitr_score_path_parameter_update_direction_pass': float(
+                parameter_update_direction_pass
+            ),
+            'actor/eitr_score_path_parameter_bidirectional_pass': float(
+                parameter_bidirectional_pass
+            ),
+            'actor/eitr_score_path_parameter_plus_ascent_pass': (
+                parameter_direction['plus_pass']
+            ),
+            'actor/eitr_score_path_parameter_nonsmooth_warning': float(
+                parameter_direction['nonsmooth_warning']
+            ),
+            'actor/eitr_score_path_parameter_pass': float(
+                parameter_correction_pass
+            ),
             'actor/eitr_score_path_zero_noop_abs_error': zero_noop_error,
             'actor/eitr_score_path_score_mode_pass': float(score_path_pass),
             'actor/eitr_score_path_direction_evaluated': 1.0,
@@ -1519,11 +1562,15 @@ class DataParallelPPOActor(BasePPOActor):
                 f'D_plus={reports["plus"][0]:.12e} '
                 f'proposal_signal={proposal_signal["signal"]:.12e} '
                 f'proposal_snr={proposal_signal["signal_to_floor_ratio"]:.12e} '
+                f'anchor_log_ratio_abs_max={old_log_ratio_abs_max:.12e} '
+                f'post_grpo_log_ratio_abs_max={zero_stats["log_ratio_abs_max"]:.12e} '
                 f'query_minus={query_direction["minus"]:.12e} '
                 f'query_zero={query_direction["zero"]:.12e} '
                 f'query_plus={query_direction["plus"]:.12e} '
                 f'query_pass={int(query_direction["pass"])} '
-                f'parameter_pass={int(parameter_direction["pass"])} '
+                f'parameter_pass={int(parameter_correction_pass)} '
+                f'parameter_bidirectional_pass={int(parameter_bidirectional_pass)} '
+                f'parameter_plus_ascent_pass={int(parameter_direction["plus_pass"])} '
                 f'anchor_pass={int(anchor_pass)} '
                 f'audit_pass={int(audit_pass)} '
                 f'probe_hash={cache_hash} '
