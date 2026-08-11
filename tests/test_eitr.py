@@ -138,11 +138,27 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
         self.assertIn(
+            'ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-false}"',
+            runner,
+        )
+        self.assertIn(
+            'ACTOR_BATCH_OFFLOAD="${ACTOR_BATCH_OFFLOAD:-false}"',
+            runner,
+        )
+        self.assertIn(
             'REF_FSDP_PARAM_OFFLOAD="${REF_FSDP_PARAM_OFFLOAD:-false}"',
             runner,
         )
         self.assertIn(
             'actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_FSDP_PARAM_OFFLOAD"',
+            runner,
+        )
+        self.assertIn(
+            'actor_rollout_ref.actor.fsdp_config.optimizer_offload="$ACTOR_FSDP_OPTIMIZER_OFFLOAD"',
+            runner,
+        )
+        self.assertIn(
+            'actor_rollout_ref.actor.fsdp_config.batch_offload="$ACTOR_BATCH_OFFLOAD"',
             runner,
         )
         self.assertIn(
@@ -167,6 +183,14 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"', runner)
         self.assertIn(
             'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
+            runner,
+        )
+        self.assertIn(
+            'ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-true}"',
+            runner,
+        )
+        self.assertIn(
+            'ACTOR_BATCH_OFFLOAD="${ACTOR_BATCH_OFFLOAD:-true}"',
             runner,
         )
         self.assertIn(
@@ -212,6 +236,51 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn("load_fsdp_param_and_grad(", ref_compute)
         self.assertIn("offload_fsdp_param_and_grad(", ref_compute)
         self.assertNotIn("if self._is_offload_param:", ref_compute)
+
+    def test_formal_actor_streams_batches_and_offloads_adamw_before_eitr(self):
+        root = Path(__file__).resolve().parents[1]
+        actor_source = (root / "verl" / "workers" / "actor" / "dp_actor.py").read_text()
+        worker_source = (root / "verl" / "workers" / "fsdp_workers.py").read_text()
+
+        update_policy = actor_source[
+            actor_source.index("    def update_policy("):
+            actor_source.index("        return metrics", actor_source.index("    def update_policy("))
+        ]
+        last_grpo_step = update_policy.index("grad_norm = self._optimizer_step()")
+        optimizer_offload = update_policy.index(
+            "offload_fsdp_optimizer(self.actor_optimizer)"
+        )
+        correction_start = update_policy.index(
+            "# Conditional correction is deliberately not another GRPO epoch"
+        )
+        self.assertLess(last_grpo_step, optimizer_offload)
+        self.assertLess(optimizer_offload, correction_start)
+        self.assertIn(
+            "micro_batch.select(*grpo_select_keys).cuda()",
+            update_policy,
+        )
+        self.assertIn(
+            "state_chunk = self._eitr_chunk_to_cuda(state_chunk)",
+            update_policy,
+        )
+
+        chunk_helper = actor_source[
+            actor_source.index("    def _eitr_chunk_to_cuda"):
+            actor_source.index("    def _snapshot_eitr_local_state")
+        ]
+        self.assertIn("state_chunk.select(*EITR_BATCH_KEYS).cuda()", chunk_helper)
+
+        worker_update = worker_source[
+            worker_source.index("    def update_actor("):
+            worker_source.index("    def compute_log_prob(")
+        ]
+        self.assertIn(
+            "data.to('cpu' if self._is_offload_batch else 'cuda')",
+            worker_update,
+        )
+        self.assertIn("if not self._is_offload_batch:", worker_update)
+        self.assertIn("load_fsdp_optimizer(", worker_update)
+        self.assertIn("timing_s/actor_optimizer_load_before_grpo", worker_update)
 
     def test_audit_failure_is_logged_before_raise_and_skips_side_effects(self):
         source = (

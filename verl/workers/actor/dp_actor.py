@@ -16,6 +16,7 @@ Single Process Actor
 """
 
 import itertools
+import time
 from contextlib import contextmanager
 from typing import Iterable, Tuple
 
@@ -50,6 +51,7 @@ from verl.trainer.ppo.eitr import (
 )
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
+from verl.utils.fsdp_utils import offload_fsdp_optimizer
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
@@ -102,6 +104,9 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
+        self.offload_actor_optimizer_after_grpo = bool(
+            self.config.fsdp_config.get('optimizer_offload', False)
+        )
         self.grpo_optimizer_steps_completed = 0
         self.eitr_optimizer_steps_completed = 0
         validate_eitr_optimization_schedule(
@@ -130,7 +135,7 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _forward_micro_batch(self, micro_batch, temperature, compute_entropy=True) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns: 
+        Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
@@ -417,6 +422,11 @@ class DataParallelPPOActor(BasePPOActor):
             )
             yield from rollout_micro_batch.split(states_per_probe_chunk)
 
+    @staticmethod
+    def _eitr_chunk_to_cuda(state_chunk):
+        """Move only cached-probe fields for the current state chunk to GPU."""
+        return state_chunk.select(*EITR_BATCH_KEYS).cuda()
+
     def _snapshot_eitr_local_state(self):
         """Save only each rank's FSDP-local shard and correction gradient on CPU."""
         snapshot = []
@@ -498,7 +508,9 @@ class DataParallelPPOActor(BasePPOActor):
                 continue
             for state_chunk in self._iter_eitr_state_chunks(mini_batch):
                 result = self._compute_eitr_micro_batch(
-                    state_chunk.cuda(), temperature, track_model_grad=False
+                    self._eitr_chunk_to_cuda(state_chunk),
+                    temperature,
+                    track_model_grad=False,
                 )
                 if result is not None:
                     js_sum += result['js_sum']
@@ -540,7 +552,7 @@ class DataParallelPPOActor(BasePPOActor):
         query_sample_grad_energy = -1.0
         for mini_batch in dataloader:
             for state_chunk in self._iter_eitr_state_chunks(mini_batch):
-                state_chunk = state_chunk.cuda()
+                state_chunk = self._eitr_chunk_to_cuda(state_chunk)
                 result = self._compute_eitr_micro_batch(
                     state_chunk, temperature, track_model_grad=build_grad
                 )
@@ -1597,6 +1609,7 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('loss_mask')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        grpo_select_keys = tuple(select_keys)
         if self.eitr_uses_probes:
             select_keys.extend(EITR_BATCH_KEYS)
         batch = data.select(batch_keys=select_keys).batch
@@ -1679,7 +1692,11 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.zero_grad()
 
                 for micro_batch in micro_batches:
-                    micro_batch = micro_batch.cuda()  # actor tensors may live on CPU under offload
+                    # Formal runs keep the full rollout/probe cache on CPU.
+                    # Stream only tensors consumed by the current GRPO forward;
+                    # cached K-probe tensors are loaded later, one state chunk
+                    # at a time, by ``_eitr_chunk_to_cuda``.
+                    micro_batch = micro_batch.select(*grpo_select_keys).cuda()
                     responses = micro_batch['responses']
                     response_length = responses.size(1)
                     attention_mask = micro_batch['attention_mask']
@@ -1735,6 +1752,31 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/ppo_epoch': float(ppo_epoch),
                     f'actor/grad_norm_pass_{ppo_epoch}': grad_norm.detach().item(),
                 })
+
+        optimizer_offload_seconds = 0.0
+        optimizer_offloaded_for_eitr = False
+        if self.eitr_uses_probes:
+            # GRPO has already consumed these gradients. Release them before
+            # moving AdamW moments so the transition itself has maximum room.
+            self.actor_optimizer.zero_grad()
+        if self.eitr_uses_probes and self.offload_actor_optimizer_after_grpo:
+            # AdamW moments are not consumed by the independent stateless EITR
+            # SGD.  Keep them on CPU from the end of all GRPO passes until the
+            # next outer update loads them again in the FSDP worker.
+            torch.cuda.synchronize()
+            offload_start = time.perf_counter()
+            offload_fsdp_optimizer(self.actor_optimizer)
+            torch.cuda.synchronize()
+            optimizer_offload_seconds = time.perf_counter() - offload_start
+            optimizer_offloaded_for_eitr = True
+        append_to_dict(metrics, {
+            'actor/optimizer_state_offloaded_for_eitr': float(
+                optimizer_offloaded_for_eitr
+            ),
+            'timing_s/actor_optimizer_offload_after_grpo': float(
+                optimizer_offload_seconds
+            ),
+        })
 
         # Conditional correction is deliberately not another GRPO epoch. This
         # avoids giving EITR/Probe-GRPO an extra reward-bearing policy update.
@@ -1848,7 +1890,7 @@ class DataParallelPPOActor(BasePPOActor):
                             continue
 
                         for state_chunk in self._iter_eitr_state_chunks(mini_batch):
-                            state_chunk = state_chunk.cuda()
+                            state_chunk = self._eitr_chunk_to_cuda(state_chunk)
                             eitr_result = self._compute_eitr_micro_batch(
                                 state_chunk,
                                 temperature,

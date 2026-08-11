@@ -89,6 +89,8 @@ SHUFFLE_TRAIN_DATALOADER="${SHUFFLE_TRAIN_DATALOADER:-false}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
 ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"
+ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-false}"
+ACTOR_BATCH_OFFLOAD="${ACTOR_BATCH_OFFLOAD:-false}"
 REF_FSDP_PARAM_OFFLOAD="${REF_FSDP_PARAM_OFFLOAD:-false}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-8192}"
 MAX_PROBE_PROMPT_TOKENS="${MAX_PROBE_PROMPT_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
@@ -114,7 +116,11 @@ case "$SHUFFLE_TRAIN_DATALOADER" in
         ;;
 esac
 
-for offload_value in "$ACTOR_FSDP_PARAM_OFFLOAD" "$REF_FSDP_PARAM_OFFLOAD"; do
+for offload_value in \
+    "$ACTOR_FSDP_PARAM_OFFLOAD" \
+    "$ACTOR_FSDP_OPTIMIZER_OFFLOAD" \
+    "$ACTOR_BATCH_OFFLOAD" \
+    "$REF_FSDP_PARAM_OFFLOAD"; do
     case "$offload_value" in
         true|false) ;;
         *)
@@ -328,7 +334,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.state_masking=true \
     actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_FSDP_PARAM_OFFLOAD" \
     actor_rollout_ref.actor.fsdp_config.grad_offload=false \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload="$ACTOR_FSDP_OPTIMIZER_OFFLOAD" \
+    actor_rollout_ref.actor.fsdp_config.batch_offload="$ACTOR_BATCH_OFFLOAD" \
     actor_rollout_ref.actor.eitr.mode="$EITR_MODE" \
     actor_rollout_ref.actor.eitr.probe_source=online_same_state \
     actor_rollout_ref.actor.eitr.probe_probability="$EITR_PROBE_PROBABILITY" \

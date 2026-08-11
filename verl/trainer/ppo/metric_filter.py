@@ -32,6 +32,8 @@ CORE_METRIC_NAMES = {
     "actor/eitr_env_drift_delta",
     "actor/eitr_env_drift_relative_reduction",
     "actor/eitr_post_diagnostic_ran",
+    "actor/optimizer_state_offloaded_for_eitr",
+    "actor/batch_cpu_streaming",
     # Optimization stability.
     "actor/kl_loss",
     "actor/pg_loss",
@@ -43,6 +45,8 @@ CORE_METRIC_NAMES = {
     "timing_s/step",
     "timing_s/gen",
     "timing_s/update_actor",
+    "timing_s/actor_optimizer_offload_after_grpo",
+    "timing_s/actor_optimizer_load_before_grpo",
 }
 
 CORE_METRIC_PREFIXES = (

@@ -33,6 +33,10 @@ class MetricFilterTest(unittest.TestCase):
             "reward/zero_rate": 0.3,
             "collector/internal_counter": 7.0,
             "actor/eitr_pass_1_log_ratio_abs_max": 0.4,
+            "actor/optimizer_state_offloaded_for_eitr": 1.0,
+            "actor/batch_cpu_streaming": 1.0,
+            "timing_s/actor_optimizer_offload_after_grpo": 3.0,
+            "timing_s/actor_optimizer_load_before_grpo": 2.0,
         }
         self.assertEqual(
             METRIC_FILTER.filter_metrics_for_logging(metrics, "core"),
@@ -43,6 +47,10 @@ class MetricFilterTest(unittest.TestCase):
                 "env/trajectory_valid_search_rate": 0.4,
                 "val/test_score/nq": 0.2,
                 "reward/zero_rate": 0.3,
+                "actor/optimizer_state_offloaded_for_eitr": 1.0,
+                "actor/batch_cpu_streaming": 1.0,
+                "timing_s/actor_optimizer_offload_after_grpo": 3.0,
+                "timing_s/actor_optimizer_load_before_grpo": 2.0,
             },
         )
 

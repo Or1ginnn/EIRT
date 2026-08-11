@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import time
 import warnings
 
 import torch
@@ -85,6 +86,7 @@ class ActorRolloutRefWorker(Worker):
         self._is_offload_param = False
         self._is_offload_grad = False
         self._is_offload_optimizer = False
+        self._is_offload_batch = False
         self._is_ref_offload_param = bool(
             self._is_ref
             and self.config.ref.fsdp_config.get('param_offload', False)
@@ -97,6 +99,7 @@ class ActorRolloutRefWorker(Worker):
             self._is_offload_param = self.config.actor.fsdp_config.get('param_offload', False)
             self._is_offload_grad = self.config.actor.fsdp_config.get('grad_offload', False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get('optimizer_offload', False)
+            self._is_offload_batch = self.config.actor.fsdp_config.get('batch_offload', False)
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self._is_ref_offload_param
@@ -376,17 +379,27 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
-        data = data.to('cuda')
+        # With batch offload, keep rollout and cached-probe tensors on CPU.
+        # DataParallelPPOActor streams only the current GRPO micro-batch or
+        # EITR state chunk to CUDA, instead of pinning the whole 160-rollout
+        # batch and every K-probe cache on the training GPUs.
+        data = data.to('cpu' if self._is_offload_batch else 'cuda')
 
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
+        optimizer_load_seconds = 0.0
         if self._is_offload_optimizer:
+            torch.cuda.synchronize()
+            optimizer_load_start = time.perf_counter()
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+            torch.cuda.synchronize()
+            optimizer_load_seconds = time.perf_counter() - optimizer_load_start
 
-        data.batch = data.batch.cuda()
+        if not self._is_offload_batch:
+            data.batch = data.batch.cuda()
 
         log_gpu_memory_usage('Before update policy', logger=logger)
 
@@ -408,6 +421,10 @@ class ActorRolloutRefWorker(Worker):
             self.actor_lr_scheduler.step()
             metrics['actor/lr'] = lr_used
             metrics['actor/lr_next_outer_update'] = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/batch_cpu_streaming'] = float(self._is_offload_batch)
+            metrics['timing_s/actor_optimizer_load_before_grpo'] = float(
+                optimizer_load_seconds
+            )
 
             log_gpu_memory_usage('After update policy', logger=logger)
 
@@ -448,7 +465,7 @@ class ActorRolloutRefWorker(Worker):
             old_log_probs = self.actor.compute_log_prob(data=data)
             output = DataProto.from_dict(tensors={'old_log_probs': old_log_probs})
             output = self.ulysses_sharding_manager.postprocess_data(output)
-            
+
         output = output.to('cpu')
 
         if self._is_offload_param:
@@ -458,7 +475,7 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
-        
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')

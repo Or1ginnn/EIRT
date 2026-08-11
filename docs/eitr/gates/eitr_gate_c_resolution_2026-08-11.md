@@ -293,6 +293,28 @@ Gate C PASS 后首次启动混合 NQ+HotpotQA 正式训练，第一批长轨迹�
 run、W&B ID、update 1/2状态和显存峰值另行补录；不能仅凭代码测试声称8000步已经
 完成。
 
+第二次正式启动确认 `REF_FSDP_PARAM_OFFLOAD=true` 已生效，并成功越过普通 GRPO
+update，但在 `EITR correction_loss.backward()` 再次 OOM：
+
+- HEAD：`126d07d0ac809d9e6353a0ccf15b1be1303bd809`；
+- W&B：`dmqocdgb`；
+- 日志：`/mnt/data1/zar/eitr_storage/logs/eitr-nq-hotpotqa-v03-full-lr3e5-ref-offload-v1.log`；
+- 物理 GPU3 上训练进程约 `64.38 GB`，Retriever约 `11.97 GB`，既有zx进程约
+  `1.06 GB`；
+- 剩余约 `1.78 GB`，correction backward 还需约 `1.99 GB`。
+
+这进一步把峰值定位到EITR反向，而不是GRPO或reference模型。随后采用两层、仅改变
+张量驻留位置的修复：
+
+1. 完成全部GRPO AdamW steps后，将EITR不使用的一阶/二阶AdamW optimizer states
+   暂存CPU；下一outer update的GRPO前再自动载回；
+2. 完整rollout与cached-probe batch常驻CPU；GRPO只流式加载当前micro-batch，EITR
+   只流式加载当前state的K条probe。
+
+正式配置仍保持actor参数常驻GPU、reference参数CPU offload、train batch=32、K=4、
+probe micro-batch=4、同一loss/reward/LR/lambda。新增W&B指标分别记录batch streaming
+开关以及AdamW state的load/offload耗时，用于量化该显存修复的速度代价。
+
 ## 7. 这次 PASS 能证明和不能证明什么
 
 ### 已经证明

@@ -103,6 +103,9 @@ actor_rollout_ref:
       param_offload: False
       grad_offload: False
       optimizer_offload: False
+      # Keep rollout/probe tensors on CPU and stream only the active
+      # GRPO micro-batch or EITR state chunk to the actor GPU.
+      batch_offload: False
       fsdp_size: -1
   ref:
     fsdp_config:

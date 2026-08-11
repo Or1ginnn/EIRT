@@ -25,10 +25,12 @@ export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-256}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 export PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"
-# The retriever shares the training GPUs on this deployment.  Offload inactive
-# FSDP parameters so the reference module does not consume the final few GiB
-# needed by long-sequence actor backward.
+# The retriever shares the training GPUs on this deployment. Keep the actor
+# resident, but offload the inactive reference, stream rollout/probe batches
+# from CPU, and park AdamW moments on CPU during independent EITR backward.
 export ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"
+export ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-true}"
+export ACTOR_BATCH_OFFLOAD="${ACTOR_BATCH_OFFLOAD:-true}"
 export REF_FSDP_PARAM_OFFLOAD="${REF_FSDP_PARAM_OFFLOAD:-true}"
 # Cached-old and current probe scores must use the same chunking.  Keep the
 # formal default conservative because current scoring now runs in eval mode
