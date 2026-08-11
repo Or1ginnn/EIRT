@@ -30,6 +30,7 @@ from verl.trainer.ppo.eitr import (
     EITR_BATCH_KEYS,
     bounded_quantile_sample_stride,
     cached_probe_fingerprint,
+    compacted_state_forward_plan,
     directional_descent_diagnostics,
     eitr_loss_enabled_for_pass,
     eitr_score_path_noop_direction_audit_enabled,
@@ -104,6 +105,10 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.ppo_epochs = int(self.config.get('ppo_epochs', 1))
         self.eitr_correction_passes = int(self.eitr_config.get('correction_passes', 1))
+        compact_invalid_states = self.eitr_config.get('compact_invalid_states', True)
+        if isinstance(compact_invalid_states, str):
+            compact_invalid_states = compact_invalid_states.strip().lower() == 'true'
+        self.eitr_compact_invalid_states = bool(compact_invalid_states)
         self.offload_actor_optimizer_after_grpo = bool(
             self.config.fsdp_config.get('optimizer_offload', False)
         )
@@ -422,6 +427,120 @@ class DataParallelPPOActor(BasePPOActor):
             )
             yield from rollout_micro_batch.split(states_per_probe_chunk)
 
+    def _prepare_eitr_correction_state_chunks(self, dataloader, *, distributed):
+        """Drop invalid online states while preserving rank-symmetric FSDP calls."""
+
+        probe_source = str(self.eitr_config.get('probe_source', 'online_same_state'))
+        if not self.eitr_compact_invalid_states or probe_source != 'online_same_state':
+            state_chunks = [
+                state_chunk
+                for mini_batch in dataloader
+                for state_chunk in self._iter_eitr_state_chunks(mini_batch)
+            ]
+            physical_count = sum(
+                int(mini_batch['eitr_state_valid'].numel()) for mini_batch in dataloader
+            )
+            return state_chunks, {
+                'actor/eitr_state_compaction_enabled': 0.0,
+                'actor/eitr_physical_state_count_before_compaction': float(physical_count),
+                'actor/eitr_compacted_state_forward_count': float(physical_count),
+                'actor/eitr_dummy_state_forward_count': float(
+                    physical_count
+                    - sum(
+                        int(mini_batch['eitr_state_valid'].sum().item())
+                        for mini_batch in dataloader
+                    )
+                ),
+                'actor/eitr_state_forward_reduction_rate': 0.0,
+            }
+
+        active_rows = []
+        dummy_row = None
+        local_physical_count = 0
+        for mini_batch in dataloader:
+            state_valid = mini_batch['eitr_state_valid'].bool()
+            state_slot = mini_batch['eitr_state_slot'].bool()
+            if bool((state_valid & ~state_slot).any().item()):
+                raise RuntimeError('EITR valid state is missing its physical slot')
+            local_physical_count += int(state_valid.numel())
+            for row_index in torch.nonzero(state_valid, as_tuple=False).flatten().tolist():
+                active_rows.append(mini_batch[row_index:row_index + 1])
+            if dummy_row is None:
+                dummy_indices = torch.nonzero(
+                    state_slot & ~state_valid, as_tuple=False
+                ).flatten()
+                if int(dummy_indices.numel()) > 0:
+                    row_index = int(dummy_indices[0].item())
+                    dummy_row = mini_batch[row_index:row_index + 1]
+
+        local_active_count = len(active_rows)
+        count_tensor = torch.tensor(
+            [float(local_active_count), float(local_physical_count)],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        max_counts = count_tensor.clone()
+        min_physical_count = count_tensor[1].clone()
+        if distributed:
+            torch.distributed.all_reduce(max_counts, op=torch.distributed.ReduceOp.MAX)
+            torch.distributed.all_reduce(
+                min_physical_count, op=torch.distributed.ReduceOp.MIN
+            )
+        max_active_count = int(max_counts[0].item())
+        max_physical_count = int(max_counts[1].item())
+        if int(min_physical_count.item()) != max_physical_count:
+            raise RuntimeError(
+                'EITR compaction requires equal physical rollout rows on every FSDP rank'
+            )
+
+        probe_count = int(dataloader[0]['eitr_probe_valid'].size(1))
+        probe_micro_batch_size = int(
+            self.eitr_config.get('probe_micro_batch_size', 4)
+        )
+        states_per_chunk = max(probe_micro_batch_size // probe_count, 1)
+        plan = compacted_state_forward_plan(
+            local_active_count=local_active_count,
+            local_physical_count=local_physical_count,
+            max_active_count=max_active_count,
+            states_per_chunk=states_per_chunk,
+        )
+        target_state_count = int(plan['target_state_count'])
+
+        if target_state_count > local_active_count:
+            if dummy_row is None:
+                if not active_rows:
+                    raise RuntimeError(
+                        'EITR compaction could not construct a rank-symmetric dummy state'
+                    )
+                # This only covers the generic all-active, odd-tail case. Keep
+                # the real cached tensors but zero every applicability mask.
+                dummy_row = active_rows[0].clone()
+                dummy_row['eitr_state_valid'].zero_()
+                dummy_row['eitr_probe_valid'].zero_()
+                dummy_row['eitr_probe_response_mask'].zero_()
+            active_rows.extend(
+                [dummy_row] * (target_state_count - local_active_count)
+            )
+
+        state_chunks = []
+        for start in range(0, target_state_count, states_per_chunk):
+            rows = active_rows[start:start + states_per_chunk]
+            state_chunks.append(rows[0] if len(rows) == 1 else torch.cat(rows, dim=0))
+        if len(state_chunks) != int(plan['chunk_count']):
+            raise RuntimeError('EITR compaction produced an inconsistent chunk count')
+
+        return state_chunks, {
+            'actor/eitr_state_compaction_enabled': 1.0,
+            'actor/eitr_physical_state_count_before_compaction': float(
+                local_physical_count
+            ),
+            'actor/eitr_compacted_state_forward_count': float(target_state_count),
+            'actor/eitr_dummy_state_forward_count': float(plan['dummy_state_count']),
+            'actor/eitr_state_forward_reduction_rate': float(
+                plan['forward_reduction_rate']
+            ),
+        }
+
     @staticmethod
     def _eitr_chunk_to_cuda(state_chunk):
         """Move only cached-probe fields for the current state chunk to GPU."""
@@ -490,10 +609,39 @@ class DataParallelPPOActor(BasePPOActor):
             torch.distributed.all_reduce(tensor, op=op)
         return float(tensor.item())
 
-    def _score_cached_eitr_drift(self, dataloader, temperature, *, distributed):
+    def _score_cached_eitr_drift(
+        self,
+        dataloader,
+        temperature,
+        *,
+        distributed,
+        state_chunks=None,
+    ):
         """Re-score exactly the existing cached probes without gradient or retrieval."""
         js_sum = 0.0
         state_count = 0.0
+        if state_chunks is not None:
+            for state_chunk in state_chunks:
+                result = self._compute_eitr_micro_batch(
+                    self._eitr_chunk_to_cuda(state_chunk),
+                    temperature,
+                    track_model_grad=False,
+                )
+                if result is not None:
+                    js_sum += result['js_sum']
+                    state_count += result['valid_state_count']
+                del result
+            result_tensor = torch.tensor(
+                [js_sum, state_count],
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            if distributed:
+                torch.distributed.all_reduce(
+                    result_tensor, op=torch.distributed.ReduceOp.SUM
+                )
+            return result_tensor
+
         for mini_batch in dataloader:
             mini_global_state_count = torch.tensor(
                 float(mini_batch['eitr_state_valid'].sum().item()),
@@ -1867,6 +2015,12 @@ class DataParallelPPOActor(BasePPOActor):
                     eitr_correction_optimizer_step_count += 1
                 score_path_noop_direction_audit_ran = True
             elif global_active_state_count.item() > 0:
+                correction_state_chunks, compaction_metrics = (
+                    self._prepare_eitr_correction_state_chunks(
+                        dataloader, distributed=distributed
+                    )
+                )
+                append_to_dict(metrics, compaction_metrics)
                 for correction_index in range(self.eitr_correction_passes):
                     pass_index = self.ppo_epochs + correction_index
                     probe_forward_enabled = eitr_probe_enabled_for_pass(
@@ -1886,109 +2040,95 @@ class DataParallelPPOActor(BasePPOActor):
                         self.eitr_optimizer.zero_grad()
                     local_applied_grad_sq = 0.0
 
-                    for mini_batch in dataloader:
-                        mini_global_state_count = torch.tensor(
-                            float(mini_batch['eitr_state_valid'].sum().item()),
-                            dtype=torch.float64,
-                            device=torch.cuda.current_device(),
+                    for state_chunk in correction_state_chunks:
+                        state_chunk = self._eitr_chunk_to_cuda(state_chunk)
+                        eitr_result = self._compute_eitr_micro_batch(
+                            state_chunk,
+                            temperature,
+                            track_model_grad=eitr_loss_enabled,
                         )
-                        if distributed:
-                            torch.distributed.all_reduce(
-                                mini_global_state_count,
-                                op=torch.distributed.ReduceOp.SUM,
-                            )
-                        if mini_global_state_count.item() <= 0:
+                        if eitr_result is None:
                             continue
 
-                        for state_chunk in self._iter_eitr_state_chunks(mini_batch):
-                            state_chunk = self._eitr_chunk_to_cuda(state_chunk)
-                            eitr_result = self._compute_eitr_micro_batch(
-                                state_chunk,
-                                temperature,
-                                track_model_grad=eitr_loss_enabled,
-                            )
-                            if eitr_result is None:
-                                continue
-
-                            valid_state_count = eitr_result['valid_state_count']
-                            # Every chunk is normalized by the same full rollout
-                            # denominator. Gradients accumulate over all mini-batches
-                            # before the single V6 correction step.
-                            state_weight = coverage_weighted_state_scale(
-                                valid_state_count,
-                                float(global_rollout_state_count.item()),
-                                world_size=eitr_world_size,
-                            )
-                            raw_logprob_grad = torch.autograd.grad(
-                                eitr_result['loss'],
-                                eitr_result['current_seq_logp'],
-                                retain_graph=eitr_loss_enabled,
-                                allow_unused=True,
-                            )[0]
-                            raw_grad_sq = (
-                                float(raw_logprob_grad.detach().float().square().sum().item())
-                                if raw_logprob_grad is not None
-                                else 0.0
-                            )
-                            if (
-                                self.eitr_update_direction_diagnostic
-                                and query_logprob_direction_sample is None
-                                and raw_logprob_grad is not None
-                                and valid_state_count > 0
-                            ):
-                                state_slot = state_chunk['eitr_state_slot'].bool()
-                                state_valid = state_chunk['eitr_state_valid'][state_slot].bool()
-                                if state_valid.any():
-                                    query_logprob_direction_sample = tuple(
-                                        value.detach().to(device='cpu', copy=True)
-                                        for value in (
-                                            eitr_result['current_seq_logp'][state_valid],
-                                            raw_logprob_grad[state_valid],
-                                            state_chunk['eitr_probe_old_seq_logp'][state_slot][state_valid],
-                                            state_chunk['eitr_probe_doc_probs'][state_slot][state_valid],
-                                            state_chunk['eitr_probe_valid'][state_slot][state_valid],
-                                        )
+                        valid_state_count = eitr_result['valid_state_count']
+                        # Every chunk is normalized by the same full rollout
+                        # denominator. Gradients accumulate over all state
+                        # chunks before the single V6 correction step.
+                        state_weight = coverage_weighted_state_scale(
+                            valid_state_count,
+                            float(global_rollout_state_count.item()),
+                            world_size=eitr_world_size,
+                        )
+                        raw_logprob_grad = torch.autograd.grad(
+                            eitr_result['loss'],
+                            eitr_result['current_seq_logp'],
+                            retain_graph=eitr_loss_enabled,
+                            allow_unused=True,
+                        )[0]
+                        raw_grad_sq = (
+                            float(raw_logprob_grad.detach().float().square().sum().item())
+                            if raw_logprob_grad is not None
+                            else 0.0
+                        )
+                        if (
+                            self.eitr_update_direction_diagnostic
+                            and query_logprob_direction_sample is None
+                            and raw_logprob_grad is not None
+                            and valid_state_count > 0
+                        ):
+                            state_slot = state_chunk['eitr_state_slot'].bool()
+                            state_valid = state_chunk['eitr_state_valid'][state_slot].bool()
+                            if state_valid.any():
+                                query_logprob_direction_sample = tuple(
+                                    value.detach().to(device='cpu', copy=True)
+                                    for value in (
+                                        eitr_result['current_seq_logp'][state_valid],
+                                        raw_logprob_grad[state_valid],
+                                        state_chunk['eitr_probe_old_seq_logp'][state_slot][state_valid],
+                                        state_chunk['eitr_probe_doc_probs'][state_slot][state_valid],
+                                        state_chunk['eitr_probe_valid'][state_slot][state_valid],
                                     )
-                            applied_scale = (
-                                self.eitr_lambda_env * state_weight
-                                if eitr_loss_enabled and valid_state_count > 0
-                                else 0.0
+                                )
+                        applied_scale = (
+                            self.eitr_lambda_env * state_weight
+                            if eitr_loss_enabled and valid_state_count > 0
+                            else 0.0
+                        )
+                        applied_grad_sq = raw_grad_sq * applied_scale * applied_scale
+                        local_applied_grad_sq += applied_grad_sq
+
+                        stats = pass_stats[pass_index]
+                        stats['raw_grad_sq_sum'] += raw_grad_sq
+                        stats['applied_grad_sq_sum'] += applied_grad_sq
+                        if valid_state_count > 0:
+                            stats['js_sum'] += eitr_result['js_sum']
+                            stats['state_count'] += valid_state_count
+                            stats['probe_count'] += eitr_result['valid_probe_count']
+                            stats['ess_sum'] += eitr_result['ess_mean'] * valid_state_count
+                            stats['clipfrac_sum'] += (
+                                eitr_result['log_ratio_clipfrac'] * valid_state_count
                             )
-                            applied_grad_sq = raw_grad_sq * applied_scale * applied_scale
-                            local_applied_grad_sq += applied_grad_sq
+                            stats['active_micro_batch_count'] += 1
+                            stats['log_ratio_abs_max'] = max(
+                                stats['log_ratio_abs_max'],
+                                eitr_result['log_ratio_abs_max'],
+                            )
+                        append_to_dict(metrics, {
+                            'actor/eitr_induced_js': eitr_result['js_mean'],
+                            'actor/eitr_probe_ess': eitr_result['ess_mean'],
+                            'actor/eitr_log_ratio_abs_max': eitr_result['log_ratio_abs_max'],
+                            'actor/eitr_log_ratio_clipfrac': eitr_result['log_ratio_clipfrac'],
+                            'actor/eitr_correction_pass': float(correction_index),
+                            'actor/eitr_state_chunk_size': float(
+                                state_chunk['eitr_state_slot'].size(0)
+                            ),
+                        })
 
-                            stats = pass_stats[pass_index]
-                            stats['raw_grad_sq_sum'] += raw_grad_sq
-                            stats['applied_grad_sq_sum'] += applied_grad_sq
-                            if valid_state_count > 0:
-                                stats['js_sum'] += eitr_result['js_sum']
-                                stats['state_count'] += valid_state_count
-                                stats['probe_count'] += eitr_result['valid_probe_count']
-                                stats['ess_sum'] += eitr_result['ess_mean'] * valid_state_count
-                                stats['clipfrac_sum'] += (
-                                    eitr_result['log_ratio_clipfrac'] * valid_state_count
-                                )
-                                stats['active_micro_batch_count'] += 1
-                                stats['log_ratio_abs_max'] = max(
-                                    stats['log_ratio_abs_max'],
-                                    eitr_result['log_ratio_abs_max'],
-                                )
-                            append_to_dict(metrics, {
-                                'actor/eitr_induced_js': eitr_result['js_mean'],
-                                'actor/eitr_probe_ess': eitr_result['ess_mean'],
-                                'actor/eitr_log_ratio_abs_max': eitr_result['log_ratio_abs_max'],
-                                'actor/eitr_log_ratio_clipfrac': eitr_result['log_ratio_clipfrac'],
-                                'actor/eitr_correction_pass': float(correction_index),
-                                'actor/eitr_state_chunk_size': float(
-                                    state_chunk['eitr_state_slot'].size(0)
-                                ),
-                            })
-
-                            if eitr_loss_enabled:
-                                correction_loss = eitr_result['loss'] * applied_scale
-                                correction_loss.backward()
-                                del correction_loss
-                            del raw_logprob_grad, eitr_result
+                        if eitr_loss_enabled:
+                            correction_loss = eitr_result['loss'] * applied_scale
+                            correction_loss.backward()
+                            del correction_loss
+                        del raw_logprob_grad, eitr_result
 
                     if eitr_loss_enabled:
                         global_applied_grad_sq = torch.tensor(
@@ -2079,7 +2219,10 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         if post_diagnostic_ran:
                             post_drift_stat_tensor = self._score_cached_eitr_drift(
-                                dataloader, temperature, distributed=distributed
+                                dataloader,
+                                temperature,
+                                distributed=distributed,
+                                state_chunks=correction_state_chunks,
                             )
                             if int(post_drift_stat_tensor[1].item()) != int(
                                 global_active_state_count.item()

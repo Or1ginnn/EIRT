@@ -40,6 +40,7 @@ build_grpo_uids = EITR.build_grpo_uids
 build_eitr_correction_optimizer = EITR.build_eitr_correction_optimizer
 bounded_quantile_sample_stride = EITR.bounded_quantile_sample_stride
 coverage_weighted_state_scale = EITR.coverage_weighted_state_scale
+compacted_state_forward_plan = EITR.compacted_state_forward_plan
 induced_js_from_cached_effects = EITR.induced_js_from_cached_effects
 directional_parameter_candidates = EITR.directional_parameter_candidates
 directional_descent_diagnostics = EITR.directional_descent_diagnostics
@@ -115,6 +116,14 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertNotIn('$STORAGE_ROOT/ray_tmp/$EXPERIMENT_NAME', runner)
         self.assertIn(
             "EITR score-path audit requires METRICS_LEVEL=debug",
+            runner,
+        )
+        self.assertIn(
+            'EITR_COMPACT_INVALID_STATES="${EITR_COMPACT_INVALID_STATES:-true}"',
+            runner,
+        )
+        self.assertIn(
+            'actor_rollout_ref.actor.eitr.compact_invalid_states="$EITR_COMPACT_INVALID_STATES"',
             runner,
         )
 
@@ -433,6 +442,48 @@ class ObservationTruncationTest(unittest.TestCase):
 
 
 class EITRMathTest(unittest.TestCase):
+    def test_compacted_state_plan_pads_only_to_busiest_rank(self):
+        plan = compacted_state_forward_plan(
+            local_active_count=30,
+            local_physical_count=50,
+            max_active_count=34,
+            states_per_chunk=1,
+        )
+        self.assertEqual(plan["target_state_count"], 34.0)
+        self.assertEqual(plan["dummy_state_count"], 4.0)
+        self.assertEqual(plan["chunk_count"], 34.0)
+        self.assertAlmostEqual(plan["forward_reduction_rate"], 0.32)
+
+    def test_compacted_state_plan_rounds_to_complete_probe_chunks(self):
+        plan = compacted_state_forward_plan(
+            local_active_count=30,
+            local_physical_count=50,
+            max_active_count=33,
+            states_per_chunk=2,
+        )
+        self.assertEqual(plan["target_state_count"], 34.0)
+        self.assertEqual(plan["dummy_state_count"], 4.0)
+        self.assertEqual(plan["chunk_count"], 17.0)
+
+    def test_compacted_state_plan_handles_zero_active_batch(self):
+        plan = compacted_state_forward_plan(
+            local_active_count=0,
+            local_physical_count=50,
+            max_active_count=0,
+            states_per_chunk=1,
+        )
+        self.assertEqual(plan["target_state_count"], 0.0)
+        self.assertEqual(plan["chunk_count"], 0.0)
+
+    def test_compacted_state_plan_rejects_inconsistent_counts(self):
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            compacted_state_forward_plan(
+                local_active_count=31,
+                local_physical_count=30,
+                max_active_count=31,
+                states_per_chunk=1,
+            )
+
     def test_coverage_weighted_scale_tracks_rollout_coverage(self):
         self.assertEqual(coverage_weighted_state_scale(0, 160), 0.0)
         self.assertEqual(coverage_weighted_state_scale(40, 160), 0.25)

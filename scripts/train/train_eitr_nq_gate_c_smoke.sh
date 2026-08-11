@@ -56,6 +56,7 @@ EITR_LAMBDA_ENV="${EITR_LAMBDA_ENV:-0.1}"
 EITR_CORRECTION_PASSES="${EITR_CORRECTION_PASSES:-1}"
 EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"
 EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"
+EITR_COMPACT_INVALID_STATES="${EITR_COMPACT_INVALID_STATES:-true}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-500}"
 MAX_OBS_LENGTH="${MAX_OBS_LENGTH:-1024}"
 MAX_TRAJECTORY_LENGTH="${MAX_TRAJECTORY_LENGTH:-8192}"
@@ -129,11 +130,12 @@ for offload_value in \
     "$ACTOR_FSDP_PARAM_OFFLOAD" \
     "$ACTOR_FSDP_OPTIMIZER_OFFLOAD" \
     "$ACTOR_BATCH_OFFLOAD" \
-    "$REF_FSDP_PARAM_OFFLOAD"; do
+    "$REF_FSDP_PARAM_OFFLOAD" \
+    "$EITR_COMPACT_INVALID_STATES"; do
     case "$offload_value" in
         true|false) ;;
         *)
-            echo "FSDP param offload flags must be true or false; got: $offload_value" >&2
+            echo "Offload and EITR compaction flags must be true or false; got: $offload_value" >&2
             exit 2
             ;;
     esac
@@ -411,6 +413,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.eitr.probe_oversample=0 \
     actor_rollout_ref.actor.eitr.probe_micro_batch_size="$EITR_PROBE_MICRO_BATCH_SIZE" \
     actor_rollout_ref.actor.eitr.probe_logprob_micro_batch_size="$EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE" \
+    actor_rollout_ref.actor.eitr.compact_invalid_states="$EITR_COMPACT_INVALID_STATES" \
     actor_rollout_ref.actor.eitr.max_query_tokens="$EITR_MAX_QUERY_TOKENS" \
     actor_rollout_ref.actor.eitr.probe_seed=20260805 \
     actor_rollout_ref.actor.eitr.max_action_tokens="$EITR_MAX_QUERY_TOKENS" \

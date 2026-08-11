@@ -56,6 +56,9 @@ actor_rollout_ref:
       # sequences, not rollout states.
       probe_micro_batch_size: 4
       probe_logprob_micro_batch_size: 4
+      # Remove invalid rows before correction and pad only to the busiest FSDP
+      # rank. This changes neither active states nor the full-rollout loss.
+      compact_invalid_states: true
       # Match the real per-turn generation budget. At runtime each state uses
       # only the suffix budget remaining after reasoning + <search>.
       max_query_tokens: ${data.max_response_length}

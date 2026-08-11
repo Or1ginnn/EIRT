@@ -447,6 +447,56 @@ def coverage_weighted_state_scale(
     return valid_state_count * world_size / global_rollout_state_count
 
 
+def compacted_state_forward_plan(
+    *,
+    local_active_count: int,
+    local_physical_count: int,
+    max_active_count: int,
+    states_per_chunk: int,
+) -> Dict[str, float]:
+    """Plan rank-symmetric EITR forwards after removing invalid state rows.
+
+    FSDP ranks must execute the same number of model forwards/backwards.  Each
+    rank therefore keeps all of its active rows and pads only to the largest
+    active-row count observed across ranks, rounded to a complete probe chunk.
+    This replaces the old, much larger padding target of every rollout row.
+    """
+
+    local_active_count = int(local_active_count)
+    local_physical_count = int(local_physical_count)
+    max_active_count = int(max_active_count)
+    states_per_chunk = int(states_per_chunk)
+    if min(local_active_count, local_physical_count, max_active_count) < 0:
+        raise ValueError("EITR state counts must be non-negative")
+    if states_per_chunk <= 0:
+        raise ValueError("states_per_chunk must be positive")
+    if local_active_count > local_physical_count:
+        raise ValueError("local active states cannot exceed physical states")
+    if max_active_count < local_active_count:
+        raise ValueError("max active states cannot be smaller than the local count")
+    if max_active_count > local_physical_count:
+        raise ValueError("max active states cannot exceed equal per-rank physical states")
+
+    target_count = (
+        0
+        if max_active_count == 0
+        else int(math.ceil(max_active_count / states_per_chunk) * states_per_chunk)
+    )
+    dummy_count = target_count - local_active_count
+    chunk_count = target_count // states_per_chunk
+    reduction_rate = (
+        0.0
+        if local_physical_count == 0
+        else max(0.0, 1.0 - target_count / local_physical_count)
+    )
+    return {
+        "target_state_count": float(target_count),
+        "dummy_state_count": float(dummy_count),
+        "chunk_count": float(chunk_count),
+        "forward_reduction_rate": float(reduction_rate),
+    }
+
+
 def rollout_averaged_env_drift(js_sum: float, global_rollout_state_count: float) -> float:
     """Aggregate V6 environment drift with the full rollout denominator."""
     js_sum = float(js_sum)
