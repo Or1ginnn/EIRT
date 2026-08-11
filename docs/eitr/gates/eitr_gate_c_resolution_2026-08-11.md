@@ -88,7 +88,11 @@ L_EITR = lambda_env * (1 / B) * sum_i m_i * D_env_i
 ```
 
 - `lambda_env=0.1` 固定；
-- 当前正式 correction base LR 固定为 `3e-5`，并与 actor 共享 warmup factor；
+- GRPO actor 保留 Search-R1 的学习率 warmup：正式8000步预算中，actor LR
+  从0线性升至 `5e-7`，共286个outer updates；
+- EITR correction 不设置独立 warmup，也不共享 actor warmup factor；其
+  optimizer LR 从训练开始固定为 `3e-5`。早期 GRPO proposal drift 较小、有效
+  search coverage 较低时，EITR 的实际梯度和 coverage-weighted 作用会自然减弱；
 - correction 使用独立 `SGD(momentum=0, weight_decay=0)`；
 - GRPO AdamW 的 momentum、second moment 和 weight decay 不被 EITR 推进；
 - 没有有效 state 时严格退化为普通 GRPO。

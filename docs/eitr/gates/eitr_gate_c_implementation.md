@@ -255,9 +255,14 @@ bash scripts/train/train_eitr_nq_gate_c_full.sh
 默认每100步保存一次轻量模型checkpoint。手动中断不会额外保存中断时刻的权重，
 因此应尽量在100的整数倍checkpoint完成写盘后停止。
 
-8000步正式预算使用 `lr_warmup_steps_ratio=0.03575`，即286个outer updates。
-这保留Search-R1 v0.3原1005步配置中的约286步warmup，而不是保留0.285比例；
-后者会把两卡EITR的warmup错误拉长到2280步。
+8000步正式预算中，GRPO actor 使用 `lr_warmup_steps_ratio=0.03575`，即286个
+outer updates。这保留Search-R1 v0.3原1005步配置中的约286步actor warmup，
+而不是保留0.285比例；后者会把actor warmup错误拉长到2280步。
+
+独立 EITR SGD correction 不使用这条 warmup schedule：`EITR_LR=3e-5` 从训练
+开始保持固定。Gate C 最终方向审计同样在固定 `EITR_LR=3e-5` 下通过。正式训练
+早期的 EITR 实际作用由 GRPO proposal drift 与 rollout coverage 自然控制，而不是
+再次对 correction LR 乘 actor warmup factor。
 
 ## 8. Safety smoke 验收
 
