@@ -198,11 +198,11 @@ def resolved_query_direction_candidates(
     The parameter-space audit epsilon is far too small for sequence log-probs
     whose magnitude is often in the hundreds.  This helper normalizes by the
     largest gradient coordinate and increases the requested log-prob movement
-    until float32 represents both directions for almost all gradient energy.
+    until the working dtype represents both directions for almost all gradient energy.
     It never changes the estimator or the model parameters.
     """
-    current = current.detach().float()
-    gradient = gradient.detach().float()
+    current = current.detach().double()
+    gradient = gradient.detach().double()
     if current.shape != gradient.shape:
         raise ValueError("current and gradient must have identical shapes")
     if not torch.isfinite(current).all() or not torch.isfinite(gradient).all():
@@ -283,6 +283,80 @@ def directional_descent_diagnostics(
         "plus_margin": plus_margin,
         "noise": noise,
         "pass": float(minus_margin > noise and plus_margin > noise),
+    }
+
+
+def proposal_signal_diagnostics(
+    *,
+    d_old: float,
+    d_pre: float,
+    noop_jitter: float,
+    zero_noop_abs_error: float,
+    actor_lr: float,
+    absolute_floor: float = 1e-10,
+    floor_multiplier: float = 10.0,
+) -> Dict[str, float]:
+    """Decide whether a GRPO proposal created resolvable environment drift.
+
+    Directional descent is undefined at the exact old-policy anchor because JS
+    is already minimized and its true gradient is zero.  Treat that case as an
+    inconclusive no-signal audit instead of manufacturing a direction from
+    finite-precision noise.
+    """
+    values = {
+        "d_old": float(d_old),
+        "d_pre": float(d_pre),
+        "noop_jitter": float(noop_jitter),
+        "zero_noop_abs_error": float(zero_noop_abs_error),
+        "actor_lr": float(actor_lr),
+        "absolute_floor": float(absolute_floor),
+        "floor_multiplier": float(floor_multiplier),
+    }
+    if not all(math.isfinite(value) for value in values.values()):
+        raise ValueError("proposal signal diagnostic inputs must be finite")
+    if min(
+        values["noop_jitter"],
+        values["zero_noop_abs_error"],
+        values["actor_lr"],
+        values["absolute_floor"],
+        values["floor_multiplier"],
+    ) < 0:
+        raise ValueError("proposal signal diagnostic scales must be non-negative")
+
+    score_mode_tolerance = max(
+        values["absolute_floor"],
+        3.0 * values["noop_jitter"],
+    )
+    score_mode_pass = bool(
+        values["zero_noop_abs_error"] <= score_mode_tolerance
+    )
+    numerical_floor = max(
+        abs(values["d_old"]),
+        values["noop_jitter"],
+        values["zero_noop_abs_error"],
+        values["absolute_floor"],
+    )
+    signal = max(
+        max(values["d_pre"], 0.0) - max(values["d_old"], 0.0),
+        0.0,
+    )
+    required_signal = values["floor_multiplier"] * numerical_floor
+    signal_pass = bool(
+        score_mode_pass
+        and values["actor_lr"] > 0
+        and values["d_pre"] > 0
+        and signal > required_signal
+    )
+    return {
+        "signal": signal,
+        "numerical_floor": numerical_floor,
+        "score_mode_tolerance": score_mode_tolerance,
+        "score_mode_pass": float(score_mode_pass),
+        "required_signal": required_signal,
+        "signal_to_floor_ratio": signal / max(numerical_floor, 1e-300),
+        "actor_lr_positive": float(values["actor_lr"] > 0),
+        "pass": float(signal_pass),
+        "no_signal": float(score_mode_pass and not signal_pass),
     }
 
 
@@ -868,7 +942,7 @@ def build_sibling_probe_tensors(
         "eitr_probe_response_mask": torch.zeros(
             (batch_size, probe_count, max_action_tokens), dtype=torch.long
         ),
-        "eitr_probe_old_seq_logp": torch.zeros((batch_size, probe_count), dtype=torch.float32),
+        "eitr_probe_old_seq_logp": torch.zeros((batch_size, probe_count), dtype=torch.float64),
         "eitr_probe_doc_probs": torch.zeros(
             (batch_size, probe_count, max_doc_support), dtype=torch.float32
         ),
@@ -1087,7 +1161,7 @@ def build_online_probe_tensors(
         "eitr_probe_response_mask": torch.zeros(
             (batch_size, probe_count, max_action_tokens), dtype=torch.long
         ),
-        "eitr_probe_old_seq_logp": torch.zeros((batch_size, probe_count), dtype=torch.float32),
+        "eitr_probe_old_seq_logp": torch.zeros((batch_size, probe_count), dtype=torch.float64),
         "eitr_probe_doc_probs": torch.zeros(
             (batch_size, probe_count, max_doc_support), dtype=torch.float32
         ),
@@ -1352,7 +1426,9 @@ def assign_probe_old_log_probs(
     expected = state_count * probe_count
     if token_log_probs.size(0) != expected:
         raise ValueError(f"Expected {expected} probe log-prob rows, got {token_log_probs.size(0)}")
-    sequence_log_probs = (token_log_probs.float() * response_mask.float()).sum(dim=-1)
+    sequence_log_probs = (
+        token_log_probs.double() * response_mask.double()
+    ).sum(dim=-1)
     batch.batch["eitr_probe_old_seq_logp"][state_slot] = sequence_log_probs.view(
         state_count, probe_count
     )
@@ -1373,9 +1449,14 @@ def induced_js_from_cached_effects(
     eps: float = 1e-8,
 ) -> Dict[str, torch.Tensor]:
     """Estimate policy-induced retrieval JS using SNIS probe weights."""
-    current = current_seq_logp.float()
-    old = old_seq_logp.float()
-    documents = doc_probs.float()
+    # Sequence log-prob ratios and document JS live on very small tensors but
+    # can be orders of magnitude below float32 precision after a small GRPO
+    # proposal.  Keep the model forward in its configured dtype, then perform
+    # the SNIS/JS estimator itself in float64 to avoid negative pseudo-JS and
+    # noise-driven correction gradients near the exact zero-drift anchor.
+    current = current_seq_logp.double()
+    old = old_seq_logp.double()
+    documents = doc_probs.double()
     mask = probe_mask.bool()
     if current.ndim != 2 or documents.ndim != 3:
         raise ValueError("Expected current/old [states, probes] and doc_probs [states, probes, docs]")
@@ -1386,9 +1467,12 @@ def induced_js_from_cached_effects(
 
     raw_log_ratio = current - old
     clipped_log_ratio = raw_log_ratio.clamp(-float(log_ratio_clip), float(log_ratio_clip))
-    masked_log_ratio = clipped_log_ratio.masked_fill(~mask, torch.finfo(torch.float32).min)
+    masked_log_ratio = clipped_log_ratio.masked_fill(
+        ~mask, torch.finfo(current.dtype).min
+    )
     current_weights = torch.softmax(masked_log_ratio, dim=-1)
-    old_weights = mask.float() / mask.float().sum(dim=-1, keepdim=True)
+    old_weights = mask.to(current.dtype)
+    old_weights = old_weights / old_weights.sum(dim=-1, keepdim=True)
 
     old_distribution = torch.einsum("sk,sku->su", old_weights, documents)
     current_distribution = torch.einsum("sk,sku->su", current_weights, documents)
@@ -1413,10 +1497,13 @@ def induced_js_from_cached_effects(
         ),
         dim=-1,
     )
-    js = 0.5 * (old_kl + current_kl)
+    # Jensen-Shannon divergence is non-negative by definition.  Clamp only
+    # round-off-sized negative zeros from the finite-precision KL reduction;
+    # positive values and their gradients are unchanged.
+    js = (0.5 * (old_kl + current_kl)).clamp_min(0.0)
     ess = 1.0 / current_weights.square().sum(dim=-1).clamp_min(eps)
     raw_log_ratio_abs = raw_log_ratio.abs()
-    valid_probe_count = mask.float().sum(dim=-1).clamp_min(1.0)
+    valid_probe_count = mask.to(current.dtype).sum(dim=-1).clamp_min(1.0)
     return {
         "js": js,
         "ess": ess,
@@ -1425,7 +1512,9 @@ def induced_js_from_cached_effects(
         "current_distribution": current_distribution,
         "log_ratio_abs_max": raw_log_ratio_abs.masked_fill(~mask, 0.0).amax(dim=-1),
         "log_ratio_clipfrac": (
-            ((raw_log_ratio_abs > float(log_ratio_clip)) & mask).float().sum(dim=-1)
+            ((raw_log_ratio_abs > float(log_ratio_clip)) & mask)
+            .to(current.dtype)
+            .sum(dim=-1)
             / valid_probe_count
         ),
     }

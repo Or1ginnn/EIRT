@@ -36,6 +36,7 @@ from verl.trainer.ppo.eitr import (
     coverage_weighted_state_scale,
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
+    proposal_signal_diagnostics,
     rank_owned_global_additive_stats,
     resolved_query_direction_candidates,
     rollout_averaged_env_drift,
@@ -341,7 +342,9 @@ class DataParallelPPOActor(BasePPOActor):
                 token_log_prob_chunks.append(chunk_log_probs)
         token_log_probs = torch.cat(token_log_prob_chunks, dim=0)
         response_mask = data['eitr_probe_response_mask'][state_slot].flatten(0, 1).float()
-        current_seq_logp = (token_log_probs.float() * response_mask).sum(dim=-1).view(
+        current_seq_logp = (
+            token_log_probs.double() * response_mask.double()
+        ).sum(dim=-1).view(
             slot_count, probe_count
         )
         if not track_model_grad:
@@ -1137,6 +1140,7 @@ class DataParallelPPOActor(BasePPOActor):
         old_log_ratio_abs_max,
         theta_old_checksum,
         grpo_step_count,
+        actor_lr,
         epsilon=3e-5,
     ):
         """Audit score consistency and the local +/- EITR update direction.
@@ -1190,8 +1194,12 @@ class DataParallelPPOActor(BasePPOActor):
             ),
             'actor/eitr_score_path_ess': float(zero_stats['ess']),
             'actor/eitr_score_path_log_ratio_clipfrac': float(zero_stats['clipfrac']),
+            'actor/eitr_score_path_log_ratio_abs_max': float(
+                zero_stats['log_ratio_abs_max']
+            ),
             'actor/eitr_score_path_theta_old_checksum_sum': theta_old_checksum[0],
             'actor/eitr_score_path_theta_grpo_checksum_sum': theta_grpo_checksum[0],
+            'actor/eitr_score_path_actor_lr': float(actor_lr),
         }
         noop_values = []
         noop_param_error = 0.0
@@ -1231,6 +1239,110 @@ class DataParallelPPOActor(BasePPOActor):
         })
         if noop_param_error != 0.0:
             raise RuntimeError('Score-path audit no-op changed theta_GRPO')
+
+        zero_noop_error = abs(zero_stats['drift'] - noop_mean)
+        anchor_pass = bool(
+            old_log_ratio_abs_max
+            <= self.eitr_score_path_anchor_max_abs_logprob_diff
+        )
+        proposal_signal = proposal_signal_diagnostics(
+            d_old=d_old,
+            d_pre=noop_mean,
+            noop_jitter=noop_jitter,
+            zero_noop_abs_error=zero_noop_error,
+            actor_lr=actor_lr,
+        )
+        metrics.update({
+            'actor/eitr_score_path_zero_noop_abs_error': zero_noop_error,
+            'actor/eitr_score_path_score_mode_tolerance': proposal_signal[
+                'score_mode_tolerance'
+            ],
+            'actor/eitr_score_path_score_mode_pass': proposal_signal[
+                'score_mode_pass'
+            ],
+            'actor/eitr_score_path_proposal_signal': proposal_signal['signal'],
+            'actor/eitr_score_path_proposal_floor': proposal_signal[
+                'numerical_floor'
+            ],
+            'actor/eitr_score_path_proposal_required_signal': proposal_signal[
+                'required_signal'
+            ],
+            'actor/eitr_score_path_proposal_signal_to_floor': proposal_signal[
+                'signal_to_floor_ratio'
+            ],
+            'actor/eitr_score_path_actor_lr_positive': proposal_signal[
+                'actor_lr_positive'
+            ],
+            'actor/eitr_score_path_proposal_signal_pass': proposal_signal['pass'],
+            'actor/eitr_score_path_no_signal': proposal_signal['no_signal'],
+        })
+        integrity_fail = bool(
+            not anchor_pass or proposal_signal['score_mode_pass'] < 0.5
+        )
+        no_signal = bool(not integrity_fail and proposal_signal['no_signal'] > 0.5)
+        metrics['actor/eitr_score_path_no_signal'] = float(no_signal)
+        if integrity_fail or no_signal:
+            # Do not manufacture a descent direction at the exact JS minimum.
+            # Return a fully auditable terminal outcome without calling the
+            # diagnostic optimizer or counting a persistent correction step.
+            self._restore_eitr_local_state(snapshot, restore_gradients=False)
+            self.eitr_optimizer.zero_grad()
+            restore_error = self._distributed_scalar(
+                self._local_snapshot_max_abs_error(snapshot),
+                distributed=distributed,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+            theta_after_checksum = self._snapshot_checksum(
+                snapshot, distributed=distributed
+            )
+            if restore_error != 0.0:
+                raise RuntimeError('Score-path terminal audit failed to restore theta_GRPO')
+            if theta_after_checksum != theta_grpo_checksum:
+                raise RuntimeError('Score-path terminal audit checksum changed')
+            probe_hash_mismatch = self._distributed_scalar(
+                float(len(set(hashes.values())) != 1),
+                distributed=distributed,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+            if probe_hash_mismatch > 0:
+                raise RuntimeError(
+                    f'Score-path terminal cached probe fingerprint mismatch: {hashes}'
+                )
+            metrics.update({
+                'actor/eitr_score_path_direction_evaluated': 0.0,
+                'actor/eitr_score_path_candidate_sgd_ran': 0.0,
+                'actor/eitr_score_path_query_pass': 0.0,
+                'actor/eitr_score_path_parameter_pass': 0.0,
+                'actor/eitr_score_path_audit_inconclusive': float(no_signal),
+                'actor/eitr_score_path_audit_fail': float(integrity_fail),
+                'actor/eitr_score_path_audit_pass': 0.0,
+                'actor/eitr_score_path_final_restore_max_abs': restore_error,
+                'actor/eitr_score_path_theta_after_checksum_sum': (
+                    theta_after_checksum[0]
+                ),
+                'actor/eitr_score_path_probe_hash_match': 1.0,
+            })
+            outcome = 'NO_SIGNAL' if no_signal else 'INTEGRITY_FAIL'
+            if not distributed or torch.distributed.get_rank() == 0:
+                print(
+                    f'EITR_SCORE_PATH_AUDIT_{outcome} '
+                    f'actor_lr={actor_lr:.12e} '
+                    f'D_old={d_old:.12e} '
+                    f'D_pre={noop_mean:.12e} '
+                    f'floor={proposal_signal["numerical_floor"]:.12e} '
+                    f'signal={proposal_signal["signal"]:.12e} '
+                    f'snr={proposal_signal["signal_to_floor_ratio"]:.12e} '
+                    f'anchor_pass={int(anchor_pass)} '
+                    f'score_mode_pass={int(proposal_signal["score_mode_pass"])} '
+                    f'probe_hash={cache_hash} '
+                    f'final_restore={restore_error:.12e}',
+                    flush=True,
+                )
+                print(
+                    f'EITR_SCORE_AUDIT_EVENT {outcome}@v{grpo_step_count}',
+                    flush=True,
+                )
+            return metrics
 
         query_direction = self._query_logprob_direction_metrics(
             zero_stats['query_sample'], distributed=distributed
@@ -1328,7 +1440,12 @@ class DataParallelPPOActor(BasePPOActor):
             raise RuntimeError('Score-path audit failed to restore theta_GRPO')
         if theta_after_checksum != theta_grpo_checksum:
             raise RuntimeError('Score-path audit checksum changed after final restoration')
-        if len(set(hashes.values())) != 1:
+        probe_hash_mismatch = self._distributed_scalar(
+            float(len(set(hashes.values())) != 1),
+            distributed=distributed,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if probe_hash_mismatch > 0:
             raise RuntimeError(f'Score-path audit cached probe fingerprint mismatch: {hashes}')
 
         for direction, (drift, stats, start_error) in reports.items():
@@ -1366,12 +1483,7 @@ class DataParallelPPOActor(BasePPOActor):
             plus=reports['plus'][0],
             jitter=noop_jitter,
         )
-        zero_noop_error = abs(zero_stats['drift'] - noop_mean)
-        score_path_pass = bool(zero_noop_error <= parameter_direction['noise'])
-        anchor_pass = bool(
-            old_log_ratio_abs_max
-            <= self.eitr_score_path_anchor_max_abs_logprob_diff
-        )
+        score_path_pass = bool(proposal_signal['score_mode_pass'] > 0.5)
         audit_pass = bool(
             anchor_pass
             and score_path_pass
@@ -1385,6 +1497,10 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/eitr_score_path_parameter_pass': parameter_direction['pass'],
             'actor/eitr_score_path_zero_noop_abs_error': zero_noop_error,
             'actor/eitr_score_path_score_mode_pass': float(score_path_pass),
+            'actor/eitr_score_path_direction_evaluated': 1.0,
+            'actor/eitr_score_path_candidate_sgd_ran': 1.0,
+            'actor/eitr_score_path_audit_inconclusive': 0.0,
+            'actor/eitr_score_path_audit_fail': float(not audit_pass),
             'actor/eitr_score_path_audit_pass': float(audit_pass),
         })
         metrics['actor/eitr_score_path_final_restore_max_abs'] = restore_error
@@ -1393,6 +1509,7 @@ class DataParallelPPOActor(BasePPOActor):
         if not distributed or torch.distributed.get_rank() == 0:
             print(
                 'EITR_SCORE_PATH_AUDIT '
+                f'actor_lr={actor_lr:.12e} '
                 f'D_old={d_old:.12e} '
                 f'D_zero_grad={zero_stats["drift"]:.12e} '
                 f'D_noop_1={noop_values[0]:.12e} '
@@ -1400,6 +1517,8 @@ class DataParallelPPOActor(BasePPOActor):
                 f'D_noop_3={noop_values[2]:.12e} '
                 f'D_minus={reports["minus"][0]:.12e} '
                 f'D_plus={reports["plus"][0]:.12e} '
+                f'proposal_signal={proposal_signal["signal"]:.12e} '
+                f'proposal_snr={proposal_signal["signal_to_floor_ratio"]:.12e} '
                 f'query_minus={query_direction["minus"]:.12e} '
                 f'query_zero={query_direction["zero"]:.12e} '
                 f'query_plus={query_direction["plus"]:.12e} '
@@ -1424,6 +1543,7 @@ class DataParallelPPOActor(BasePPOActor):
         assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size == 0
         self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
         temperature = data.meta_info['temperature']  # avoid silently training at the wrong temperature
+        actor_lr_used = float(self.actor_optimizer.param_groups[0]['lr'])
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.state_masking:
@@ -1620,6 +1740,7 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_ratio_abs_max=audit_old_stats['log_ratio_abs_max'],
                     theta_old_checksum=audit_theta_old_checksum,
                     grpo_step_count=grpo_optimizer_step_count,
+                    actor_lr=actor_lr_used,
                 )
                 append_to_dict(metrics, diagnostic_metrics)
                 pass_index = self.ppo_epochs
@@ -1638,9 +1759,12 @@ class DataParallelPPOActor(BasePPOActor):
                     torch.distributed.get_rank() if distributed else 0
                 ))
                 pass_stats[pass_index].update(audit_additive_stats)
-                # One real SGD invocation occurred inside the diagnostic, then
-                # theta_GRPO was restored. Count placement, not persistence.
-                eitr_correction_optimizer_step_count += 1
+                # Count only a real candidate SGD invocation. A zero-proposal
+                # audit exits before the optimizer and must remain loss_applied=0.
+                if diagnostic_metrics.get(
+                    'actor/eitr_score_path_candidate_sgd_ran', 0.0
+                ) > 0.5:
+                    eitr_correction_optimizer_step_count += 1
                 score_path_noop_direction_audit_ran = True
             elif global_active_state_count.item() > 0:
                 for correction_index in range(self.eitr_correction_passes):

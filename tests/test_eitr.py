@@ -51,6 +51,7 @@ same_batch_cache_signature = EITR.same_batch_cache_signature
 same_batch_scale_diagnostic_lrs = EITR.same_batch_scale_diagnostic_lrs
 same_batch_sgd_candidates = EITR.same_batch_sgd_candidates
 probe_effect_diversity = EITR.probe_effect_diversity
+proposal_signal_diagnostics = EITR.proposal_signal_diagnostics
 rollout_averaged_env_drift = EITR.rollout_averaged_env_drift
 rank_owned_global_additive_stats = EITR.rank_owned_global_additive_stats
 resolved_query_direction_candidates = EITR.resolved_query_direction_candidates
@@ -187,6 +188,50 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertLess(logger_call, failure_guard)
         self.assertLess(failure_guard, finish_call)
         self.assertLess(finish_call, failure_raise)
+
+    def test_audit_inconclusive_is_logged_before_report_and_skips_side_effects(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "trainer"
+            / "ppo"
+            / "ray_trainer.py"
+        ).read_text()
+        fit_start = source.index("    def fit(self):")
+        pending_start = source.index(
+            "pending_audit_inconclusive = {", fit_start
+        )
+        validation_call = source.index("val_metrics: dict = self._validate()", fit_start)
+        checkpoint_call = source.index("self._save_checkpoint()", fit_start)
+        logger_call = source.index("                logger.log(", fit_start)
+        inconclusive_guard = source.index(
+            "                if pending_audit_inconclusive is not None:",
+            logger_call,
+        )
+        finish_call = source.index(
+            "                    logger.finish()", inconclusive_guard
+        )
+        report = source.index("INCONCLUSIVE_ZERO_PROPOSAL", finish_call)
+        inconclusive_raise = source.rfind(
+            "                    raise RuntimeError(", finish_call, report
+        )
+
+        validation_guard = source[
+            source.rfind("if ", fit_start, validation_call):validation_call
+        ]
+        checkpoint_guard = source[
+            source.rfind("if ", fit_start, checkpoint_call):checkpoint_call
+        ]
+        self.assertIn("pending_audit_inconclusive is None", validation_guard)
+        self.assertIn("pending_audit_inconclusive is None", checkpoint_guard)
+        self.assertLess(pending_start, validation_call)
+        self.assertLess(pending_start, checkpoint_call)
+        self.assertLess(validation_call, logger_call)
+        self.assertLess(checkpoint_call, logger_call)
+        self.assertLess(logger_call, inconclusive_guard)
+        self.assertLess(inconclusive_guard, finish_call)
+        self.assertLess(finish_call, inconclusive_raise)
+        self.assertLess(inconclusive_raise, report)
 
 
 class ObservationTruncationTest(unittest.TestCase):
@@ -633,6 +678,7 @@ class EITRProbeBatchTest(unittest.TestCase):
         self.assertGreater(metrics["eitr/probe_effect_pairwise_js_max"], 0.0)
         self.assertEqual(tensors["eitr_state_slot"].nonzero().flatten().tolist(), [0, 1, 2, 3, 4])
         self.assertEqual(tensors["eitr_state_valid"].nonzero().flatten().tolist(), [0])
+        self.assertEqual(tensors["eitr_probe_old_seq_logp"].dtype, torch.float64)
         state_prefixes = tensors["eitr_probe_input_ids"][0, :, :4]
         self.assertTrue(torch.equal(state_prefixes, state_prefixes[0].expand_as(state_prefixes)))
 
@@ -1072,6 +1118,25 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
         second["eitr_probe_old_seq_logp"][0, 0, 0] += 1
         self.assertNotEqual(cached_probe_fingerprint([first]), cached_probe_fingerprint([second]))
 
+    def test_probe_hash_failures_are_synchronized_before_raising(self):
+        actor_source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "actor"
+            / "dp_actor.py"
+        ).read_text()
+        self.assertEqual(
+            actor_source.count(
+                "probe_hash_mismatch = self._distributed_scalar("
+            ),
+            2,
+        )
+        self.assertEqual(
+            actor_source.count("if probe_hash_mismatch > 0:"),
+            2,
+        )
+
     def test_noop_does_not_change_parameters_and_candidates_do_not_accumulate(self):
         parameter = torch.tensor([2.0], dtype=torch.float32)
         gradient = torch.tensor([4.0], dtype=torch.float32)
@@ -1240,6 +1305,160 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
             "with self._temporary_probe_eval():",
             actor_source[compute_eitr_start:iter_chunks_start],
         )
+
+    def test_zero_warmup_uses_base_lr_from_the_first_optimizer_step(self):
+        scheduler_source_path = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "utils"
+            / "torch_functional.py"
+        )
+        scheduler_tree = ast.parse(scheduler_source_path.read_text())
+        scheduler_method = next(
+            node
+            for node in scheduler_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "get_constant_schedule_with_warmup"
+        )
+        namespace = {
+            "Optimizer": torch.optim.Optimizer,
+            "LambdaLR": torch.optim.lr_scheduler.LambdaLR,
+        }
+        scheduler_module = ast.fix_missing_locations(
+            ast.Module(body=[scheduler_method], type_ignores=[])
+        )
+        exec(
+            compile(scheduler_module, str(scheduler_source_path), "exec"),
+            namespace,
+        )
+        make_scheduler = namespace["get_constant_schedule_with_warmup"]
+
+        base_lr = 5e-7
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.AdamW([parameter], lr=base_lr)
+        scheduler = make_scheduler(optimizer, num_warmup_steps=0)
+
+        self.assertEqual(optimizer.param_groups[0]["lr"], base_lr)
+        parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        scheduler.step()
+        self.assertEqual(optimizer.param_groups[0]["lr"], base_lr)
+        self.assertEqual(scheduler.get_last_lr(), [base_lr])
+
+    def test_tiny_same_policy_js_is_float64_nonnegative_and_near_zero(self):
+        old = torch.tensor(
+            [
+                [-500.0, -700.0, -900.0, -1100.0],
+                [-120.0, -320.0, -520.0, -720.0],
+            ],
+            dtype=torch.float64,
+        )
+        documents = torch.tensor(
+            [
+                [
+                    [0.8, 0.2, 0.0],
+                    [0.1, 0.7, 0.2],
+                    [0.0, 0.3, 0.7],
+                    [0.4, 0.1, 0.5],
+                ],
+                [
+                    [0.6, 0.4, 0.0],
+                    [0.2, 0.3, 0.5],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+            ],
+            dtype=torch.float32,
+        )
+        probe_mask = torch.tensor(
+            [[True, True, True, True], [True, True, False, False]]
+        )
+
+        same_policy = induced_js_from_cached_effects(
+            current_seq_logp=old.clone(),
+            old_seq_logp=old,
+            doc_probs=documents,
+            probe_mask=probe_mask,
+        )["js"]
+        self.assertEqual(same_policy.dtype, torch.float64)
+        self.assertTrue(torch.isfinite(same_policy).all())
+        self.assertTrue((same_policy >= 0).all())
+        self.assertLessEqual(float(same_policy.max().item()), 1e-12)
+
+        perturbation = torch.tensor(
+            [[1e-8, -1e-8, 2e-8, -2e-8], [1e-8, -1e-8, 0.0, 0.0]],
+            dtype=torch.float64,
+        )
+        current = (old + perturbation).detach().requires_grad_(True)
+        tiny_result = induced_js_from_cached_effects(
+            current_seq_logp=current,
+            old_seq_logp=old,
+            doc_probs=documents,
+            probe_mask=probe_mask,
+        )
+        tiny_gradient = torch.autograd.grad(tiny_result["js"].sum(), current)[0]
+        self.assertEqual(tiny_result["js"].dtype, torch.float64)
+        self.assertTrue(torch.isfinite(tiny_result["js"]).all())
+        self.assertTrue((tiny_result["js"] >= 0).all())
+        self.assertTrue(torch.isfinite(tiny_gradient).all())
+
+    def test_proposal_signal_real_noise_fixture_is_inconclusive(self):
+        diagnostic = proposal_signal_diagnostics(
+            d_old=-1e-8,
+            d_pre=-4.6e-10,
+            noop_jitter=0.0,
+            zero_noop_abs_error=0.0,
+            actor_lr=5e-7,
+        )
+
+        self.assertEqual(diagnostic["signal"], 0.0)
+        self.assertEqual(diagnostic["numerical_floor"], 1e-8)
+        self.assertEqual(diagnostic["required_signal"], 1e-7)
+        self.assertEqual(diagnostic["score_mode_pass"], 1.0)
+        self.assertEqual(diagnostic["pass"], 0.0)
+        self.assertEqual(diagnostic["no_signal"], 1.0)
+
+    def test_proposal_signal_accepts_a_resolved_positive_drift(self):
+        diagnostic = proposal_signal_diagnostics(
+            d_old=0.0,
+            d_pre=1e-4,
+            noop_jitter=1e-9,
+            zero_noop_abs_error=1e-9,
+            actor_lr=5e-7,
+        )
+
+        self.assertEqual(diagnostic["score_mode_pass"], 1.0)
+        self.assertGreater(diagnostic["signal"], diagnostic["required_signal"])
+        self.assertGreater(diagnostic["signal_to_floor_ratio"], 10.0)
+        self.assertEqual(diagnostic["pass"], 1.0)
+        self.assertEqual(diagnostic["no_signal"], 0.0)
+
+    def test_no_signal_skips_candidate_sgd_and_correction_count(self):
+        actor_source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "actor"
+            / "dp_actor.py"
+        ).read_text()
+        terminal_start = actor_source.index("        if integrity_fail or no_signal:")
+        terminal_return = actor_source.index("            return metrics", terminal_start)
+        terminal_block = actor_source[terminal_start:terminal_return]
+        self.assertIn("'actor/eitr_score_path_direction_evaluated': 0.0", terminal_block)
+        self.assertIn("'actor/eitr_score_path_candidate_sgd_ran': 0.0", terminal_block)
+        self.assertIn("'actor/eitr_score_path_audit_inconclusive': float(no_signal)", terminal_block)
+        self.assertNotIn("self.eitr_optimizer.step()", terminal_block)
+        self.assertNotIn("self._optimizer_step(", terminal_block)
+
+        count_guard = actor_source.index(
+            "                if diagnostic_metrics.get(\n"
+            "                    'actor/eitr_score_path_candidate_sgd_ran', 0.0"
+        )
+        count_increment = actor_source.index(
+            "                    eitr_correction_optimizer_step_count += 1",
+            count_guard,
+        )
+        self.assertLess(count_guard, count_increment)
 
 
 if __name__ == "__main__":

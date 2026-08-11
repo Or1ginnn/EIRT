@@ -899,6 +899,7 @@ class RayPPOTrainer(object):
                 print(f'epoch {epoch}, outer update {current_step}/{self.total_training_steps}')
                 metrics = {}
                 pending_audit_failure = None
+                pending_audit_inconclusive = None
                 timing_raw = {}
                 eitr_rollout_meta = {}
 
@@ -1119,7 +1120,25 @@ class RayPPOTrainer(object):
                         score_path_audit_pass = actor_output_metrics.get(
                             'actor/eitr_score_path_audit_pass'
                         )
-                        if (
+                        score_path_audit_inconclusive = actor_output_metrics.get(
+                            'actor/eitr_score_path_audit_inconclusive', 0.0
+                        )
+                        if float(score_path_audit_inconclusive) > 0.5:
+                            pending_audit_inconclusive = {
+                                'actor_lr': float(actor_output_metrics.get(
+                                    'actor/eitr_score_path_actor_lr', 0.0
+                                )),
+                                'signal': float(actor_output_metrics.get(
+                                    'actor/eitr_score_path_proposal_signal', 0.0
+                                )),
+                                'floor': float(actor_output_metrics.get(
+                                    'actor/eitr_score_path_proposal_floor', 0.0
+                                )),
+                                'snr': float(actor_output_metrics.get(
+                                    'actor/eitr_score_path_proposal_signal_to_floor', 0.0
+                                )),
+                            }
+                        elif (
                             score_path_audit_pass is not None
                             and float(score_path_audit_pass) < 0.5
                         ):
@@ -1138,6 +1157,14 @@ class RayPPOTrainer(object):
                             metrics['trainer/eitr_score_path_audit_pass'] = float(
                                 score_path_audit_pass
                             )
+                            metrics['trainer/eitr_score_path_audit_inconclusive'] = float(
+                                score_path_audit_inconclusive
+                            )
+                            metrics['trainer/eitr_score_path_no_signal'] = float(
+                                actor_output_metrics.get(
+                                    'actor/eitr_score_path_no_signal', 0.0
+                                )
+                            )
 
                     # The update is now complete.  All logging, validation and
                     # checkpoint names use this completed-update count.
@@ -1147,18 +1174,27 @@ class RayPPOTrainer(object):
                         self.config.trainer.test_freq > 0
                         and self.global_steps % self.config.trainer.test_freq == 0
                     )
-                    if self.val_reward_fn is not None and (
-                        is_periodic_validation_step or is_final_step
-                    ) and pending_audit_failure is None:
+                    if (
+                        self.val_reward_fn is not None
+                        and (is_periodic_validation_step or is_final_step)
+                        and pending_audit_failure is None
+                        and pending_audit_inconclusive is None
+                    ):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
                         if is_final_step:
                             pprint(f'Final validation metrics: {val_metrics}')
 
-                    if self.config.trainer.save_freq > 0 and (
+                    if (
+                        self.config.trainer.save_freq > 0
+                        and (
                             self.global_steps % self.config.trainer.save_freq == 0
-                            or is_final_step) and pending_audit_failure is None:
+                            or is_final_step
+                        )
+                        and pending_audit_failure is None
+                        and pending_audit_inconclusive is None
+                    ):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
 
@@ -1193,6 +1229,17 @@ class RayPPOTrainer(object):
                         f'query_pass={pending_audit_failure["query_pass"]:.0f}, '
                         f'parameter_pass={pending_audit_failure["parameter_pass"]:.0f}, '
                         f'anchor_pass={pending_audit_failure["anchor_pass"]:.0f}'
+                    )
+
+                if pending_audit_inconclusive is not None:
+                    logger.finish()
+                    raise RuntimeError(
+                        'EITR score-path audit INCONCLUSIVE_ZERO_PROPOSAL after '
+                        'metrics flush: '
+                        f'actor_lr={pending_audit_inconclusive["actor_lr"]:.12e}, '
+                        f'signal={pending_audit_inconclusive["signal"]:.12e}, '
+                        f'floor={pending_audit_inconclusive["floor"]:.12e}, '
+                        f'snr={pending_audit_inconclusive["snr"]:.6f}'
                     )
 
                 if is_final_step:

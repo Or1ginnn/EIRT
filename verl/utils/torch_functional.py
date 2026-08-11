@@ -426,6 +426,9 @@ def get_constant_schedule_with_warmup(
 ):
 
     def lr_lambda(current_step):
+        # Zero warmup means the base LR is active from the first optimizer step.
+        if num_warmup_steps <= 0:
+            return 1.0
         return min(1, float(current_step) / float(max(1, num_warmup_steps)))
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
