@@ -49,6 +49,7 @@ from verl.trainer.ppo.eitr import (
 )
 from verl.trainer.ppo.step_plan import resolve_training_step_plan
 from verl.trainer.ppo.metric_filter import filter_metrics_for_logging, normalize_metrics_level
+from verl.trainer.ppo.console_trace import print_training_trace_samples
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
@@ -1083,6 +1084,19 @@ class RayPPOTrainer(object):
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
+
+                        # A bounded, driver-side trace for checking the exact
+                        # prompt, full tool trajectory, extracted answer, and
+                        # scalar reward. This is observational only and never
+                        # calls the model, retriever, or reward function again.
+                        print_training_trace_samples(
+                            batch=batch,
+                            tokenizer=self.tokenizer,
+                            outer_update_step=current_step,
+                            sample_count=int(
+                                self.config.trainer.get('console_trace_samples', 0)
+                            ),
+                        )
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:

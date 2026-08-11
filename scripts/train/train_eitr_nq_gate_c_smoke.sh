@@ -76,6 +76,7 @@ PPO_EPOCHS="${PPO_EPOCHS:-1}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-smoke}"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
 METRICS_LEVEL="${METRICS_LEVEL:-debug}"
+TERMINAL_TRACE_SAMPLES="${TERMINAL_TRACE_SAMPLES:-1}"
 # With an explicit TOTAL_TRAINING_STEPS budget, the trainer cycles the
 # dataloader until that exact number of outer updates is complete.  Keep the
 # smoke epoch default aligned as a readable fallback for its one-batch loader.
@@ -118,6 +119,11 @@ case "$SHUFFLE_TRAIN_DATALOADER" in
         exit 2
         ;;
 esac
+
+if ! [[ "$TERMINAL_TRACE_SAMPLES" =~ ^[0-9]+$ ]]; then
+    echo "TERMINAL_TRACE_SAMPLES must be a non-negative integer; got: $TERMINAL_TRACE_SAMPLES" >&2
+    exit 2
+fi
 
 for offload_value in \
     "$ACTOR_FSDP_PARAM_OFFLOAD" \
@@ -437,6 +443,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.ref.fsdp_config.param_offload="$REF_FSDP_PARAM_OFFLOAD" \
     trainer.logger="['console','wandb']" \
     trainer.metrics_level="$METRICS_LEVEL" \
+    trainer.console_trace_samples="$TERMINAL_TRACE_SAMPLES" \
     +trainer.val_before_train=false \
     +trainer.val_only=false \
     trainer.n_gpus_per_node="$NUM_GPUS" \

@@ -227,6 +227,9 @@ trainer:
   logger: [ 'console', 'wandb' ]
   # debug logs every internal diagnostic; core keeps the formal W&B view compact.
   metrics_level: debug
+  # Print this many real prompt/trajectory/reward examples per outer update.
+  # Zero keeps generic veRL jobs quiet; the EITR runner enables one sample.
+  console_trace_samples: 0
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1
