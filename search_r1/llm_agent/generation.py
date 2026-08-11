@@ -298,15 +298,23 @@ class LLMGenerationManager:
         # Generate with padded batch
         padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
 
-        # Remove padding from output
-        trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
+        # Remove every completion belonging to the padded prompt rows. Probe
+        # generation can temporarily request n>1, in which case the vLLM
+        # output is ordered as ``prompt_0_sample_0..n, prompt_1_sample_0..n``.
+        sampling_params = active_batch.meta_info.get('sampling_params', {})
+        do_sample = active_batch.meta_info.get('do_sample', True)
+        request_n = int(sampling_params.get('n', 1)) if do_sample else 1
+        valid_output_rows = batch_size * request_n
+        trimmed_batch = {
+            k: v[:valid_output_rows] for k, v in padded_output.batch.items()
+        }
         
         # Handle meta_info if present
         if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
             trimmed_meta = {}
             for k, v in padded_output.meta_info.items():
                 if isinstance(v, torch.Tensor):
-                    trimmed_meta[k] = v[:-padding_size]
+                    trimmed_meta[k] = v[:valid_output_rows]
                 else:
                     trimmed_meta[k] = v
             padded_output.meta_info = trimmed_meta
@@ -990,12 +998,10 @@ If I want to give the final answer, I should put the answer between <answer> and
                 self._register_compat_eitr_group(group)
             return
 
-        # vLLM constructs one seeded generator per request. Repeating the same
-        # state several rows in one call with one shared seed therefore produces
-        # identical continuations. Sample one candidate per state per round and
-        # advance the seed between rounds so the K-1 candidates for a state are
-        # genuine independent draws from the frozen rollout policy.
-        generated_candidates = []
+        # Ask vLLM for all K-1 completions of each state in one request. Its
+        # multi-output sampling uses one generator stream per request and emits
+        # independent stochastic continuations, while avoiding K-1 complete
+        # rollout/sharding-manager entries and weight synchronizations.
         state_prompt_ids = [group['state_prompt_token_ids'] for group in state_groups]
         max_state_length = max(len(item) for item in state_prompt_ids)
         max_query_budget = max(int(group['query_token_budget']) for group in state_groups)
@@ -1006,49 +1012,54 @@ If I want to give the final answer, I should put the answer between <answer> and
                 f'max_response_length; got {configured_query_limit} != '
                 f'{int(self.config.max_response_length)}'
             )
-        for _ in range(candidates_per_state):
-            probe_input_ids = torch.full(
-                (len(state_prompt_ids), max_state_length),
-                self.tokenizer.pad_token_id,
-                dtype=torch.long,
+        probe_input_ids = torch.full(
+            (len(state_prompt_ids), max_state_length),
+            self.tokenizer.pad_token_id,
+            dtype=torch.long,
+        )
+        probe_attention_mask = torch.zeros_like(probe_input_ids)
+        for index, token_ids in enumerate(state_prompt_ids):
+            length = len(token_ids)
+            probe_input_ids[index, -length:] = torch.tensor(token_ids, dtype=torch.long)
+            probe_attention_mask[index, -length:] = 1
+        probe_position_ids = self.tensor_fn.create_position_ids(probe_attention_mask)
+        probe_prompts = DataProto.from_dict({
+            'input_ids': probe_input_ids,
+            'attention_mask': probe_attention_mask,
+            'position_ids': probe_position_ids,
+        })
+        probe_seed = int(self.config.eitr_probe_seed + self._eitr_probe_call_index)
+        probe_prompts.meta_info.update({
+            'recompute_log_prob': False,
+            'sampling_params': {
+                # One batched vLLM call needs one shared limit. Every result is
+                # cropped below to its owning state's residual budget.
+                'max_tokens': max_query_budget,
+                'n': candidates_per_state,
+                'seed': probe_seed,
+            },
+        })
+        self._eitr_probe_call_index += 1
+        probe_generation_start = time.perf_counter()
+        probe_outputs = self._generate_with_gpu_padding(probe_prompts)
+        self._record_timing(
+            'eitr_probe_generation',
+            time.perf_counter() - probe_generation_start,
+        )
+        generated_responses = probe_outputs.batch['responses']
+        expected_candidates = len(state_groups) * candidates_per_state
+        if int(generated_responses.shape[0]) != expected_candidates:
+            raise RuntimeError(
+                'EITR multi-sample probe generation returned an unexpected '
+                f'row count: {int(generated_responses.shape[0])} != '
+                f'{expected_candidates}'
             )
-            probe_attention_mask = torch.zeros_like(probe_input_ids)
-            for index, token_ids in enumerate(state_prompt_ids):
-                length = len(token_ids)
-                probe_input_ids[index, -length:] = torch.tensor(token_ids, dtype=torch.long)
-                probe_attention_mask[index, -length:] = 1
-            probe_position_ids = self.tensor_fn.create_position_ids(probe_attention_mask)
-            probe_prompts = DataProto.from_dict({
-                'input_ids': probe_input_ids,
-                'attention_mask': probe_attention_mask,
-                'position_ids': probe_position_ids,
-            })
-            probe_seed = int(
-                self.config.eitr_probe_seed + self._eitr_probe_call_index
-            )
-            probe_prompts.meta_info.update({
-                'recompute_log_prob': False,
-                'sampling_params': {
-                    # One batched vLLM call needs one shared limit. Every result
-                    # is cropped below to its owning real state's smaller
-                    # residual budget before parsing.
-                    'max_tokens': max_query_budget,
-                    'n': 1,
-                    'seed': probe_seed,
-                },
-            })
-            self._eitr_probe_call_index += 1
-            probe_generation_start = time.perf_counter()
-            probe_outputs = self._generate_with_gpu_padding(probe_prompts)
-            self._record_timing(
-                'eitr_probe_generation',
-                time.perf_counter() - probe_generation_start,
-            )
-            stats['probe_generation_call_count'] += 1
-            stats['probe_candidate_generated'] += len(state_groups)
-            generated_candidates.extend(
-                zip(range(len(state_groups)), probe_outputs.batch['responses'])
-            )
+        stats['probe_generation_call_count'] += 1
+        stats['probe_candidate_generated'] += expected_candidates
+        generated_candidates = [
+            (flat_index // candidates_per_state, response)
+            for flat_index, response in enumerate(generated_responses)
+        ]
 
         valid_candidates = []
         flat_queries = []

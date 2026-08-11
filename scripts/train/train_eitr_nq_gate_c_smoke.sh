@@ -88,6 +88,9 @@ VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
 SHUFFLE_TRAIN_DATALOADER="${SHUFFLE_TRAIN_DATALOADER:-false}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-16}"
+ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE:-32}"
+REF_LOG_PROB_MICRO_BATCH_SIZE="${REF_LOG_PROB_MICRO_BATCH_SIZE:-32}"
+N_AGENT="${N_AGENT:-5}"
 ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"
 ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-false}"
 ACTOR_BATCH_OFFLOAD="${ACTOR_BATCH_OFFLOAD:-false}"
@@ -175,6 +178,64 @@ if (( EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE != EITR_PROBE_MICRO_BATCH_SIZE )); the
 fi
 if (( EITR_PROBE_MICRO_BATCH_SIZE % EITR_PROBE_COUNT != 0 )); then
     echo "EITR_PROBE_MICRO_BATCH_SIZE must be divisible by EITR_PROBE_COUNT" >&2
+    exit 2
+fi
+
+for positive_integer in \
+    "$NUM_GPUS" \
+    "$TRAIN_BATCH_SIZE" \
+    "$PPO_MINI_BATCH_SIZE" \
+    "$PPO_MICRO_BATCH_SIZE" \
+    "$ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE" \
+    "$REF_LOG_PROB_MICRO_BATCH_SIZE" \
+    "$N_AGENT"; do
+    if [[ ! "$positive_integer" =~ ^[1-9][0-9]*$ ]]; then
+        echo "GPU and batch-size settings must be positive integers; got: $positive_integer" >&2
+        exit 2
+    fi
+done
+
+IFS=',' read -r -a visible_gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
+if (( ${#visible_gpu_ids[@]} != NUM_GPUS )); then
+    echo "NUM_GPUS=$NUM_GPUS does not match CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2
+    exit 2
+fi
+declare -A seen_gpu_ids=()
+for gpu_id in "${visible_gpu_ids[@]}"; do
+    gpu_id="${gpu_id//[[:space:]]/}"
+    if [[ ! "$gpu_id" =~ ^[0-9]+$ ]]; then
+        echo "CUDA_VISIBLE_DEVICES must contain physical numeric GPU ids; got: $gpu_id" >&2
+        exit 2
+    fi
+    if [[ "$gpu_id" == "0" ]]; then
+        echo "Physical GPU0 is reserved and must not be used" >&2
+        exit 2
+    fi
+    if [[ -n "${seen_gpu_ids[$gpu_id]+x}" ]]; then
+        echo "CUDA_VISIBLE_DEVICES contains duplicate GPU id: $gpu_id" >&2
+        exit 2
+    fi
+    seen_gpu_ids[$gpu_id]=1
+done
+
+for divisible_setting in \
+    "$TRAIN_BATCH_SIZE" \
+    "$PPO_MINI_BATCH_SIZE" \
+    "$PPO_MICRO_BATCH_SIZE" \
+    "$ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE" \
+    "$REF_LOG_PROB_MICRO_BATCH_SIZE"; do
+    if (( divisible_setting % NUM_GPUS != 0 )); then
+        echo "Three-card/data-parallel batch settings must be divisible by NUM_GPUS=$NUM_GPUS; got: $divisible_setting" >&2
+        exit 2
+    fi
+done
+if (( PPO_MINI_BATCH_SIZE % PPO_MICRO_BATCH_SIZE != 0 )); then
+    echo "PPO_MINI_BATCH_SIZE must be divisible by PPO_MICRO_BATCH_SIZE" >&2
+    exit 2
+fi
+rollout_batch_size=$((TRAIN_BATCH_SIZE * N_AGENT))
+if (( rollout_batch_size % PPO_MINI_BATCH_SIZE != 0 )); then
+    echo "TRAIN_BATCH_SIZE*N_AGENT=$rollout_batch_size must be divisible by PPO_MINI_BATCH_SIZE=$PPO_MINI_BATCH_SIZE" >&2
     exit 2
 fi
 
@@ -366,13 +427,13 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.max_model_len="$VLLM_MAX_MODEL_LEN" \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size="$ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE" \
     actor_rollout_ref.rollout.n=1 \
-    actor_rollout_ref.rollout.n_agent=5 \
+    actor_rollout_ref.rollout.n_agent="$N_AGENT" \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size="$REF_LOG_PROB_MICRO_BATCH_SIZE" \
     actor_rollout_ref.ref.fsdp_config.param_offload="$REF_FSDP_PARAM_OFFLOAD" \
     trainer.logger="['console','wandb']" \
     trainer.metrics_level="$METRICS_LEVEL" \

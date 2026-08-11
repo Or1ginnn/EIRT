@@ -206,6 +206,34 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
 
+    def test_three_gpu_profile_uses_divisible_batches_and_conservative_offload(self):
+        root = Path(__file__).resolve().parents[1]
+        profile = (
+            root / "scripts" / "train" / "train_eitr_nq_hotpotqa_3gpu.sh"
+        ).read_text()
+        smoke = (
+            root / "scripts" / "train" / "train_eitr_nq_gate_c_smoke.sh"
+        ).read_text()
+        self.assertIn('CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3}"', profile)
+        self.assertIn('NUM_GPUS="${NUM_GPUS:-3}"', profile)
+        self.assertIn('TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-30}"', profile)
+        self.assertIn('PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-30}"', profile)
+        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-6}"', profile)
+        self.assertIn(
+            'ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-true}"',
+            profile,
+        )
+        self.assertIn('Physical GPU0 is reserved and must not be used', smoke)
+        self.assertIn('divisible by NUM_GPUS=', smoke)
+        self.assertIn(
+            'actor_rollout_ref.rollout.log_prob_micro_batch_size="$ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE"',
+            smoke,
+        )
+        self.assertIn(
+            'actor_rollout_ref.ref.log_prob_micro_batch_size="$REF_LOG_PROB_MICRO_BATCH_SIZE"',
+            smoke,
+        )
+
     def test_combined_worker_offloads_reference_without_offloading_actor(self):
         source = (
             Path(__file__).resolve().parents[1]
@@ -1144,7 +1172,7 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         self.assertEqual(action_ids, [203, 202])
         self.assertIsNone(reason)
 
-    def test_same_state_probe_rounds_use_distinct_seeds(self):
+    def test_same_state_probe_candidates_use_one_multi_sample_call(self):
         class FakeDataProto:
             @staticmethod
             def from_dict(batch):
@@ -1185,15 +1213,16 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         manager._eitr_probe_groups = [None]
         manager._eitr_probe_collection_stats = Counter()
         manager._eitr_probe_call_index = 0
-        seen_seeds = []
-        seen_max_tokens = []
+        seen_sampling_params = []
 
         def fake_generate(prompts):
-            seen_seeds.append(prompts.meta_info["sampling_params"]["seed"])
-            seen_max_tokens.append(prompts.meta_info["sampling_params"]["max_tokens"])
-            token = 301 + len(seen_seeds)
+            seen_sampling_params.append(dict(prompts.meta_info["sampling_params"]))
             return SimpleNamespace(batch={
-                "responses": torch.tensor([[token, 999, 0]], dtype=torch.long)
+                "responses": torch.tensor([
+                    [302, 999, 0],
+                    [303, 999, 0],
+                    [304, 999, 0],
+                ], dtype=torch.long)
             })
 
         manager._generate_with_gpu_padding = fake_generate
@@ -1209,11 +1238,60 @@ class SearchR1CompatibilityTest(unittest.TestCase):
         finally:
             generation_module.DataProto = original_data_proto
 
-        self.assertEqual(seen_seeds, [123, 124, 125])
-        self.assertEqual(seen_max_tokens, [3, 3, 3])
-        self.assertEqual(manager._eitr_probe_collection_stats["probe_generation_call_count"], 3)
+        self.assertEqual(seen_sampling_params, [{
+            "max_tokens": 3,
+            "n": 3,
+            "seed": 123,
+        }])
+        self.assertEqual(manager._eitr_probe_collection_stats["probe_generation_call_count"], 1)
+        self.assertEqual(manager._eitr_probe_collection_stats["probe_candidate_generated"], 3)
         self.assertEqual(group["effective_probe_count"], 4)
         self.assertEqual(len({probe["query"] for probe in group["probes"]}), 4)
+
+    def test_multi_sample_gpu_padding_discards_all_padded_prompt_outputs(self):
+        class FakeDataProto:
+            @staticmethod
+            def from_dict(batch):
+                return SimpleNamespace(batch=batch, meta_info={})
+
+        class FakeRolloutGroup:
+            def generate_sequences(self, prompts):
+                self.prompt_rows = int(prompts.batch["input_ids"].shape[0])
+                return SimpleNamespace(
+                    batch={"responses": torch.arange(9).reshape(9, 1)},
+                    meta_info={},
+                )
+
+        manager = object.__new__(LLMGenerationManager)
+        manager.config = SimpleNamespace(num_gpus=3, collect_eitr_probes=True)
+        manager.actor_rollout_wg = FakeRolloutGroup()
+        active_batch = SimpleNamespace(
+            batch={"input_ids": torch.tensor([[1], [2]])},
+            meta_info={"sampling_params": {"n": 3}},
+        )
+        original_data_proto = generation_module.DataProto
+        generation_module.DataProto = FakeDataProto
+        try:
+            output = manager._generate_with_gpu_padding(active_batch)
+        finally:
+            generation_module.DataProto = original_data_proto
+
+        self.assertEqual(manager.actor_rollout_wg.prompt_rows, 3)
+        self.assertEqual(output.batch["responses"].flatten().tolist(), list(range(6)))
+
+    def test_vllm_rollout_shapes_temporary_multi_sample_requests_from_request_n(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "rollout"
+            / "vllm_rollout"
+            / "vllm_rollout.py"
+        ).read_text()
+        self.assertIn("request_n = int(kwargs.get('n', self.config.n))", source)
+        self.assertIn("idx = idx.repeat_interleave(request_n, dim=0)", source)
+        self.assertNotIn("if self.config.n > 1 and do_sample:", source)
+
 
 class ScorePathNoopDirectionAuditTest(unittest.TestCase):
     def _cached_batch(self):

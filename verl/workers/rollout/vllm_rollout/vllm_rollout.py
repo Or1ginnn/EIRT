@@ -165,6 +165,13 @@ class vLLMRollout(BaseRollout):
             idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
         do_sample = prompts.meta_info.get('do_sample', True)
+        # ``n`` may be overridden for a probe-only request even though the
+        # ordinary rollout config keeps n=1.  Shape the returned prompt-side
+        # tensors from the effective request value, not the static config, so
+        # one vLLM call can return K-1 independent same-state probe samples.
+        request_n = int(kwargs.get('n', self.config.n)) if do_sample else 1
+        if request_n <= 0:
+            raise ValueError(f'vLLM sampling n must be positive, got {request_n}')
         if not do_sample:
             kwargs = {
                 'best_of': 1,
@@ -192,11 +199,11 @@ class vLLMRollout(BaseRollout):
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
             log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
 
-        if self.config.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
-            position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
-            batch_size = batch_size * self.config.n
+        if request_n > 1:
+            idx = idx.repeat_interleave(request_n, dim=0)
+            attention_mask = attention_mask.repeat_interleave(request_n, dim=0)
+            position_ids = position_ids.repeat_interleave(request_n, dim=0)
+            batch_size = batch_size * request_n
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
