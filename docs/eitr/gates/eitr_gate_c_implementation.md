@@ -264,14 +264,14 @@ outer updates。这保留Search-R1 v0.3原1005步配置中的约286步actor warm
 早期的 EITR 实际作用由 GRPO proposal drift 与 rollout coverage 自然控制，而不是
 再次对 correction LR 乘 actor warmup factor。
 
-为减少两卡正式训练中过小 micro-batch 带来的调度开销，在 actor optimizer-state
-offload 与 batch CPU streaming 已生效后，下一轮性能 smoke 将
-`PPO_MICRO_BATCH_SIZE`、`EITR_PROBE_MICRO_BATCH_SIZE` 和
-`EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE` 从4提高到8。三者只改变同一批张量的分块
-方式，不改变全局 train batch=32、PPO mini-batch=32、K=4、loss 或 optimizer step
-数；必须先通过1-step显存与数值 smoke，才能作为新的正式默认继续长跑。
+正式默认继续保持 `PPO_MICRO_BATCH_SIZE=4`、
+`EITR_PROBE_MICRO_BATCH_SIZE=4` 和
+`EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE=4`。虽然更大的8/8/8只改变同一批张量的
+分块方式，不改变全局 train batch=32、PPO mini-batch=32、K=4、loss 或 optimizer
+step数，但真实4/4/4任务已在第8个随机长batch的EITR correction backward发生OOM，
+因此在释放训练GPU上的Retriever显存前，8/8/8不再是可接受候选。
 
-性能 smoke 同时记录 `timing_s/real_retrieval`、
+性能诊断继续记录 `timing_s/real_retrieval`、
 `timing_s/eitr_probe_generation`、`timing_s/eitr_probe_retrieval`、
 `timing_s/eitr_probe_old_logprob`、`timing_s/grpo_update` 和
 `timing_s/eitr_correction`，用真实分阶段耗时区分 EITR 计算成本与 CPU offload 成本。

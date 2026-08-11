@@ -319,11 +319,18 @@ update，但在 `EITR correction_loss.backward()` 再次 OOM：
 probe micro-batch=4、同一loss/reward/LR/lambda。新增W&B指标分别记录batch streaming
 开关以及AdamW state的load/offload耗时，用于量化该显存修复的速度代价。
 
-该内存安全路径使正式 batch 能越过 correction backward，但4/4/4的保守
-micro-batch 带来明显调度开销。下一轮性能 smoke 因此在不改变全局 batch、K、loss
-或更新次数的前提下测试8/8/8，并新增 probe generation、probe retrieval、old
-scoring、GRPO update 与 EITR correction 的独立 wall-time 指标；8/8/8在1-step
-实测通过前不能宣称稳定。
+该内存安全路径一度让正式训练连续完成7个outer updates，但第8个随机长batch仍在
+EITR correction backward OOM：物理GPU1上的训练进程约占 `64.8 GB`，Retriever约
+占 `12 GB`，其他服务约占 `1 GB`；仅剩 `1.32 GB` 时，backward还需申请
+`2.53 GB`。因此“前几步通过”不能作为正式显存稳定性的证据，4/4/4已经是当前完整
+K=4 state的保守分块，8/8/8候选随之作废。训练已自动退出且未重试，物理GPU0未被
+触碰；日志为
+`/mnt/data1/zar/eitr_storage/logs/eitr-nq-hotpotqa-v03-full-lr3e5-cpu-offload-v1.log`。
+
+下一步应优先释放训练GPU1、3上由Retriever占用的约24GB，而不是继续增大
+micro-batch或修改EITR数学。分阶段 wall-time 指标仍然保留，用于在显存问题解决后
+量化 probe generation、probe retrieval、old scoring、GRPO update 与 EITR
+correction 的真实成本。
 
 ## 7. 这次 PASS 能证明和不能证明什么
 

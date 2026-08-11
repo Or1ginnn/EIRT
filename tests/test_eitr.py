@@ -180,7 +180,7 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
         self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
-        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-8}"', runner)
+        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"', runner)
         self.assertIn(
             'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
             runner,
@@ -198,11 +198,11 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
         self.assertIn(
-            'EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-8}"',
+            'EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE="${EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE:-4}"',
             runner,
         )
         self.assertIn(
-            'EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-8}"',
+            'EITR_PROBE_MICRO_BATCH_SIZE="${EITR_PROBE_MICRO_BATCH_SIZE:-4}"',
             runner,
         )
 
