@@ -240,7 +240,15 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('NUM_GPUS="${NUM_GPUS:-3}"', profile)
         self.assertIn('TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-30}"', profile)
         self.assertIn('PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-30}"', profile)
-        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-3}"', profile)
+        self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-6}"', profile)
+        self.assertIn(
+            'EITR_PROBE_GRADIENT_CHECKPOINTING="${EITR_PROBE_GRADIENT_CHECKPOINTING:-true}"',
+            profile,
+        )
+        self.assertIn(
+            'EITR_COMPACT_INVALID_STATES="${EITR_COMPACT_INVALID_STATES:-true}"',
+            profile,
+        )
         self.assertIn(
             'ACTOR_FSDP_OPTIMIZER_OFFLOAD="${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-true}"',
             profile,
