@@ -93,6 +93,7 @@ def normalized_correction_step(
     correction_lr: float,
     grad_clip: float,
     max_update_norm: Optional[float],
+    min_update_norm: Optional[float] = None,
 ) -> Dict[str, float]:
     """Resolve one stateless SGD step under a global update-norm ceiling.
 
@@ -116,11 +117,33 @@ def normalized_correction_step(
             raise ValueError(
                 "EITR correction_max_update_norm must be finite and positive"
             )
+    if min_update_norm is not None:
+        min_update_norm = float(min_update_norm)
+        if not math.isfinite(min_update_norm) or min_update_norm <= 0:
+            raise ValueError(
+                "EITR correction_min_update_norm must be finite and positive"
+            )
+    if (
+        min_update_norm is not None
+        and max_update_norm is not None
+        and min_update_norm > max_update_norm
+    ):
+        raise ValueError(
+            "EITR correction_min_update_norm must not exceed "
+            "correction_max_update_norm"
+        )
 
     clipped_grad_norm = min(grad_norm, grad_clip)
     unnormalized_update_norm = correction_lr * clipped_grad_norm
-    normalization_scale = 1.0
-    if (
+    should_apply = bool(
+        unnormalized_update_norm > 0
+        and (
+            min_update_norm is None
+            or unnormalized_update_norm >= min_update_norm
+        )
+    )
+    normalization_scale = 1.0 if should_apply else 0.0
+    if should_apply and (
         max_update_norm is not None
         and unnormalized_update_norm > max_update_norm
     ):
@@ -129,6 +152,8 @@ def normalized_correction_step(
     return {
         "clipped_grad_norm": clipped_grad_norm,
         "unnormalized_update_norm": unnormalized_update_norm,
+        "min_update_norm": float(min_update_norm or 0.0),
+        "should_apply": float(should_apply),
         "normalization_scale": normalization_scale,
         "effective_lr": effective_lr,
         "predicted_update_norm": effective_lr * clipped_grad_norm,
@@ -686,6 +711,9 @@ def validate_eitr_config(
     correction_max_update_norm = _config_value(
         config, "correction_max_update_norm", None
     )
+    correction_min_update_norm = _config_value(
+        config, "correction_min_update_norm", None
+    )
     post_diagnostic_freq = int(_config_value(config, "post_diagnostic_freq", 0))
     log_ratio_clip = float(_config_value(config, "log_ratio_clip", 10.0))
     informative_js_threshold = float(_config_value(config, "informative_js_threshold", 0.01))
@@ -786,6 +814,22 @@ def validate_eitr_config(
     ):
         raise ValueError(
             "EITR correction_max_update_norm must be finite and positive"
+        )
+    if correction_min_update_norm is not None and (
+        not math.isfinite(float(correction_min_update_norm))
+        or float(correction_min_update_norm) <= 0
+    ):
+        raise ValueError(
+            "EITR correction_min_update_norm must be finite and positive"
+        )
+    if (
+        correction_min_update_norm is not None
+        and correction_max_update_norm is not None
+        and float(correction_min_update_norm) > float(correction_max_update_norm)
+    ):
+        raise ValueError(
+            "EITR correction_min_update_norm must not exceed "
+            "correction_max_update_norm"
         )
     if post_diagnostic_freq < 0:
         raise ValueError("EITR post_diagnostic_freq must be non-negative")

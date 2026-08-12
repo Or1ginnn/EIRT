@@ -12,6 +12,7 @@ export EITR_PROBE_COUNT="${EITR_PROBE_COUNT:-4}"
 # predicted global parameter-update norm without adding a second model pass.
 export EITR_LR="${EITR_LR:-3e-5}"
 export EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"
+export EITR_MIN_UPDATE_NORM="${EITR_MIN_UPDATE_NORM:-3e-6}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-hotpotqa-v03-phase2-full}"
 export METRICS_LEVEL="${METRICS_LEVEL:-core}"
 export EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-10}"

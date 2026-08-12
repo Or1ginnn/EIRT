@@ -99,6 +99,14 @@ class DataParallelPPOActor(BasePPOActor):
             if configured_max_update_norm is None
             else float(configured_max_update_norm)
         )
+        configured_min_update_norm = self.eitr_config.get(
+            'correction_min_update_norm', None
+        )
+        self.eitr_correction_min_update_norm = (
+            None
+            if configured_min_update_norm is None
+            else float(configured_min_update_norm)
+        )
         self.eitr_post_diagnostic_freq = int(
             self.eitr_config.get('post_diagnostic_freq', 0)
         )
@@ -291,16 +299,18 @@ class DataParallelPPOActor(BasePPOActor):
             correction_lr=base_lrs[0],
             grad_clip=float(self.config.grad_clip),
             max_update_norm=self.eitr_correction_max_update_norm,
+            min_update_norm=self.eitr_correction_min_update_norm,
         )
-        try:
-            for group, base_lr in zip(self.eitr_optimizer.param_groups, base_lrs):
-                group['lr'] = base_lr * step['normalization_scale']
-            self.eitr_optimizer.step()
-        finally:
-            # The configured LR remains the fixed upper bound for the next
-            # batch; normalization is recomputed independently per correction.
-            for group, base_lr in zip(self.eitr_optimizer.param_groups, base_lrs):
-                group['lr'] = base_lr
+        if step['should_apply'] > 0.5:
+            try:
+                for group, base_lr in zip(self.eitr_optimizer.param_groups, base_lrs):
+                    group['lr'] = base_lr * step['normalization_scale']
+                self.eitr_optimizer.step()
+            finally:
+                # The configured LR remains the fixed upper bound for the next
+                # batch; normalization is recomputed independently per correction.
+                for group, base_lr in zip(self.eitr_optimizer.param_groups, base_lrs):
+                    group['lr'] = base_lr
         return grad_norm, step
 
     @contextmanager
@@ -2031,6 +2041,9 @@ class DataParallelPPOActor(BasePPOActor):
         score_path_noop_direction_audit_ran = False
         query_logprob_direction_sample = None
         eitr_effective_correction_lr = 0.0
+        eitr_correction_skipped_weak_update = False
+        eitr_post_diagnostic_noop = False
+        eitr_correction_decision_made = False
         if self.eitr_uses_probes:
             torch.cuda.synchronize()
             eitr_correction_start = time.perf_counter()
@@ -2283,7 +2296,14 @@ class DataParallelPPOActor(BasePPOActor):
                                 eitr_effective_correction_lr = normalized_step[
                                     'effective_lr'
                                 ]
-                                eitr_correction_optimizer_step_count += 1
+                                correction_applied = (
+                                    normalized_step['should_apply'] > 0.5
+                                )
+                                eitr_correction_decision_made = True
+                                if correction_applied:
+                                    eitr_correction_optimizer_step_count += 1
+                                else:
+                                    eitr_correction_skipped_weak_update = True
                                 append_to_dict(metrics, {
                                     'actor/eitr_correction_grad_norm': correction_grad_norm.detach().item(),
                                     'actor/eitr_correction_normalization_scale': normalized_step['normalization_scale'],
@@ -2292,6 +2312,12 @@ class DataParallelPPOActor(BasePPOActor):
                                     'actor/eitr_correction_predicted_update_norm': normalized_step['predicted_update_norm'],
                                     'actor/eitr_correction_max_update_norm': float(
                                         self.eitr_correction_max_update_norm or 0.0
+                                    ),
+                                    'actor/eitr_correction_min_update_norm': float(
+                                        self.eitr_correction_min_update_norm or 0.0
+                                    ),
+                                    'actor/eitr_correction_skipped_weak_update': float(
+                                        eitr_correction_skipped_weak_update
                                     ),
                                     f'actor/grad_norm_pass_{pass_index}': correction_grad_norm.detach().item(),
                                 })
@@ -2309,11 +2335,16 @@ class DataParallelPPOActor(BasePPOActor):
                         post_diagnostic_ran = should_run_post_diagnostic(
                             outer_update_step,
                             self.eitr_post_diagnostic_freq,
-                            correction_applied=(
-                                eitr_correction_optimizer_step_count > 0
-                            ),
+                            correction_applied=eitr_correction_decision_made,
                         )
-                        if post_diagnostic_ran:
+                        if post_diagnostic_ran and eitr_correction_skipped_weak_update:
+                            # Parameters are exactly unchanged, so the same cached
+                            # probe score is the exact post value without another
+                            # expensive model forward. Keep this visibly separate
+                            # from an applied correction that achieved descent.
+                            post_drift_stat_tensor = pre_drift_stat_tensor.clone()
+                            eitr_post_diagnostic_noop = True
+                        elif post_diagnostic_ran:
                             post_drift_stat_tensor = self._score_cached_eitr_drift(
                                 dataloader,
                                 temperature,
@@ -2452,6 +2483,10 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 'actor/eitr_env_drift_pre': env_drift_pre,
                 'actor/eitr_post_diagnostic_ran': float(post_diagnostic_ran),
+                'actor/eitr_post_diagnostic_noop': float(eitr_post_diagnostic_noop),
+                'actor/eitr_correction_skipped_weak_update': float(
+                    eitr_correction_skipped_weak_update
+                ),
                 'actor/eitr_same_batch_scale_diagnostic_ran': float(
                     same_batch_scale_diagnostic_ran
                 ),

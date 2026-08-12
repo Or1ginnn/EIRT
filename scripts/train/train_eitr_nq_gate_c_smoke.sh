@@ -68,6 +68,9 @@ EITR_LR="${EITR_LR:-$ACTOR_LR}"
 # Preserve the fixed LR as an upper bound, while preventing an unusually large
 # batch gradient from producing an oversized one-shot correction.
 EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"
+# Skip the SGD commit when the batch predicts less than this much movement.
+# The EITR gradient is still measured; no second backward or score pass is added.
+EITR_MIN_UPDATE_NORM="${EITR_MIN_UPDATE_NORM:-3e-6}"
 EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-1}"
 EITR_SAME_BATCH_SCALE_DIAGNOSTIC="${EITR_SAME_BATCH_SCALE_DIAGNOSTIC:-false}"
 EITR_UPDATE_DIRECTION_DIAGNOSTIC="${EITR_UPDATE_DIRECTION_DIAGNOSTIC:-false}"
@@ -432,6 +435,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.eitr.correction_optimizer=sgd \
     actor_rollout_ref.actor.eitr.correction_lr="$EITR_LR" \
     actor_rollout_ref.actor.eitr.correction_max_update_norm="$EITR_MAX_UPDATE_NORM" \
+    actor_rollout_ref.actor.eitr.correction_min_update_norm="$EITR_MIN_UPDATE_NORM" \
     actor_rollout_ref.actor.eitr.post_diagnostic_freq="$EITR_POST_DIAGNOSTIC_FREQ" \
     actor_rollout_ref.actor.eitr.same_batch_scale_diagnostic="$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" \
     actor_rollout_ref.actor.eitr.update_direction_diagnostic="$EITR_UPDATE_DIRECTION_DIAGNOSTIC" \

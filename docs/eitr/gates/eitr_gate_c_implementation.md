@@ -102,6 +102,7 @@ eitr:
   # 固定 LR 现在是单次 correction 的上限；大梯度 batch 自动缩短该步。
   correction_lr: 3e-5
   correction_max_update_norm: 3e-6
+  correction_min_update_norm: 3e-6
   post_diagnostic_freq: 10
   lambda_env: 0.1
   log_ratio_clip: 10.0
@@ -127,6 +128,14 @@ tau = correction_max_update_norm = 3e-6
 batch 只把同一负梯度方向等比例缩短。该实现仍然只有一次 EITR backward 和一次独立
 SGD step，不增加 probe、检索、模型重评分或参数快照。W&B 记录基础 LR、实际 LR、
 normalization scale 与预测更新范数；`actor/eitr_effective_step_scale` 使用实际 LR 计算。
+
+归一化10-step复验显示：归一化前预测更新达到上限的6个batch中5个下降，而低于上限的
+4个batch全部反弹。因此加入显式的弱更新门：仅当
+`eta_base * ||g_clipped|| >= correction_min_update_norm=3e-6` 时提交独立SGD；否则保留
+GRPO proposal，记录 `correction_skipped_weak_update=1`、真实 correction step为0。若该步
+按频率需要post诊断，由于参数未变，可直接精确记录 `D_post=D_pre`，并用
+`post_diagnostic_noop=1` 与一次实际下降的correction区分。这个门只刻画本batch预测更新是否
+达到当前经验阈值，不等价于query质量或理论置信度；其必要性需要新的20-step随机batch验证。
 
 三种 paired 模式统一使用 `rollout.top_p=1.0, top_k=-1`。EITR 的 SNIS ratio 使用 actor 完整 softmax 下的 query sequence log-prob，因此采样也必须来自同一个未截断分布；`probe_only/eitr` 若配置 nucleus 或 top-k 截断会在启动时直接拒绝。
 
@@ -157,6 +166,11 @@ LR scheduler 也以 outer update 为时间单位，因此 paired 的 `off/probe_
 - `trainer/target_outer_updates`
 - `actor/grpo_optimizer_step_count`
 - `actor/eitr_correction_optimizer_step_count`
+- `actor/eitr_correction_normalization_scale`
+- `actor/eitr_correction_unnormalized_update_norm`
+- `actor/eitr_correction_predicted_update_norm`
+- `actor/eitr_correction_skipped_weak_update`
+- `actor/eitr_post_diagnostic_noop`
 - `actor/optimizer_step_count`
 - 对应的 `*_cumulative` 累计指标
 

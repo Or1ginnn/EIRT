@@ -88,6 +88,9 @@ actor_rollout_ref:
       # Optional ceiling on ||delta_theta_EITR|| for the single stateless SGD
       # step. null preserves the original fixed-LR correction exactly.
       correction_max_update_norm: null
+      # Optional lower bound on the unnormalized predicted update. Batches
+      # below it keep the GRPO proposal and skip the stateless SGD commit.
+      correction_min_update_norm: null
       post_diagnostic_freq: 0  # 0 disables the extra post-correction re-score
       same_batch_scale_diagnostic: false  # debug-only, never enabled by formal runs
       update_direction_diagnostic: false  # one-shot +/- gradient audit only

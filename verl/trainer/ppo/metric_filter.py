@@ -29,6 +29,8 @@ CORE_METRIC_NAMES = {
     "actor/eitr_correction_unnormalized_update_norm",
     "actor/eitr_correction_predicted_update_norm",
     "actor/eitr_correction_max_update_norm",
+    "actor/eitr_correction_min_update_norm",
+    "actor/eitr_correction_skipped_weak_update",
     "actor/eitr_effective_step_scale",
     "actor/eitr_loss_applied",
     "actor/eitr_correction_optimizer_step_count",
@@ -43,6 +45,7 @@ CORE_METRIC_NAMES = {
     "actor/eitr_env_drift_delta",
     "actor/eitr_env_drift_relative_reduction",
     "actor/eitr_post_diagnostic_ran",
+    "actor/eitr_post_diagnostic_noop",
     "actor/optimizer_state_offloaded_for_eitr",
     "actor/batch_cpu_streaming",
     # Optimization stability.

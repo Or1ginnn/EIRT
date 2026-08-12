@@ -141,8 +141,13 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
         self.assertIn('EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"', runner)
+        self.assertIn('EITR_MIN_UPDATE_NORM="${EITR_MIN_UPDATE_NORM:-3e-6}"', runner)
         self.assertIn(
             'actor_rollout_ref.actor.eitr.correction_max_update_norm="$EITR_MAX_UPDATE_NORM"',
+            runner,
+        )
+        self.assertIn(
+            'actor_rollout_ref.actor.eitr.correction_min_update_norm="$EITR_MIN_UPDATE_NORM"',
             runner,
         )
 
@@ -208,6 +213,10 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('EITR_LR="${EITR_LR:-3e-5}"', runner)
         self.assertIn(
             'EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"',
+            runner,
+        )
+        self.assertIn(
+            'EITR_MIN_UPDATE_NORM="${EITR_MIN_UPDATE_NORM:-3e-6}"',
             runner,
         )
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
@@ -741,6 +750,30 @@ class EITRMathTest(unittest.TestCase):
         self.assertEqual(disabled["normalization_scale"], 1.0)
         self.assertAlmostEqual(disabled["effective_lr"], 3e-5)
 
+    def test_weak_predicted_update_skips_the_sgd_commit(self):
+        skipped = normalized_correction_step(
+            grad_norm=0.08,
+            correction_lr=3e-5,
+            grad_clip=1.0,
+            max_update_norm=3e-6,
+            min_update_norm=3e-6,
+        )
+        self.assertEqual(skipped["should_apply"], 0.0)
+        self.assertEqual(skipped["normalization_scale"], 0.0)
+        self.assertEqual(skipped["effective_lr"], 0.0)
+        self.assertEqual(skipped["predicted_update_norm"], 0.0)
+        self.assertAlmostEqual(skipped["unnormalized_update_norm"], 2.4e-6)
+
+        boundary = normalized_correction_step(
+            grad_norm=0.1,
+            correction_lr=3e-5,
+            grad_clip=1.0,
+            max_update_norm=3e-6,
+            min_update_norm=3e-6,
+        )
+        self.assertEqual(boundary["should_apply"], 1.0)
+        self.assertAlmostEqual(boundary["predicted_update_norm"], 3e-6)
+
     def test_normalized_correction_rejects_invalid_ceiling(self):
         for invalid in (0.0, -1.0, float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "correction_max_update_norm"):
@@ -754,6 +787,16 @@ class EITRMathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "correction_max_update_norm"):
             validate_eitr_config(
                 {"correction_max_update_norm": 0},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
+        with self.assertRaisesRegex(ValueError, "correction_min_update_norm"):
+            validate_eitr_config(
+                {
+                    "correction_min_update_norm": 4e-6,
+                    "correction_max_update_norm": 3e-6,
+                },
                 n_agent=5,
                 max_queries_per_turn=1,
                 rollout_n=1,
@@ -783,8 +826,27 @@ class EITRMathTest(unittest.TestCase):
         self.assertIn("self.actor_module.clip_grad_norm_", method)
         self.assertIn("normalized_correction_step(", method)
         self.assertEqual(method.count("self.eitr_optimizer.step()"), 1)
+        self.assertIn("if step['should_apply'] > 0.5:", method)
         self.assertNotIn("backward()", method)
         self.assertIn("group['lr'] = base_lr", method)
+
+    def test_weak_update_noop_drift_is_explicit_and_not_counted_as_correction(self):
+        actor_source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "actor"
+            / "dp_actor.py"
+        ).read_text()
+        self.assertIn("post_drift_stat_tensor = pre_drift_stat_tensor.clone()", actor_source)
+        self.assertIn("eitr_post_diagnostic_noop = True", actor_source)
+        self.assertIn(
+            "if correction_applied:\n                                    eitr_correction_optimizer_step_count += 1",
+            actor_source,
+        )
+        self.assertIn(
+            "'actor/eitr_correction_skipped_weak_update': float(", actor_source
+        )
 
     def test_variable_effective_k_has_finite_gradient(self):
         documents = torch.eye(4).unsqueeze(0)

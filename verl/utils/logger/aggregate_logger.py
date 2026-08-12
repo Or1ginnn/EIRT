@@ -28,6 +28,7 @@ HIGH_PRECISION_METRICS = {
     'actor/eitr_correction_unnormalized_update_norm',
     'actor/eitr_correction_predicted_update_norm',
     'actor/eitr_correction_max_update_norm',
+    'actor/eitr_correction_min_update_norm',
     'actor/eitr_effective_step_scale',
 }
 
