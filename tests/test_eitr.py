@@ -67,6 +67,7 @@ same_batch_sgd_candidates = EITR.same_batch_sgd_candidates
 probe_effect_diversity = EITR.probe_effect_diversity
 parameter_correction_diagnostics = EITR.parameter_correction_diagnostics
 proposal_signal_diagnostics = EITR.proposal_signal_diagnostics
+normalized_correction_step = EITR.normalized_correction_step
 rollout_averaged_env_drift = EITR.rollout_averaged_env_drift
 rank_owned_global_additive_stats = EITR.rank_owned_global_additive_stats
 resolved_query_direction_candidates = EITR.resolved_query_direction_candidates
@@ -139,6 +140,11 @@ class TrackingFlushTest(unittest.TestCase):
             'actor_rollout_ref.actor.eitr.compact_invalid_states="$EITR_COMPACT_INVALID_STATES"',
             runner,
         )
+        self.assertIn('EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"', runner)
+        self.assertIn(
+            'actor_rollout_ref.actor.eitr.correction_max_update_norm="$EITR_MAX_UPDATE_NORM"',
+            runner,
+        )
 
     def test_smoke_uses_search_r1_v03_format_reward(self):
         runner = (
@@ -199,6 +205,11 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn("data/nq_search", runner)
         self.assertIn('SHUFFLE_TRAIN_DATALOADER="${SHUFFLE_TRAIN_DATALOADER:-true}"', runner)
         self.assertIn('TRAIN_DATA_NUM="${TRAIN_DATA_NUM:-null}"', runner)
+        self.assertIn('EITR_LR="${EITR_LR:-3e-5}"', runner)
+        self.assertIn(
+            'EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"',
+            runner,
+        )
         self.assertIn('VAL_DATA_NUM="${VAL_DATA_NUM:-256}"', runner)
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
         self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
@@ -683,6 +694,97 @@ class EITRMathTest(unittest.TestCase):
                 default_lr=1e-3,
             )
         )
+
+    def test_normalized_correction_preserves_small_fixed_lr_step(self):
+        step = normalized_correction_step(
+            grad_norm=0.05,
+            correction_lr=3e-5,
+            grad_clip=1.0,
+            max_update_norm=3e-6,
+        )
+        self.assertEqual(step["normalization_scale"], 1.0)
+        self.assertEqual(step["effective_lr"], 3e-5)
+        self.assertAlmostEqual(step["predicted_update_norm"], 1.5e-6)
+
+    def test_normalized_correction_caps_one_sgd_update_without_flipping_direction(self):
+        step = normalized_correction_step(
+            grad_norm=0.2,
+            correction_lr=3e-5,
+            grad_clip=1.0,
+            max_update_norm=3e-6,
+        )
+        self.assertAlmostEqual(step["normalization_scale"], 0.5)
+        self.assertAlmostEqual(step["effective_lr"], 1.5e-5)
+        self.assertAlmostEqual(step["unnormalized_update_norm"], 6e-6)
+        self.assertAlmostEqual(step["predicted_update_norm"], 3e-6)
+        gradient = torch.tensor([3.0, -4.0])
+        delta = -step["effective_lr"] * gradient
+        self.assertLess(float(torch.dot(gradient, delta)), 0.0)
+
+    def test_normalized_correction_respects_actor_clip_and_can_be_disabled(self):
+        clipped = normalized_correction_step(
+            grad_norm=4.0,
+            correction_lr=3e-5,
+            grad_clip=1.0,
+            max_update_norm=3e-6,
+        )
+        self.assertEqual(clipped["clipped_grad_norm"], 1.0)
+        self.assertAlmostEqual(clipped["normalization_scale"], 0.1)
+        self.assertAlmostEqual(clipped["predicted_update_norm"], 3e-6)
+
+        disabled = normalized_correction_step(
+            grad_norm=0.2,
+            correction_lr=3e-5,
+            grad_clip=1.0,
+            max_update_norm=None,
+        )
+        self.assertEqual(disabled["normalization_scale"], 1.0)
+        self.assertAlmostEqual(disabled["effective_lr"], 3e-5)
+
+    def test_normalized_correction_rejects_invalid_ceiling(self):
+        for invalid in (0.0, -1.0, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "correction_max_update_norm"):
+                normalized_correction_step(
+                    grad_norm=0.2,
+                    correction_lr=3e-5,
+                    grad_clip=1.0,
+                    max_update_norm=invalid,
+                )
+
+        with self.assertRaisesRegex(ValueError, "correction_max_update_norm"):
+            validate_eitr_config(
+                {"correction_max_update_norm": 0},
+                n_agent=5,
+                max_queries_per_turn=1,
+                rollout_n=1,
+            )
+        for invalid_lr in (float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "correction_lr"):
+                validate_eitr_config(
+                    {"correction_lr": invalid_lr},
+                    n_agent=5,
+                    max_queries_per_turn=1,
+                    rollout_n=1,
+                )
+
+    def test_actor_uses_single_global_normalized_step(self):
+        actor_source = (
+            Path(__file__).resolve().parents[1]
+            / "verl"
+            / "workers"
+            / "actor"
+            / "dp_actor.py"
+        ).read_text()
+        method_start = actor_source.index(
+            "    def _normalized_eitr_optimizer_step(self):"
+        )
+        method_end = actor_source.index("    @contextmanager", method_start)
+        method = actor_source[method_start:method_end]
+        self.assertIn("self.actor_module.clip_grad_norm_", method)
+        self.assertIn("normalized_correction_step(", method)
+        self.assertEqual(method.count("self.eitr_optimizer.step()"), 1)
+        self.assertNotIn("backward()", method)
+        self.assertIn("group['lr'] = base_lr", method)
 
     def test_variable_effective_k_has_finite_gradient(self):
         documents = torch.eye(4).unsqueeze(0)

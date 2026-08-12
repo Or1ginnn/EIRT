@@ -87,6 +87,54 @@ def eitr_score_path_noop_direction_audit_enabled(config: Any) -> bool:
     return bool(enabled)
 
 
+def normalized_correction_step(
+    *,
+    grad_norm: float,
+    correction_lr: float,
+    grad_clip: float,
+    max_update_norm: Optional[float],
+) -> Dict[str, float]:
+    """Resolve one stateless SGD step under a global update-norm ceiling.
+
+    Ordinary actor gradient clipping remains authoritative.  EITR then scales
+    the single SGD learning rate only when ``lr * ||clipped_grad||`` would
+    exceed ``max_update_norm``.  This preserves the correction direction and
+    adds no extra forward, backward, retriever call, or parameter snapshot.
+    """
+    grad_norm = float(grad_norm)
+    correction_lr = float(correction_lr)
+    grad_clip = float(grad_clip)
+    if not math.isfinite(grad_norm) or grad_norm < 0:
+        raise ValueError("EITR correction grad_norm must be finite and non-negative")
+    if not math.isfinite(correction_lr) or correction_lr <= 0:
+        raise ValueError("EITR correction_lr must be finite and positive")
+    if not math.isfinite(grad_clip) or grad_clip <= 0:
+        raise ValueError("EITR grad_clip must be finite and positive")
+    if max_update_norm is not None:
+        max_update_norm = float(max_update_norm)
+        if not math.isfinite(max_update_norm) or max_update_norm <= 0:
+            raise ValueError(
+                "EITR correction_max_update_norm must be finite and positive"
+            )
+
+    clipped_grad_norm = min(grad_norm, grad_clip)
+    unnormalized_update_norm = correction_lr * clipped_grad_norm
+    normalization_scale = 1.0
+    if (
+        max_update_norm is not None
+        and unnormalized_update_norm > max_update_norm
+    ):
+        normalization_scale = max_update_norm / unnormalized_update_norm
+    effective_lr = correction_lr * normalization_scale
+    return {
+        "clipped_grad_norm": clipped_grad_norm,
+        "unnormalized_update_norm": unnormalized_update_norm,
+        "normalization_scale": normalization_scale,
+        "effective_lr": effective_lr,
+        "predicted_update_norm": effective_lr * clipped_grad_norm,
+    }
+
+
 def same_batch_cache_signature(batch: Mapping[str, torch.Tensor]) -> Tuple[Tuple[Any, ...], ...]:
     """Describe cached EITR tensors without copying or mutating them."""
     return tuple(
@@ -592,8 +640,8 @@ def build_eitr_correction_optimizer(
         )
     configured_lr = _config_value(config, "correction_lr", None)
     correction_lr = float(default_lr if configured_lr is None else configured_lr)
-    if correction_lr <= 0:
-        raise ValueError("EITR correction_lr must be positive")
+    if not math.isfinite(correction_lr) or correction_lr <= 0:
+        raise ValueError("EITR correction_lr must be finite and positive")
     return torch.optim.SGD(
         parameters,
         lr=correction_lr,
@@ -635,6 +683,9 @@ def validate_eitr_config(
         _config_value(config, "correction_optimizer", "sgd")
     ).strip().lower()
     correction_lr = _config_value(config, "correction_lr", None)
+    correction_max_update_norm = _config_value(
+        config, "correction_max_update_norm", None
+    )
     post_diagnostic_freq = int(_config_value(config, "post_diagnostic_freq", 0))
     log_ratio_clip = float(_config_value(config, "log_ratio_clip", 10.0))
     informative_js_threshold = float(_config_value(config, "informative_js_threshold", 0.01))
@@ -725,8 +776,17 @@ def validate_eitr_config(
         raise ValueError("EITR lambda_env must be non-negative")
     if correction_optimizer != "sgd":
         raise ValueError("V6 EITR correction_optimizer must be 'sgd'")
-    if correction_lr is not None and float(correction_lr) <= 0:
-        raise ValueError("EITR correction_lr must be positive")
+    if correction_lr is not None and (
+        not math.isfinite(float(correction_lr)) or float(correction_lr) <= 0
+    ):
+        raise ValueError("EITR correction_lr must be finite and positive")
+    if correction_max_update_norm is not None and (
+        not math.isfinite(float(correction_max_update_norm))
+        or float(correction_max_update_norm) <= 0
+    ):
+        raise ValueError(
+            "EITR correction_max_update_norm must be finite and positive"
+        )
     if post_diagnostic_freq < 0:
         raise ValueError("EITR post_diagnostic_freq must be non-negative")
     if log_ratio_clip <= 0:

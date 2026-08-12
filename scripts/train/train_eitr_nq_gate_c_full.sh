@@ -8,6 +8,10 @@ export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"
 export EITR_MODE="${EITR_MODE:-eitr}"
 export EITR_PROBE_PROBABILITY="${EITR_PROBE_PROBABILITY:-1.0}"
 export EITR_PROBE_COUNT="${EITR_PROBE_COUNT:-4}"
+# Normalized one-shot correction: 3e-5 is the LR ceiling and 3e-6 caps the
+# predicted global parameter-update norm without adding a second model pass.
+export EITR_LR="${EITR_LR:-3e-5}"
+export EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-hotpotqa-v03-phase2-full}"
 export METRICS_LEVEL="${METRICS_LEVEL:-core}"
 export EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-10}"

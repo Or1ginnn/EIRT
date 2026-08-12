@@ -99,7 +99,9 @@ eitr:
   max_probe_prompt_tokens: 8692
   correction_passes: 1
   correction_optimizer: sgd
-  correction_lr: 5e-7
+  # 固定 LR 现在是单次 correction 的上限；大梯度 batch 自动缩短该步。
+  correction_lr: 3e-5
+  correction_max_update_norm: 3e-6
   post_diagnostic_freq: 10
   lambda_env: 0.1
   log_ratio_clip: 10.0
@@ -113,9 +115,18 @@ eitr:
 每轮提供给模型的 rolling prompt 均为 `8192` token。两者使用独立配置，当前取值相同。
 
 三种 paired 模式的 GRPO 统一使用 Search-R1 v0.3 actor AdamW 参数。EITR
-correction 使用独立 SGD，`momentum=0, weight_decay=0`；默认 correction LR
-继承 actor LR，当前正式配置为 `5e-7`。实际一阶尺度同时记录
-`correction_lr * lambda_env * coverage`，不再继承 GRPO AdamW 的历史状态。
+correction 使用独立 SGD，`momentum=0, weight_decay=0`。当前把
+`correction_lr=3e-5` 作为单次 correction 的基础 LR 上限，并在更新前根据全局参数梯度范数计算：
+
+```text
+eta_effective = eta_base * min(1, tau / (eta_base * ||g_clipped||))
+tau = correction_max_update_norm = 3e-6
+```
+
+因此预测参数更新范数不超过 `3e-6`。小梯度 batch 与原固定 LR 完全相同；大梯度
+batch 只把同一负梯度方向等比例缩短。该实现仍然只有一次 EITR backward 和一次独立
+SGD step，不增加 probe、检索、模型重评分或参数快照。W&B 记录基础 LR、实际 LR、
+normalization scale 与预测更新范数；`actor/eitr_effective_step_scale` 使用实际 LR 计算。
 
 三种 paired 模式统一使用 `rollout.top_p=1.0, top_k=-1`。EITR 的 SNIS ratio 使用 actor 完整 softmax 下的 query sequence log-prob，因此采样也必须来自同一个未截断分布；`probe_only/eitr` 若配置 nucleus 或 top-k 截断会在启动时直接拒绝。
 

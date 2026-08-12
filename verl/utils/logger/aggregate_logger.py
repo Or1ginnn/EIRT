@@ -24,6 +24,10 @@ HIGH_PRECISION_METRICS = {
     'actor/eitr_env_drift_delta',
     'actor/eitr_env_drift_relative_reduction',
     'actor/eitr_correction_lr',
+    'actor/eitr_correction_effective_lr',
+    'actor/eitr_correction_unnormalized_update_norm',
+    'actor/eitr_correction_predicted_update_norm',
+    'actor/eitr_correction_max_update_norm',
     'actor/eitr_effective_step_scale',
 }
 

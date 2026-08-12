@@ -39,6 +39,7 @@ from verl.trainer.ppo.eitr import (
     eitr_probe_enabled_for_pass,
     induced_js_from_cached_effects,
     parameter_correction_diagnostics,
+    normalized_correction_step,
     proposal_signal_diagnostics,
     rank_owned_global_additive_stats,
     resolved_query_direction_candidates,
@@ -90,6 +91,14 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_mode = resolve_eitr_mode(self.eitr_config)
         self.eitr_uses_probes = self.eitr_mode != 'off'
         self.eitr_lambda_env = float(self.eitr_config.get('lambda_env', 0.1))
+        configured_max_update_norm = self.eitr_config.get(
+            'correction_max_update_norm', None
+        )
+        self.eitr_correction_max_update_norm = (
+            None
+            if configured_max_update_norm is None
+            else float(configured_max_update_norm)
+        )
         self.eitr_post_diagnostic_freq = int(
             self.eitr_config.get('post_diagnostic_freq', 0)
         )
@@ -260,6 +269,39 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         optimizer.step()
         return grad_norm
+
+    def _normalized_eitr_optimizer_step(self):
+        """Apply one stateless EITR SGD step with a global norm ceiling."""
+        if self.eitr_optimizer is None:
+            raise RuntimeError('Normalized EITR step requires its SGD optimizer')
+        base_lrs = [float(group['lr']) for group in self.eitr_optimizer.param_groups]
+        if not base_lrs or any(abs(lr - base_lrs[0]) > 1e-15 for lr in base_lrs[1:]):
+            raise RuntimeError('Normalized EITR requires one shared correction LR')
+
+        if isinstance(self.actor_module, FSDP):
+            grad_norm = self.actor_module.clip_grad_norm_(
+                max_norm=self.config.grad_clip
+            )
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_module.parameters(), max_norm=self.config.grad_clip
+            )
+        step = normalized_correction_step(
+            grad_norm=float(grad_norm.detach().item()),
+            correction_lr=base_lrs[0],
+            grad_clip=float(self.config.grad_clip),
+            max_update_norm=self.eitr_correction_max_update_norm,
+        )
+        try:
+            for group, base_lr in zip(self.eitr_optimizer.param_groups, base_lrs):
+                group['lr'] = base_lr * step['normalization_scale']
+            self.eitr_optimizer.step()
+        finally:
+            # The configured LR remains the fixed upper bound for the next
+            # batch; normalization is recomputed independently per correction.
+            for group, base_lr in zip(self.eitr_optimizer.param_groups, base_lrs):
+                group['lr'] = base_lr
+        return grad_norm, step
 
     @contextmanager
     def _temporary_probe_eval(self):
@@ -1988,6 +2030,7 @@ class DataParallelPPOActor(BasePPOActor):
         update_direction_diagnostic_ran = False
         score_path_noop_direction_audit_ran = False
         query_logprob_direction_sample = None
+        eitr_effective_correction_lr = 0.0
         if self.eitr_uses_probes:
             torch.cuda.synchronize()
             eitr_correction_start = time.perf_counter()
@@ -2234,12 +2277,22 @@ class DataParallelPPOActor(BasePPOActor):
                                 append_to_dict(metrics, diagnostic_metrics)
                                 update_direction_diagnostic_ran = True
                             else:
-                                correction_grad_norm = self._optimizer_step(
-                                    self.eitr_optimizer
+                                correction_grad_norm, normalized_step = (
+                                    self._normalized_eitr_optimizer_step()
                                 )
+                                eitr_effective_correction_lr = normalized_step[
+                                    'effective_lr'
+                                ]
                                 eitr_correction_optimizer_step_count += 1
                                 append_to_dict(metrics, {
                                     'actor/eitr_correction_grad_norm': correction_grad_norm.detach().item(),
+                                    'actor/eitr_correction_normalization_scale': normalized_step['normalization_scale'],
+                                    'actor/eitr_correction_effective_lr': normalized_step['effective_lr'],
+                                    'actor/eitr_correction_unnormalized_update_norm': normalized_step['unnormalized_update_norm'],
+                                    'actor/eitr_correction_predicted_update_norm': normalized_step['predicted_update_norm'],
+                                    'actor/eitr_correction_max_update_norm': float(
+                                        self.eitr_correction_max_update_norm or 0.0
+                                    ),
                                     f'actor/grad_norm_pass_{pass_index}': correction_grad_norm.detach().item(),
                                 })
                         elif (
@@ -2390,7 +2443,7 @@ class DataParallelPPOActor(BasePPOActor):
                 ),
                 'actor/eitr_correction_lr': correction_lr,
                 'actor/eitr_effective_step_scale': float(
-                    correction_lr
+                    eitr_effective_correction_lr
                     * self.eitr_lambda_env
                     * global_active_state_count.item()
                     / rollout_denominator

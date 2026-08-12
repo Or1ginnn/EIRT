@@ -65,6 +65,9 @@ EITR_MAX_QUERY_TOKENS="${EITR_MAX_QUERY_TOKENS:-$MAX_RESPONSE_LENGTH}"
 # Search-R1 v0.3 GRPO uses 5e-7 (v0.2 used 1e-6).
 ACTOR_LR="${ACTOR_LR:-5e-7}"
 EITR_LR="${EITR_LR:-$ACTOR_LR}"
+# Preserve the fixed LR as an upper bound, while preventing an unusually large
+# batch gradient from producing an oversized one-shot correction.
+EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"
 EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-1}"
 EITR_SAME_BATCH_SCALE_DIAGNOSTIC="${EITR_SAME_BATCH_SCALE_DIAGNOSTIC:-false}"
 EITR_UPDATE_DIRECTION_DIAGNOSTIC="${EITR_UPDATE_DIRECTION_DIAGNOSTIC:-false}"
@@ -428,6 +431,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.eitr.correction_passes="$EITR_CORRECTION_PASSES" \
     actor_rollout_ref.actor.eitr.correction_optimizer=sgd \
     actor_rollout_ref.actor.eitr.correction_lr="$EITR_LR" \
+    actor_rollout_ref.actor.eitr.correction_max_update_norm="$EITR_MAX_UPDATE_NORM" \
     actor_rollout_ref.actor.eitr.post_diagnostic_freq="$EITR_POST_DIAGNOSTIC_FREQ" \
     actor_rollout_ref.actor.eitr.same_batch_scale_diagnostic="$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" \
     actor_rollout_ref.actor.eitr.update_direction_diagnostic="$EITR_UPDATE_DIRECTION_DIAGNOSTIC" \
