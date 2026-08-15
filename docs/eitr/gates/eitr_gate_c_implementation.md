@@ -220,17 +220,17 @@ Collector 的具体拒绝原因仍以 `eitr/collector_*` 记录，例如 missing
 `info_mask` 标记的环境 observation 中判断 evidence；仅在文本里留下未执行的
 `<search>` 或模型伪造 `<information>` 都不能通过门控。没有真实搜索、工具轨迹不一致
 或模型伪造information时
-reward为0；完整协议格式不再是总硬门。通过环境门后，`think`格式0.2、最终`answer`
-格式0.1和答案EM 1.2分别提供独立软信号。训练reward不再使用
-answer-bearing evidence或严格协议联合奖励，满分仍为1.5。缺少`think`只损失0.2，
-不会清空已经成立的answer格式分或答案分。真实搜索即使返回空information也能通过搜索
+reward为0；最终必须有唯一、非空、正确闭合且位于轨迹末尾的`answer`，否则同样归零。
+通过这两个硬门后，`think`格式0.2、`answer`基础分0.1和答案EM 1.2组成训练reward。
+训练reward不再使用answer-bearing evidence或严格协议联合奖励，满分仍为1.5。缺少
+`think`只损失0.2，不会清空answer基础分或答案分。真实搜索即使返回空information也能通过搜索
 门；evidence命中只作为诊断，不改变reward，多轮命中也不累计。
 `off/probe_only/eitr`必须使用
 同一个显式profile，不能跨reward比较；EITR probe检索绝不能满足真实搜索门控。
 
 W&B 额外记录 `reward/answer_em_rate`、`reward/format_valid_rate`、
 `reward/configured_max_score`、`reward/mandatory_search_profile`、
-`reward/soft_format_components`、
+`reward/soft_format_components`、`reward/answer_hard_gate`、
 `reward/think_format_score`、`reward/answer_format_score`、
 `reward/evidence_score`、`reward/answer_em_score`、`reward/joint_success_bonus`、
 `reward/think_format_valid_rate`、`reward/answer_format_valid_rate`、

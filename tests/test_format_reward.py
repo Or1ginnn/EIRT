@@ -467,7 +467,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             1.5,
         )
 
-    def test_think_and_answer_are_soft_components_not_global_gates(self):
+    def test_think_is_soft_but_answer_is_a_hard_gate(self):
         missing_think = (
             "<search>capital of France</search>"
             "<information>Paris is the capital of France.</information>"
@@ -489,11 +489,29 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             self.score(missing_think, executed_search_count=1),
             1.3,
         )
-        self.assertAlmostEqual(
-            self.score(missing_answer, executed_search_count=1),
-            0.2,
-        )
+        self.assertEqual(self.score(missing_answer, executed_search_count=1), 0.0)
         self.assertEqual(self.score(empty_query, executed_search_count=1), 0.0)
+
+        malformed_answers = (
+            (
+                "<think>search</think><search>capital</search>"
+                "<information>Paris</information>"
+                "<think>finish</think><answer>Paris"
+            ),
+            (
+                "<think>search</think><search>capital</search>"
+                "<information>Paris</information>"
+                "<think>finish</think><answer>Paris</answer>trailing"
+            ),
+            (
+                "<think>search</think><search>capital</search>"
+                "<information>Paris</information>"
+                "<think>finish</think><answer>Paris</answer>"
+                "<answer>Paris</answer>"
+            ),
+        )
+        for malformed in malformed_answers:
+            self.assertEqual(self.score(malformed, executed_search_count=1), 0.0)
 
     def test_environment_tags_cannot_forge_model_answer_or_search(self):
         response_with_injected_answer = (
@@ -518,7 +536,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             model_generated_str=model_without_answer,
             return_details=True,
         )
-        self.assertAlmostEqual(score, 0.2)
+        self.assertEqual(score, 0.0)
         self.assertFalse(details["answer_format_valid"])
         self.assertFalse(details["answer_em"])
 

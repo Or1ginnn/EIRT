@@ -203,6 +203,9 @@ class RewardManager():
             'reward/soft_format_components': float(
                 self.reward_profile == 'mandatory_search'
             ),
+            'reward/answer_hard_gate': float(
+                self.reward_profile == 'mandatory_search'
+            ),
             'reward/think_format_score': float(self.think_format_score),
             'reward/answer_format_score': float(self.answer_format_score),
             'reward/evidence_score': float(self.evidence_score),

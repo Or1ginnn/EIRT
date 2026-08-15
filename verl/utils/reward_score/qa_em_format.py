@@ -581,6 +581,7 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
             and tool_trace_consistent
             and model_ownership_signal_available
             and not generated_information_detected
+            and answer_format_valid
         )
         eligible_answer_correct = bool(answer_correct)
         if not hard_reward_gate_pass:
@@ -588,7 +589,7 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         else:
             reward = (
                 float(think_format_score) * float(think_format_valid)
-                + float(answer_format_score) * float(answer_format_valid)
+                + float(answer_format_score)
                 + float(answer_em_score) * float(eligible_answer_correct)
             )
     elif reward_profile == 'pure_em':
