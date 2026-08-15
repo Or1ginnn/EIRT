@@ -273,11 +273,11 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             executed_search_count=executed_search_count,
             environment_observation_str=environment_observation_str,
             model_generated_str=model_generated_str,
-            think_format_score=0.05,
-            answer_format_score=0.05,
-            evidence_score=0.2,
-            answer_em_score=0.7,
-            joint_success_bonus=0.5,
+            think_format_score=0.2,
+            answer_format_score=0.1,
+            evidence_score=0.0,
+            answer_em_score=1.2,
+            joint_success_bonus=0.0,
             return_details=return_details,
         )
 
@@ -316,7 +316,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
 
         self.assertAlmostEqual(
             self.score(searched_miss_wrong, executed_search_count=1),
-            0.1,
+            0.3,
         )
         self.assertAlmostEqual(
             self.score(searched_hit_wrong, executed_search_count=1),
@@ -324,7 +324,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             self.score(searched_miss_correct, executed_search_count=1),
-            0.8,
+            1.5,
         )
         self.assertAlmostEqual(
             self.score(searched_hit_correct, executed_search_count=1),
@@ -400,22 +400,24 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             "<information>Paris is the capital of France.</information>"
         )
 
-        self.assertAlmostEqual(
-            self.score(
-                generated_hit_correct,
-                executed_search_count=1,
-                environment_observation_str=trusted_miss,
-            ),
-            0.8,
+        miss_score, miss_details = self.score(
+            generated_hit_correct,
+            executed_search_count=1,
+            environment_observation_str=trusted_miss,
+            return_details=True,
         )
-        self.assertAlmostEqual(
-            self.score(
-                generated_miss_correct,
-                executed_search_count=1,
-                environment_observation_str=trusted_hit,
-            ),
-            1.5,
+        hit_score, hit_details = self.score(
+            generated_miss_correct,
+            executed_search_count=1,
+            environment_observation_str=trusted_hit,
+            return_details=True,
         )
+        self.assertAlmostEqual(miss_score, 1.5)
+        self.assertAlmostEqual(hit_score, 1.5)
+        self.assertFalse(miss_details["answer_bearing_evidence"])
+        self.assertTrue(hit_details["answer_bearing_evidence"])
+        self.assertFalse(miss_details["evidence_bonus_applied"])
+        self.assertFalse(hit_details["evidence_bonus_applied"])
 
     def test_info_mask_decoder_excludes_generated_tokens(self):
         class Tokenizer:
@@ -462,7 +464,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
                     "<information></information>"
                 ),
             ),
-            0.8,
+            1.5,
         )
 
     def test_think_and_answer_are_soft_components_not_global_gates(self):
@@ -485,11 +487,11 @@ class HardSearchGatedRewardTest(unittest.TestCase):
 
         self.assertAlmostEqual(
             self.score(missing_think, executed_search_count=1),
-            0.95,
+            1.3,
         )
         self.assertAlmostEqual(
             self.score(missing_answer, executed_search_count=1),
-            0.25,
+            0.2,
         )
         self.assertEqual(self.score(empty_query, executed_search_count=1), 0.0)
 
@@ -516,7 +518,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             model_generated_str=model_without_answer,
             return_details=True,
         )
-        self.assertAlmostEqual(score, 0.25)
+        self.assertAlmostEqual(score, 0.2)
         self.assertFalse(details["answer_format_valid"])
         self.assertFalse(details["answer_em"])
 
@@ -639,7 +641,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             1.5,
         )
 
-    def test_success_bonus_requires_both_evidence_and_correct_answer(self):
+    def test_evidence_is_diagnostic_and_does_not_change_reward(self):
         searched_hit_wrong = self.searched(
             evidence="Paris is the capital of France.",
             answer="London",
@@ -659,7 +661,7 @@ class HardSearchGatedRewardTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             self.score(searched_miss_correct, executed_search_count=1),
-            0.8,
+            1.5,
         )
         score, details = self.score(
             searched_hit_correct,
@@ -667,8 +669,46 @@ class HardSearchGatedRewardTest(unittest.TestCase):
             return_details=True,
         )
         self.assertAlmostEqual(score, 1.5)
-        self.assertTrue(details["joint_success_bonus_applied"])
+        self.assertTrue(details["answer_bearing_evidence"])
+        self.assertFalse(details["evidence_bonus_applied"])
+        self.assertFalse(details["joint_success_bonus_applied"])
         self.assertTrue(details["hard_reward_gate_pass"])
+
+    def test_mandatory_search_rejects_evidence_or_joint_reward_weights(self):
+        searched_hit_correct = self.searched(
+            evidence="Paris is the capital of France.",
+            answer="Paris",
+        )
+        common = dict(
+            solution_str=self.PREFIX + searched_hit_correct,
+            ground_truth=self.GROUND_TRUTH,
+            reward_profile="mandatory_search",
+            executed_search_count=1,
+            environment_observation_str=(
+                "<information>Paris is the capital of France.</information>"
+            ),
+            model_generated_str=re.sub(
+                r"<information>.*?</information>",
+                "",
+                searched_hit_correct,
+                flags=re.DOTALL,
+            ),
+            think_format_score=0.2,
+            answer_format_score=0.1,
+            answer_em_score=1.2,
+        )
+        with self.assertRaisesRegex(ValueError, "evidence_score=0"):
+            QA_EM_FORMAT.compute_score_em(
+                **common,
+                evidence_score=0.2,
+                joint_success_bonus=0.0,
+            )
+        with self.assertRaisesRegex(ValueError, "joint_success_bonus=0"):
+            QA_EM_FORMAT.compute_score_em(
+                **common,
+                evidence_score=0.0,
+                joint_success_bonus=0.5,
+            )
 
     def test_group_diagnostics_measure_grpo_reward_contrast(self):
         diagnostics = QA_EM_FORMAT.reward_group_diagnostics(

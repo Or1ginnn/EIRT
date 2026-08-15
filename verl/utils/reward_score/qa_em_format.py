@@ -399,9 +399,9 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
                      reward_profile='pure_em', executed_search_count=None,
                      environment_observation_str=None,
                      model_generated_str=None,
-                     think_format_score=0.05, answer_format_score=0.05,
-                     evidence_score=0.2, answer_em_score=0.7,
-                     joint_success_bonus=0.5):
+                     think_format_score=0.2, answer_format_score=0.1,
+                     evidence_score=0.0, answer_em_score=1.2,
+                     joint_success_bonus=0.0):
     """The scoring function for exact match (EM).
 
     Args:
@@ -433,6 +433,21 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
             raise ValueError(
                 'mandatory_search reward components must be finite and '
                 f'non-negative, got {invalid_scores}'
+            )
+        disabled_scores = {
+            'evidence_score': float(evidence_score),
+            'joint_success_bonus': float(joint_success_bonus),
+        }
+        nonzero_disabled_scores = {
+            name: value
+            for name, value in disabled_scores.items()
+            if not math.isclose(value, 0.0, rel_tol=0.0, abs_tol=1e-12)
+        }
+        if nonzero_disabled_scores:
+            raise ValueError(
+                'mandatory_search uses evidence only as a diagnostic and '
+                'requires evidence_score=0 and joint_success_bonus=0; got '
+                f'{nonzero_disabled_scores}'
             )
     if reward_profile == 'official_v03':
         exact_v03 = {
@@ -561,11 +576,6 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     )
 
     if reward_profile == 'mandatory_search':
-        strict_protocol_valid = bool(
-            is_valid_format
-            and think_format_valid
-            and answer_format_valid
-        )
         hard_reward_gate_pass = bool(
             execution_signal_available
             and tool_trace_consistent
@@ -573,24 +583,13 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
             and not generated_information_detected
         )
         eligible_answer_correct = bool(answer_correct)
-        eligible_evidence = bool(
-            retrieval_correct and tool_trace_consistent
-        )
-        full_success = bool(
-            strict_protocol_valid
-            and hard_reward_gate_pass
-            and eligible_evidence
-            and eligible_answer_correct
-        )
         if not hard_reward_gate_pass:
             reward = 0.0
         else:
             reward = (
                 float(think_format_score) * float(think_format_valid)
                 + float(answer_format_score) * float(answer_format_valid)
-                + float(evidence_score) * float(eligible_evidence)
                 + float(answer_em_score) * float(eligible_answer_correct)
-                + float(joint_success_bonus) * float(full_success)
             )
     elif reward_profile == 'pure_em':
         reward = float(score) if answer_correct else 0.0
@@ -653,11 +652,6 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         'trusted_environment_evidence': bool(trusted_retrieval_correct),
         'evidence_bonus_applied': bool(
             (
-                reward_profile == 'mandatory_search'
-                and hard_reward_gate_pass
-                and retrieval_correct
-            )
-            or (
                 reward_profile == 'evidence_shaping'
                 and is_valid_format
                 and retrieval_correct
@@ -665,13 +659,7 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
                 and float(retrieval_score) > 0
             )
         ),
-        'joint_success_bonus_applied': bool(
-            reward_profile == 'mandatory_search'
-            and hard_reward_gate_pass
-            and strict_protocol_valid
-            and retrieval_correct
-            and answer_correct
-        ),
+        'joint_success_bonus_applied': False,
     }
     if return_details:
         return float(reward), details

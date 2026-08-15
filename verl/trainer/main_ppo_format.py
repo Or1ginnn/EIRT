@@ -34,9 +34,9 @@ class RewardManager():
     """
 
     def __init__(self, tokenizer, num_examine, structure_format_score=0., final_format_score=0., retrieval_score=0., format_score=0.,
-                 reward_profile='pure_em', think_format_score=0.05,
-                 answer_format_score=0.05, evidence_score=0.2,
-                 answer_em_score=0.7, joint_success_bonus=0.5) -> None:
+                 reward_profile='pure_em', think_format_score=0.2,
+                 answer_format_score=0.1, evidence_score=0.0,
+                 answer_em_score=1.2, joint_success_bonus=0.0) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
@@ -203,6 +203,11 @@ class RewardManager():
             'reward/soft_format_components': float(
                 self.reward_profile == 'mandatory_search'
             ),
+            'reward/think_format_score': float(self.think_format_score),
+            'reward/answer_format_score': float(self.answer_format_score),
+            'reward/evidence_score': float(self.evidence_score),
+            'reward/answer_em_score': float(self.answer_em_score),
+            'reward/joint_success_bonus': float(self.joint_success_bonus),
             'reward/answer_em_rate': sum(
                 int(item['answer_em']) for item in reward_details
             ) / count,

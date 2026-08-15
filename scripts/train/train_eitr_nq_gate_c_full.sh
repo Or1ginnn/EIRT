@@ -13,15 +13,15 @@ export EITR_PROBE_COUNT="${EITR_PROBE_COUNT:-4}"
 export EITR_LR="${EITR_LR:-3e-5}"
 export EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"
 export EITR_MIN_UPDATE_NORM="${EITR_MIN_UPDATE_NORM:-3e-6}"
-# Search is a hard environment gate in the main reward profile. A fully valid,
-# evidence-grounded correct trajectory receives 1.5 via a 0.5 joint bonus;
+# Search is a hard environment gate in the main reward profile. A real-search
+# trajectory with valid think/answer and correct EM receives 1.5;
 # repeated searches never accumulate additional reward.
 export REWARD_PROFILE="${REWARD_PROFILE:-mandatory_search}"
-export THINK_FORMAT_SCORE="${THINK_FORMAT_SCORE:-0.05}"
-export ANSWER_FORMAT_SCORE="${ANSWER_FORMAT_SCORE:-0.05}"
-export EVIDENCE_SCORE="${EVIDENCE_SCORE:-0.2}"
-export ANSWER_EM_SCORE="${ANSWER_EM_SCORE:-0.7}"
-export JOINT_SUCCESS_BONUS="${JOINT_SUCCESS_BONUS:-0.5}"
+export THINK_FORMAT_SCORE="${THINK_FORMAT_SCORE:-0.2}"
+export ANSWER_FORMAT_SCORE="${ANSWER_FORMAT_SCORE:-0.1}"
+export EVIDENCE_SCORE="${EVIDENCE_SCORE:-0.0}"
+export ANSWER_EM_SCORE="${ANSWER_EM_SCORE:-1.2}"
+export JOINT_SUCCESS_BONUS="${JOINT_SUCCESS_BONUS:-0.0}"
 REWARD_PROFILE_SLUG="${REWARD_PROFILE//_/-}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-${EITR_MODE}-nq-hotpotqa-${REWARD_PROFILE_SLUG}-phase2-full}"
 export METRICS_LEVEL="${METRICS_LEVEL:-core}"

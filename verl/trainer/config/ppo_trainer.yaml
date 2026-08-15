@@ -217,11 +217,11 @@ reward_model:
   structure_format_score: 0
   final_format_score: 0
   retrieval_score: 0
-  think_format_score: 0.05
-  answer_format_score: 0.05
-  evidence_score: 0.2
-  answer_em_score: 0.7
-  joint_success_bonus: 0.5
+  think_format_score: 0.2
+  answer_format_score: 0.1
+  evidence_score: 0.0
+  answer_em_score: 1.2
+  joint_success_bonus: 0.0
 
 retriever:
   url: "http://127.0.0.1:8000/retrieve"
