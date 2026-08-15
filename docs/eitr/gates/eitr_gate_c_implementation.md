@@ -217,18 +217,26 @@ Collector 的具体拒绝原因仍以 `eitr/collector_*` 记录，例如 missing
 - `mandatory_search`：当前 formal runner 的 Search-Agent 训练奖励。
 
 `mandatory_search` 只信环境真实执行后写入的逐轨迹 `executed_search_count`，并只从
-`info_mask` 标记的环境 observation 中判断 evidence；模型自己生成 `<search>` 或
-`<information>` 不能通过门控。没有真实搜索、工具轨迹不一致或完整协议格式非法时
-reward 为0。其余奖励为：`think`格式0.05、最终`answer`格式0.05、answer-bearing
-evidence 0.2、答案EM 0.7；当格式、真实搜索、evidence与答案全部正确时，再加一次
-0.5联合成功奖励，因此满分为1.5。真实搜索即使返回空information也能通过搜索门，
-但不获得evidence分。多轮命中不累计。`off/probe_only/eitr` 必须使用
+`info_mask` 标记的环境 observation 中判断 evidence；仅在文本里留下未执行的
+`<search>` 或模型伪造 `<information>` 都不能通过门控。没有真实搜索、工具轨迹不一致
+或模型伪造information时
+reward为0；完整协议格式不再是总硬门。通过环境门后，`think`格式0.05、最终`answer`
+格式0.05、answer-bearing evidence 0.2和答案EM 0.7分别提供独立软信号。只有完整严格
+协议、evidence与答案同时正确时才额外获得0.5联合成功奖励，因此满分仍为1.5。缺少
+`think`不会清空已经成立的evidence或answer基础分，但会失去think格式分0.05和严格协议
+联合成功奖励0.5。真实搜索即使返回
+空information也能通过搜索门，但不获得evidence分；多轮命中不累计。
+`off/probe_only/eitr`必须使用
 同一个显式profile，不能跨reward比较；EITR probe检索绝不能满足真实搜索门控。
 
 W&B 额外记录 `reward/answer_em_rate`、`reward/format_valid_rate`、
 `reward/configured_max_score`、`reward/mandatory_search_profile`、
+`reward/soft_format_components`、
 `reward/think_format_valid_rate`、`reward/answer_format_valid_rate`、
 `reward/tool_trace_consistent_rate`、`reward/hard_reward_gate_pass_rate`、
+`reward/generated_information_rate`、`reward/nonzero_rate`、
+`reward/score_std`、`reward/unique_level_count`、
+`reward/nonzero_advantage_group_rate`、`reward/zero_advantage_group_rate`、
 `reward/answer_bearing_evidence_rate`、`reward/answer_bearing_given_search` 与
 `reward/evidence_bonus_applied_rate`、`reward/joint_success_bonus_rate`。周期验证仍使用
 纯答案EM，范围保持0到1，不加入hard-search reward。该profile是所有方法共享的训练

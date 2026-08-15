@@ -300,11 +300,14 @@ outcome-only primary profile。
 no-search shortcut。它用真实环境执行作为硬门，并采用
 
 $$
-R=SP\left(0.05F_{think}+0.05F_{answer}+0.2E+0.7C+0.5EC\right),
+R=G_{tool}\left(0.05F_{think}+0.05F_{answer}+0.2E+0.7C+0.5PEC\right),
 $$
 
-其中 $S$ 只由真实Retriever调用决定，$P$ 是完整协议格式硬门，$E$ 只读取环境拥有的
-observation，完整成功满分为1.5。该组是明确的process-reward实验，不能作为“无reward
+其中 $G_{tool}$ 只在真实Retriever调用、环境轨迹一致且模型没有伪造information时成立；
+$P$ 是完整严格协议，仅控制联合成功奖励而不是总硬门；$F_{think}$ 与 $F_{answer}$ 是
+独立软格式分，$E$ 只读取环境拥有的observation。缺少think不会清空已经成立的证据或
+答案基础分，但会失去think格式分0.05和严格协议联合奖励0.5；完整成功满分仍为1.5。
+该组是明确的process-reward实验，不能作为“无reward
 shaping”主张的唯一证据；
 必须同时保留exact-v0.3对照，并让off/probe_only/eitr三组共享同一profile。
 

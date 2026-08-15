@@ -28,6 +28,44 @@ SUPPORTED_REWARD_PROFILES = {
 }
 
 
+def reward_group_diagnostics(scores, group_ids, tolerance=1e-12):
+    """Summarize whether GRPO sibling groups contain usable reward contrast."""
+
+    scores = [float(value) for value in scores]
+    group_ids = list(group_ids)
+    if len(scores) != len(group_ids):
+        raise ValueError(
+            "reward scores and group ids must have equal length: "
+            f"{len(scores)} != {len(group_ids)}"
+        )
+    if not scores:
+        return {
+            'nonzero_rate': 0.0,
+            'score_std': 0.0,
+            'unique_level_count': 0.0,
+            'nonzero_advantage_group_rate': 0.0,
+            'zero_advantage_group_rate': 0.0,
+        }
+
+    groups = {}
+    for score_value, group_id in zip(scores, group_ids):
+        groups.setdefault(str(group_id), []).append(score_value)
+    varying_groups = sum(
+        max(group_scores) - min(group_scores) > float(tolerance)
+        for group_scores in groups.values()
+    )
+    mean_score = sum(scores) / len(scores)
+    variance = sum((value - mean_score) ** 2 for value in scores) / len(scores)
+    nonzero_advantage_rate = varying_groups / len(groups)
+    return {
+        'nonzero_rate': sum(value > 0.0 for value in scores) / len(scores),
+        'score_std': math.sqrt(max(variance, 0.0)),
+        'unique_level_count': float(len(set(scores))),
+        'nonzero_advantage_group_rate': nonzero_advantage_rate,
+        'zero_advantage_group_rate': 1.0 - nonzero_advantage_rate,
+    }
+
+
 def extract_assistant_content(text):
     """Return only model-generated content after the first assistant marker.
 
@@ -216,6 +254,32 @@ def decode_environment_observation(
     return tokenizer.decode(environment_ids)
 
 
+def decode_model_generated_response(
+    tokenizer,
+    valid_response_ids,
+    response_info_mask,
+) -> str:
+    """Decode only model-owned response tokens selected by ``info_mask``."""
+
+    if len(valid_response_ids) != len(response_info_mask):
+        raise ValueError(
+            'response ids and response info mask must have equal length: '
+            f'{len(valid_response_ids)} != {len(response_info_mask)}'
+        )
+    if hasattr(response_info_mask, 'ne'):
+        model_ids = valid_response_ids[response_info_mask.ne(0)]
+    else:
+        model_ids = [
+            token_id
+            for token_id, mask_value in zip(
+                valid_response_ids,
+                response_info_mask,
+            )
+            if int(mask_value) != 0
+        ]
+    return tokenizer.decode(model_ids)
+
+
 def extract_search_information_pairs(text: str) -> list[tuple[str, str]]:
     """Return non-empty search/environment-observation pairs.
 
@@ -334,6 +398,7 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
                      score=1., return_details=False,
                      reward_profile='pure_em', executed_search_count=None,
                      environment_observation_str=None,
+                     model_generated_str=None,
                      think_format_score=0.05, answer_format_score=0.05,
                      evidence_score=0.2, answer_em_score=0.7,
                      joint_success_bonus=0.5):
@@ -409,19 +474,30 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
                 f'requires their scores to be zero, got {nonzero_scores}'
             )
 
+    # The combined trajectory contains both model tokens and environment
+    # observations.  Keep it for the end-to-end protocol check, but never use
+    # it to award model-owned think/answer/search components: retrieved text
+    # can itself contain literal action tags.
+    if reward_profile == 'mandatory_search':
+        model_solution_str = (
+            "<|im_start|>assistant\n" + (model_generated_str or "")
+        )
+    else:
+        model_solution_str = solution_str
+
     is_valid_format, _ = is_valid_sequence(solution_str)
     think_format_valid, answer_format_valid = generated_format_components(
-        solution_str
+        model_solution_str
     )
     search_information_pairs = extract_search_information_pairs(solution_str)
-    # Record the raw answer-bearing evidence event independently of whether the
-    # final trajectory passes the strict format gate.  Only a format-valid
-    # trajectory is eligible to turn this diagnostic event into reward.
+    # Record the legacy parsed-evidence event independently of the strict
+    # format gate.  Mandatory-search scoring replaces it below with trusted
+    # environment-owned evidence.
     parsed_retrieval_correct = is_retrieval_correct(
         solution_str,
         ground_truth['target'],
     )
-    answer = extract_solution(solution_str=solution_str)
+    answer = extract_solution(solution_str=model_solution_str)
     answer_correct = bool(
         answer is not None and em_check(answer, ground_truth['target'])
     )
@@ -447,11 +523,30 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         if environment_observation_str is not None
         else []
     )
+    assistant_content = extract_assistant_content(model_solution_str)
+    nonempty_search_count = sum(
+        bool(block.strip())
+        for block in re.findall(
+            r"<search>(.*?)</search>",
+            assistant_content,
+            re.DOTALL,
+        )
+    )
     tool_trace_consistent = bool(
         actual_search_count > 0
         and environment_observation_str is not None
         and len(trusted_information_blocks) == actual_search_count
+        and nonempty_search_count == actual_search_count
     )
+    generated_information_detected = bool(
+        model_generated_str is not None
+        and re.search(
+            r"<\s*/?\s*information\b[^>]*>",
+            model_generated_str,
+            flags=re.IGNORECASE,
+        )
+    )
+    model_ownership_signal_available = model_generated_str is not None
     trusted_retrieval_correct = bool(
         tool_trace_consistent
         and observations_contain_answer(
@@ -466,27 +561,33 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     )
 
     if reward_profile == 'mandatory_search':
-        format_gate_pass = bool(
+        strict_protocol_valid = bool(
             is_valid_format
             and think_format_valid
             and answer_format_valid
         )
-        eligible_answer_correct = bool(answer_correct and format_gate_pass)
+        hard_reward_gate_pass = bool(
+            execution_signal_available
+            and tool_trace_consistent
+            and model_ownership_signal_available
+            and not generated_information_detected
+        )
+        eligible_answer_correct = bool(answer_correct)
         eligible_evidence = bool(
-            retrieval_correct and tool_trace_consistent and format_gate_pass
+            retrieval_correct and tool_trace_consistent
         )
         full_success = bool(
-            format_gate_pass
-            and tool_trace_consistent
+            strict_protocol_valid
+            and hard_reward_gate_pass
             and eligible_evidence
             and eligible_answer_correct
         )
-        if not tool_trace_consistent or not format_gate_pass:
+        if not hard_reward_gate_pass:
             reward = 0.0
         else:
             reward = (
-                float(think_format_score)
-                + float(answer_format_score)
+                float(think_format_score) * float(think_format_valid)
+                + float(answer_format_score) * float(answer_format_valid)
                 + float(evidence_score) * float(eligible_evidence)
                 + float(answer_em_score) * float(eligible_answer_correct)
                 + float(joint_success_bonus) * float(full_success)
@@ -538,22 +639,22 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         'has_executed_search': bool(actual_search_count > 0),
         'execution_signal_available': bool(execution_signal_available),
         'tool_trace_consistent': bool(tool_trace_consistent),
+        'model_ownership_signal_available': bool(
+            model_ownership_signal_available
+        ),
+        'generated_information_detected': bool(
+            generated_information_detected
+        ),
         'hard_reward_gate_pass': bool(
             reward_profile == 'mandatory_search'
-            and tool_trace_consistent
-            and is_valid_format
-            and think_format_valid
-            and answer_format_valid
+            and hard_reward_gate_pass
         ),
         'answer_bearing_evidence': bool(retrieval_correct),
         'trusted_environment_evidence': bool(trusted_retrieval_correct),
         'evidence_bonus_applied': bool(
             (
                 reward_profile == 'mandatory_search'
-                and tool_trace_consistent
-                and is_valid_format
-                and think_format_valid
-                and answer_format_valid
+                and hard_reward_gate_pass
                 and retrieval_correct
             )
             or (
@@ -566,12 +667,10 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         ),
         'joint_success_bonus_applied': bool(
             reward_profile == 'mandatory_search'
-            and is_valid_format
-            and tool_trace_consistent
+            and hard_reward_gate_pass
+            and strict_protocol_valid
             and retrieval_correct
             and answer_correct
-            and think_format_valid
-            and answer_format_valid
         ),
     }
     if return_details:

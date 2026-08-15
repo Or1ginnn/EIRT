@@ -96,6 +96,7 @@ class RewardManager():
 
         already_print_data_sources = {}
         reward_details = []
+        trajectory_scores = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -117,12 +118,20 @@ class RewardManager():
             response_str = self.tokenizer.decode(valid_response_ids)
             sequences_str = f"<|im_start|>assistant\n{response_str}"
             environment_observation_str = None
+            model_generated_str = None
             if 'info_mask' in data_item.batch.keys():
                 response_info_mask = data_item.batch['info_mask'][
                     prompt_length:prompt_length + valid_response_length
                 ]
                 environment_observation_str = (
                     qa_em_format.decode_environment_observation(
+                        self.tokenizer,
+                        valid_response_ids,
+                        response_info_mask,
+                    )
+                )
+                model_generated_str = (
+                    qa_em_format.decode_model_generated_response(
                         self.tokenizer,
                         valid_response_ids,
                         response_info_mask,
@@ -150,6 +159,7 @@ class RewardManager():
                 reward_profile=self.reward_profile,
                 executed_search_count=executed_search_count,
                 environment_observation_str=environment_observation_str,
+                model_generated_str=model_generated_str,
                 think_format_score=self.think_format_score,
                 answer_format_score=self.answer_format_score,
                 evidence_score=self.evidence_score,
@@ -158,6 +168,7 @@ class RewardManager():
                 return_details=True,
             )
             reward_details.append(details)
+            trajectory_scores.append(float(score))
 
             reward_tensor[i, valid_response_length - 1] = score
             # all_scores.append(score)
@@ -176,9 +187,20 @@ class RewardManager():
         answer_bearing_count = sum(
             int(item['answer_bearing_evidence']) for item in reward_details
         )
+        reward_group_metrics = qa_em_format.reward_group_diagnostics(
+            trajectory_scores,
+            (
+                data.non_tensor_batch['uid']
+                if 'uid' in data.non_tensor_batch
+                else range(len(trajectory_scores))
+            ),
+        )
         self.last_metrics = {
             'reward/configured_max_score': self.configured_max_score,
             'reward/mandatory_search_profile': float(
+                self.reward_profile == 'mandatory_search'
+            ),
+            'reward/soft_format_components': float(
                 self.reward_profile == 'mandatory_search'
             ),
             'reward/answer_em_rate': sum(
@@ -196,6 +218,10 @@ class RewardManager():
             'reward/tool_trace_consistent_rate': sum(
                 int(item['tool_trace_consistent']) for item in reward_details
             ) / count,
+            'reward/generated_information_rate': sum(
+                int(item['generated_information_detected'])
+                for item in reward_details
+            ) / count,
             'reward/hard_reward_gate_pass_rate': sum(
                 int(item['hard_reward_gate_pass']) for item in reward_details
             ) / count,
@@ -212,6 +238,10 @@ class RewardManager():
                 int(item['joint_success_bonus_applied'])
                 for item in reward_details
             ) / count,
+            **{
+                f'reward/{name}': value
+                for name, value in reward_group_metrics.items()
+            },
         }
 
         return reward_tensor
