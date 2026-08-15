@@ -15,13 +15,14 @@
 import re
 import string
 import random
+import unicodedata
 
 
 ASSISTANT_MARKER_PATTERN = r"<\|im_start\|>assistant\s*"
 
 
 def extract_assistant_content(text):
-    """Return only model-generated content after the final assistant marker.
+    """Return only model-generated content after the first assistant marker.
 
     Search-R1 prompts contain literal ``<answer>...</answer>`` examples.  Those
     examples are instructions, not model actions, and must never be eligible
@@ -30,7 +31,11 @@ def extract_assistant_content(text):
     matches = list(re.finditer(ASSISTANT_MARKER_PATTERN, text))
     if not matches:
         return text
-    return text[matches[-1].end():]
+    # RewardManager supplies one synthetic marker before the generated
+    # trajectory.  Always anchor on that first marker: accepting a later marker
+    # would let the model hide malformed output by emitting a second assistant
+    # turn itself.
+    return text[matches[0].end():]
 
 def normalize_answer(s):
     def remove_articles(text):
@@ -63,14 +68,16 @@ def em_check(prediction, golden_answers):
 
 
 def is_valid_sequence(text):
-    # Find the final assistant turn and validate generated content only.
+    # Find the one assistant turn and validate generated content only.
     assistant_matches = list(re.finditer(ASSISTANT_MARKER_PATTERN, text))
     
     if not assistant_matches:
         return False, "Missing assistant marker"
+    if len(assistant_matches) != 1:
+        return False, "Unexpected assistant marker inside generated trajectory"
     
     # Extract the content after the assistant marker
-    start_pos = assistant_matches[-1].end()
+    start_pos = assistant_matches[0].end()
     content = text[start_pos:]
     
     # Check for balanced tags
@@ -166,16 +173,69 @@ def extract_information_blocks(text: str) -> list[str]:
     return [match.strip() for match in matches]
 
 
-def is_retrieval_correct(text: str, golden_answers: list[str]) -> list[str]:
-    seqs = extract_information_blocks(text)
-    for seq in seqs:
+def extract_search_information_pairs(text: str) -> list[tuple[str, str]]:
+    """Return non-empty search/environment-observation pairs.
+
+    The bonus is trajectory-level and must be tied to an actual tool-shaped
+    interaction.  A free-standing ``<information>`` block is not evidence that
+    the model issued a usable search action.
+    """
+
+    pattern = (
+        r"<search>(.*?)</search>\s*"
+        r"<information>(.*?)</information>"
+    )
+    pairs = re.findall(pattern, extract_assistant_content(text), re.DOTALL)
+    return [
+        (query.strip(), information.strip())
+        for query, information in pairs
+        if query.strip() and information.strip()
+    ]
+
+
+def _contains_normalized_answer(information: str, golden_answer: str) -> bool:
+    """Match a normalized gold alias as a complete token sequence."""
+
+    def normalize_evidence_text(text: str) -> str:
+        # Convert both ASCII and Unicode punctuation into token boundaries
+        # before applying the v0.3 answer normalization.  Deleting punctuation
+        # would turn ``Paris—the`` into one token and miss a genuine hit.
+        separated = ''.join(
+            ' ' if unicodedata.category(char).startswith('P') else char
+            for char in text
+        )
+        return normalize_answer(separated)
+
+    normalized_information = normalize_evidence_text(information)
+    normalized_answer = normalize_evidence_text(golden_answer)
+    if not normalized_answer:
+        return False
+    return re.search(
+        rf"(?<!\w){re.escape(normalized_answer)}(?!\w)",
+        normalized_information,
+    ) is not None
+
+
+def is_retrieval_correct(text: str, golden_answers: list[str]) -> bool:
+    """Whether any executed-search observation contains a gold alias.
+
+    This is an answer-bearing-evidence heuristic, not a claim that the whole
+    retrieved passage is relevant.  Multiple hits still produce one Boolean
+    trajectory-level event and therefore cannot reward repeated searches.
+    """
+
+    if isinstance(golden_answers, str):
+        golden_answers = [golden_answers]
+    for _, information in extract_search_information_pairs(text):
         for golden_answer in golden_answers:
-            if normalize_answer(golden_answer) in normalize_answer(seq):
+            if _contains_normalized_answer(information, golden_answer):
                 return True
     return False
 
 
-def compute_score_em(solution_str, ground_truth, method='strict', structure_format_score=0, final_format_score=0, retrieval_score=0, format_score=0, score=1.):
+def compute_score_em(solution_str, ground_truth, method='strict', structure_format_score=0,
+                     final_format_score=0, retrieval_score=0, format_score=0,
+                     score=1., return_details=False):
     """The scoring function for exact match (EM).
 
     Args:
@@ -186,10 +246,18 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         score: the score for the correct answer
     """
     is_valid_format, _ = is_valid_sequence(solution_str)
-    retrieval_correct = False
-    if is_valid_format:
-        retrieval_correct = is_retrieval_correct(solution_str, ground_truth['target'])
+    search_information_pairs = extract_search_information_pairs(solution_str)
+    # Record the raw answer-bearing evidence event independently of whether the
+    # final trajectory passes the strict format gate.  Only a format-valid
+    # trajectory is eligible to turn this diagnostic event into reward.
+    retrieval_correct = is_retrieval_correct(
+        solution_str,
+        ground_truth['target'],
+    )
     answer = extract_solution(solution_str=solution_str)
+    answer_correct = bool(
+        answer is not None and em_check(answer, ground_truth['target'])
+    )
     do_print = random.randint(1, 64) == 1
     
     if do_print:
@@ -201,21 +269,38 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     if answer is None:
         if is_valid_format:
             if retrieval_correct:
-                return structure_format_score + retrieval_score # 0.3
+                reward = structure_format_score + retrieval_score
             else:
-                return structure_format_score # 0.2
+                reward = structure_format_score
         else:
-            return 0
+            reward = 0
     else:
-        if em_check(answer, ground_truth['target']):
+        if answer_correct:
             if is_valid_format:
-                return score # 1
+                reward = score
             else:
-                return score - structure_format_score # 0.8
+                reward = score - structure_format_score
         elif is_valid_format:
             if retrieval_correct:
-                return structure_format_score + retrieval_score # 0.3
+                reward = structure_format_score + retrieval_score
             else:
-                return structure_format_score # 0.2
+                reward = structure_format_score
         else:
-            return final_format_score # 0.1
+            reward = final_format_score
+
+    reward = min(float(score), float(reward))
+    details = {
+        'format_valid': bool(is_valid_format),
+        'answer_em': bool(answer_correct),
+        'has_executed_search': bool(search_information_pairs),
+        'answer_bearing_evidence': bool(retrieval_correct),
+        'evidence_bonus_applied': bool(
+            is_valid_format
+            and retrieval_correct
+            and not answer_correct
+            and float(retrieval_score) > 0
+        ),
+    }
+    if return_details:
+        return float(reward), details
+    return float(reward)

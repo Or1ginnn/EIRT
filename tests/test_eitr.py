@@ -151,7 +151,7 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
 
-    def test_smoke_uses_search_r1_v03_format_reward(self):
+    def test_smoke_uses_shared_v03_evidence_reward(self):
         runner = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -161,7 +161,7 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn("python3 -m verl.trainer.main_ppo_format", runner)
         self.assertIn('STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"', runner)
         self.assertIn('FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"', runner)
-        self.assertIn('RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0}"', runner)
+        self.assertIn('RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0.1}"', runner)
         self.assertIn('reward_model.structure_format_score="$STRUCTURE_FORMAT_SCORE"', runner)
         self.assertIn('reward_model.final_format_score="$FINAL_FORMAT_SCORE"', runner)
         self.assertIn('reward_model.retrieval_score="$RETRIEVAL_SCORE"', runner)
@@ -223,6 +223,8 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
         self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
         self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"', runner)
+        self.assertIn('RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0.1}"', runner)
+        self.assertIn('v03-evidence-phase2-full', runner)
         self.assertIn(
             'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
             runner,

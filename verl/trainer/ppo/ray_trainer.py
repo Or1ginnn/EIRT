@@ -1085,6 +1085,9 @@ class RayPPOTrainer(object):
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
+                        reward_metrics = getattr(self.reward_fn, 'last_metrics', None)
+                        if reward_metrics:
+                            metrics.update(reward_metrics)
 
                         # A bounded, driver-side trace for checking the exact
                         # prompt, full tool trajectory, extracted answer, and

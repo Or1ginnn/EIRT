@@ -13,7 +13,11 @@ export EITR_PROBE_COUNT="${EITR_PROBE_COUNT:-4}"
 export EITR_LR="${EITR_LR:-3e-5}"
 export EITR_MAX_UPDATE_NORM="${EITR_MAX_UPDATE_NORM:-3e-6}"
 export EITR_MIN_UPDATE_NORM="${EITR_MIN_UPDATE_NORM:-3e-6}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-hotpotqa-v03-phase2-full}"
+# Keep the official v0.3 format scores, but enable its answer-bearing evidence
+# hook. This is an explicit shared reward ablation, not the exact v0.3 reward:
+# one or many useful searches receive the same single trajectory-level bonus.
+export RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0.1}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-hotpotqa-v03-evidence-phase2-full}"
 export METRICS_LEVEL="${METRICS_LEVEL:-core}"
 export EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-10}"
 FORMAL_STORAGE_ROOT="${STORAGE_ROOT:-/mnt/data1/zar/eitr_storage}"

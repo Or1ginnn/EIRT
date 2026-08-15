@@ -285,13 +285,16 @@ $$
 
 生成。
 
-最终仅使用 terminal task reward：
+EITR 算法本身仅要求一个固定的 task reward。用于支撑“无额外 process reward”主张的
+primary profile 只使用 terminal task reward：
 
 $$
 R(\tau)\in\{0,1\}
 $$
 
-或标准 EM / F1 / verifier reward。
+或标准 EM / F1 / verifier reward。为诊断 Search-R1 v0.3 的 no-search collapse，可以
+另设一个明确命名的 evidence-shaping profile；但它必须作为单独实验，不能冒充上述
+outcome-only primary profile。
 
 **核心要求：主要实验中 reward definition 对所有 RL baseline 保持相同。**
 
@@ -970,11 +973,15 @@ $$
 R'=R_{answer}+\lambda R_{search-step}.
 $$
 
-EITR 不改变任务 reward：
+EITR correction 本身不改变任务 reward。在 exact-v0.3 primary profile 中：
 
 $$
 R'=R_{answer}.
 $$
+
+如果实验显式使用 answer-bearing evidence shaping，则只能声称“所有方法共享相同
+reward，EITR 不额外修改它”，不能再把该组实验描述成 outcome-only。必须同时保留
+`retrieval_score=0` 对照，区分 reward 效果与 EITR 效果。
 
 它改变的是一次 policy optimization step 的 feasible set：
 

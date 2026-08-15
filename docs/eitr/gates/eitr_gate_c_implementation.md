@@ -209,12 +209,22 @@ Collector 的具体拒绝原因仍以 `eitr/collector_*` 记录，例如 missing
 
 ## 7. 运行入口
 
-训练奖励采用 Search-R1 v0.3 的格式奖励入口 `main_ppo_format`：完整且答案
+训练仍使用 Search-R1 v0.3 的格式奖励入口 `main_ppo_format`：完整且答案
 正确为 1.0，答案正确但轨迹结构非法为 0.8，答案错误但完整轨迹结构合法为
-0.2，只有最终 `<answer>...</answer>` 格式合法为 0.1，其余为 0。默认
-`retrieval_score=0`，因此不额外奖励“检索结果中包含答案”。周期验证仍使用纯答案
-EM，不加入格式 shaping。该奖励与 EITR correction 独立：GRPO 使用上述标量奖励，
-EITR 仍在随后的 correction pass 中最小化环境诱导分布漂移。
+0.2，只有最终 `<answer>...</answer>` 格式合法为 0.1，其余为 0。需要区分两种
+显式 reward profile：`retrieval_score=0` 是 exact-v0.3 对照；正式 evidence profile
+使用 `retrieval_score=0.1`，当且仅当至少一个非空真实
+`<search>...</search> -> <information>...</information>` 返回包含完整 gold alias、且最终
+答案仍错误时，整条 trajectory 只额外获得一次 0.1。多轮命中不会累加，搜索次数
+本身不产生奖励，reward 上限仍为 1.0。`off/probe_only/eitr` 必须使用同一个显式
+profile，不能跨 reward 比较。
+
+W&B 额外记录 `reward/answer_em_rate`、`reward/format_valid_rate`、
+`reward/answer_bearing_evidence_rate`、`reward/answer_bearing_given_search` 与
+`reward/evidence_bonus_applied_rate`。周期验证仍使用纯答案 EM，不加入格式或 evidence
+shaping。该 evidence profile 是共享的训练奖励变量，不属于 EITR correction；EITR
+仍在随后的 correction pass 中最小化环境诱导分布漂移。论文报告必须把它与
+exact-v0.3 outcome-only 对照分开命名。
 
 V6 correction采用rollout coverage加权。若一个训练mini-batch共有 `B` 条
 rollout，其中mask有效的EITR state为 `m_i=1`，则实际目标为

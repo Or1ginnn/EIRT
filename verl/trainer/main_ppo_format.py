@@ -40,9 +40,14 @@ class RewardManager():
         self.structure_format_score = structure_format_score
         self.final_format_score = final_format_score
         self.retrieval_score = retrieval_score
+        self.last_metrics = {}
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
+
+        # Never leak diagnostics from a previous rule-reward batch when an
+        # externally supplied reward-model score takes the early-return path.
+        self.last_metrics = {}
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if 'rm_scores' in data.batch.keys():
@@ -53,6 +58,7 @@ class RewardManager():
         # all_scores = []
 
         already_print_data_sources = {}
+        reward_details = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -78,11 +84,16 @@ class RewardManager():
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
 
-            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, 
-                                     structure_format_score=self.structure_format_score, 
-                                     final_format_score=self.final_format_score, 
-                                     retrieval_score=self.retrieval_score,
-                                     format_score=self.format_score)
+            score, details = compute_score_fn(
+                solution_str=sequences_str,
+                ground_truth=ground_truth,
+                structure_format_score=self.structure_format_score,
+                final_format_score=self.final_format_score,
+                retrieval_score=self.retrieval_score,
+                format_score=self.format_score,
+                return_details=True,
+            )
+            reward_details.append(details)
 
             reward_tensor[i, valid_response_length - 1] = score
             # all_scores.append(score)
@@ -93,6 +104,31 @@ class RewardManager():
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
                 print(sequences_str)
+
+        count = max(len(reward_details), 1)
+        searched_count = sum(
+            int(item['has_executed_search']) for item in reward_details
+        )
+        answer_bearing_count = sum(
+            int(item['answer_bearing_evidence']) for item in reward_details
+        )
+        self.last_metrics = {
+            'reward/answer_em_rate': sum(
+                int(item['answer_em']) for item in reward_details
+            ) / count,
+            'reward/format_valid_rate': sum(
+                int(item['format_valid']) for item in reward_details
+            ) / count,
+            'reward/answer_bearing_evidence_rate': answer_bearing_count / count,
+            'reward/answer_bearing_given_search': (
+                answer_bearing_count / searched_count
+                if searched_count
+                else 0.0
+            ),
+            'reward/evidence_bonus_applied_rate': sum(
+                int(item['evidence_bonus_applied']) for item in reward_details
+            ) / count,
+        }
 
         return reward_tensor
 
