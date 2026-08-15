@@ -296,6 +296,18 @@ $$
 另设一个明确命名的 evidence-shaping profile；但它必须作为单独实验，不能冒充上述
 outcome-only primary profile。
 
+当前工程 formal runner 另设 `mandatory_search` profile，用于阻止NQ+HotpotQA训练中的
+no-search shortcut。它用真实环境执行作为硬门，并采用
+
+$$
+R=SP\left(0.05F_{think}+0.05F_{answer}+0.2E+0.7C+0.5EC\right),
+$$
+
+其中 $S$ 只由真实Retriever调用决定，$P$ 是完整协议格式硬门，$E$ 只读取环境拥有的
+observation，完整成功满分为1.5。该组是明确的process-reward实验，不能作为“无reward
+shaping”主张的唯一证据；
+必须同时保留exact-v0.3对照，并让off/probe_only/eitr三组共享同一profile。
+
 **核心要求：主要实验中 reward definition 对所有 RL baseline 保持相同。**
 
 ---
@@ -973,15 +985,18 @@ $$
 R'=R_{answer}+\lambda R_{search-step}.
 $$
 
-EITR correction 本身不改变任务 reward。在 exact-v0.3 primary profile 中：
+EITR correction 本身不改变任务 reward。在 `pure_em` primary profile 中：
 
 $$
 R'=R_{answer}.
 $$
 
-如果实验显式使用 answer-bearing evidence shaping，则只能声称“所有方法共享相同
-reward，EITR 不额外修改它”，不能再把该组实验描述成 outcome-only。必须同时保留
-`retrieval_score=0` 对照，区分 reward 效果与 EITR 效果。
+`official_v03` 是Search-R1发布的格式shaping对照，并不是纯二元outcome reward。
+
+如果实验显式使用answer-bearing evidence shaping或`mandatory_search`硬门控，则只能
+声称“所有方法共享相同reward，EITR不额外修改它”，不能再把该组实验描述成
+outcome-only。必须同时保留`official_v03 / retrieval_score=0`对照，区分reward效果与
+EITR效果。`mandatory_search`的训练reward范围为0到1.5，周期验证仍报告0到1的纯EM。
 
 它改变的是一次 policy optimization step 的 feasible set：
 

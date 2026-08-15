@@ -197,6 +197,9 @@ critic:
 
 reward_model:
   enable: False
+  # Validation/default rule scoring is pure answer EM. Formal training runners
+  # set their reward profile explicitly.
+  reward_profile: pure_em
   strategy: fsdp
   model:
     input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
@@ -214,6 +217,11 @@ reward_model:
   structure_format_score: 0
   final_format_score: 0
   retrieval_score: 0
+  think_format_score: 0.05
+  answer_format_score: 0.05
+  evidence_score: 0.2
+  answer_em_score: 0.7
+  joint_success_bonus: 0.5
 
 retriever:
   url: "http://127.0.0.1:8000/retrieve"

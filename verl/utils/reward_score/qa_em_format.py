@@ -16,9 +16,16 @@ import re
 import string
 import random
 import unicodedata
+import math
 
 
 ASSISTANT_MARKER_PATTERN = r"<\|im_start\|>assistant\s*"
+SUPPORTED_REWARD_PROFILES = {
+    "pure_em",
+    "official_v03",
+    "evidence_shaping",
+    "mandatory_search",
+}
 
 
 def extract_assistant_content(text):
@@ -173,6 +180,42 @@ def extract_information_blocks(text: str) -> list[str]:
     return [match.strip() for match in matches]
 
 
+def extract_environment_information_blocks(text: str) -> list[str]:
+    """Extract observations without applying model-turn marker semantics."""
+
+    pattern = r"<information>(.*?)</information>"
+    return [
+        match.strip()
+        for match in re.findall(pattern, text or "", re.DOTALL)
+    ]
+
+
+def decode_environment_observation(
+    tokenizer,
+    valid_response_ids,
+    response_info_mask,
+) -> str:
+    """Decode only environment-owned response tokens selected by info_mask."""
+
+    if len(valid_response_ids) != len(response_info_mask):
+        raise ValueError(
+            'response ids and response info mask must have equal length: '
+            f'{len(valid_response_ids)} != {len(response_info_mask)}'
+        )
+    if hasattr(response_info_mask, 'eq'):
+        environment_ids = valid_response_ids[response_info_mask.eq(0)]
+    else:
+        environment_ids = [
+            token_id
+            for token_id, mask_value in zip(
+                valid_response_ids,
+                response_info_mask,
+            )
+            if int(mask_value) == 0
+        ]
+    return tokenizer.decode(environment_ids)
+
+
 def extract_search_information_pairs(text: str) -> list[tuple[str, str]]:
     """Return non-empty search/environment-observation pairs.
 
@@ -191,6 +234,42 @@ def extract_search_information_pairs(text: str) -> list[tuple[str, str]]:
         for query, information in pairs
         if query.strip() and information.strip()
     ]
+
+
+def generated_format_components(text: str) -> tuple[bool, bool]:
+    """Return independently useful think/answer format indicators.
+
+    The complete Search-R1 protocol is still checked by ``is_valid_sequence``.
+    These two indicators provide bounded shaping when a trajectory has a real
+    tool execution but has not yet learned the whole protocol.
+    """
+
+    assistant_matches = list(re.finditer(ASSISTANT_MARKER_PATTERN, text))
+    if len(assistant_matches) != 1:
+        return False, False
+    content = text[assistant_matches[0].end():]
+
+    think_open = list(re.finditer(r"<think>", content))
+    think_close = list(re.finditer(r"</think>", content))
+    think_blocks = re.findall(r"<think>(.*?)</think>", content, re.DOTALL)
+    think_valid = bool(
+        think_open
+        and len(think_open) == len(think_close) == len(think_blocks)
+        and all(block.strip() for block in think_blocks)
+        and content.lstrip().startswith("<think>")
+    )
+
+    answer_open = list(re.finditer(r"<answer>", content))
+    answer_close = list(re.finditer(r"</answer>", content))
+    answer_blocks = list(
+        re.finditer(r"<answer>(.*?)</answer>", content, re.DOTALL)
+    )
+    answer_valid = bool(
+        len(answer_open) == len(answer_close) == len(answer_blocks) == 1
+        and answer_blocks[0].group(1).strip()
+        and not content[answer_blocks[0].end():].strip()
+    )
+    return think_valid, answer_valid
 
 
 def _contains_normalized_answer(information: str, golden_answer: str) -> bool:
@@ -233,9 +312,31 @@ def is_retrieval_correct(text: str, golden_answers: list[str]) -> bool:
     return False
 
 
+def observations_contain_answer(
+    observation_text: str,
+    golden_answers: list[str],
+) -> bool:
+    """Check only environment-owned information blocks for a gold alias."""
+
+    if isinstance(golden_answers, str):
+        golden_answers = [golden_answers]
+    for information in extract_environment_information_blocks(observation_text):
+        if not information:
+            continue
+        for golden_answer in golden_answers:
+            if _contains_normalized_answer(information, golden_answer):
+                return True
+    return False
+
+
 def compute_score_em(solution_str, ground_truth, method='strict', structure_format_score=0,
                      final_format_score=0, retrieval_score=0, format_score=0,
-                     score=1., return_details=False):
+                     score=1., return_details=False,
+                     reward_profile='pure_em', executed_search_count=None,
+                     environment_observation_str=None,
+                     think_format_score=0.05, answer_format_score=0.05,
+                     evidence_score=0.2, answer_em_score=0.7,
+                     joint_success_bonus=0.5):
     """The scoring function for exact match (EM).
 
     Args:
@@ -245,12 +346,78 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         format_score: the score for the format
         score: the score for the correct answer
     """
+    if reward_profile not in SUPPORTED_REWARD_PROFILES:
+        raise ValueError(
+            f"Unknown reward_profile={reward_profile!r}; expected one of "
+            f"{sorted(SUPPORTED_REWARD_PROFILES)}"
+        )
+    if reward_profile == 'mandatory_search':
+        component_scores = {
+            'think_format_score': think_format_score,
+            'answer_format_score': answer_format_score,
+            'evidence_score': evidence_score,
+            'answer_em_score': answer_em_score,
+            'joint_success_bonus': joint_success_bonus,
+        }
+        invalid_scores = {
+            name: value
+            for name, value in component_scores.items()
+            if not math.isfinite(float(value)) or float(value) < 0
+        }
+        if invalid_scores:
+            raise ValueError(
+                'mandatory_search reward components must be finite and '
+                f'non-negative, got {invalid_scores}'
+            )
+    if reward_profile == 'official_v03':
+        exact_v03 = {
+            'structure_format_score': (float(structure_format_score), 0.2),
+            'final_format_score': (float(final_format_score), 0.1),
+            'retrieval_score': (float(retrieval_score), 0.0),
+            'score': (float(score), 1.0),
+        }
+        mismatched = {
+            name: actual
+            for name, (actual, expected) in exact_v03.items()
+            if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12)
+        }
+        if mismatched:
+            raise ValueError(
+                'official_v03 requires exact Search-R1 3B reward weights '
+                f'(structure=0.2, final=0.1, retrieval=0, score=1); got '
+                f'{mismatched}'
+            )
+    if reward_profile == 'pure_em':
+        unused_scores = {
+            'structure_format_score': structure_format_score,
+            'final_format_score': final_format_score,
+            'retrieval_score': retrieval_score,
+        }
+        nonzero_scores = {
+            name: float(value)
+            for name, value in unused_scores.items()
+            if not math.isclose(
+                float(value),
+                0.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        }
+        if nonzero_scores:
+            raise ValueError(
+                'pure_em ignores format/evidence shaping and therefore '
+                f'requires their scores to be zero, got {nonzero_scores}'
+            )
+
     is_valid_format, _ = is_valid_sequence(solution_str)
+    think_format_valid, answer_format_valid = generated_format_components(
+        solution_str
+    )
     search_information_pairs = extract_search_information_pairs(solution_str)
     # Record the raw answer-bearing evidence event independently of whether the
     # final trajectory passes the strict format gate.  Only a format-valid
     # trajectory is eligible to turn this diagnostic event into reward.
-    retrieval_correct = is_retrieval_correct(
+    parsed_retrieval_correct = is_retrieval_correct(
         solution_str,
         ground_truth['target'],
     )
@@ -266,39 +433,145 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         print(f"Extracted answer: {answer}")
         print(f"Solution string: {solution_str}")
             
-    if answer is None:
-        if is_valid_format:
-            if retrieval_correct:
-                reward = structure_format_score + retrieval_score
-            else:
-                reward = structure_format_score
-        else:
-            reward = 0
+    parsed_search_count = len(search_information_pairs)
+    if executed_search_count is None:
+        actual_search_count = parsed_search_count
+        execution_signal_available = False
     else:
-        if answer_correct:
-            if is_valid_format:
-                reward = score
-            else:
-                reward = score - structure_format_score
-        elif is_valid_format:
-            if retrieval_correct:
-                reward = structure_format_score + retrieval_score
-            else:
-                reward = structure_format_score
-        else:
-            reward = final_format_score
+        actual_search_count = int(executed_search_count)
+        execution_signal_available = True
+    if actual_search_count < 0:
+        raise ValueError("executed_search_count must be non-negative")
+    trusted_information_blocks = (
+        extract_environment_information_blocks(environment_observation_str)
+        if environment_observation_str is not None
+        else []
+    )
+    tool_trace_consistent = bool(
+        actual_search_count > 0
+        and environment_observation_str is not None
+        and len(trusted_information_blocks) == actual_search_count
+    )
+    trusted_retrieval_correct = bool(
+        tool_trace_consistent
+        and observations_contain_answer(
+            environment_observation_str,
+            ground_truth['target'],
+        )
+    )
+    retrieval_correct = (
+        trusted_retrieval_correct
+        if reward_profile == 'mandatory_search'
+        else parsed_retrieval_correct
+    )
 
-    reward = min(float(score), float(reward))
-    details = {
-        'format_valid': bool(is_valid_format),
-        'answer_em': bool(answer_correct),
-        'has_executed_search': bool(search_information_pairs),
-        'answer_bearing_evidence': bool(retrieval_correct),
-        'evidence_bonus_applied': bool(
+    if reward_profile == 'mandatory_search':
+        format_gate_pass = bool(
             is_valid_format
+            and think_format_valid
+            and answer_format_valid
+        )
+        eligible_answer_correct = bool(answer_correct and format_gate_pass)
+        eligible_evidence = bool(
+            retrieval_correct and tool_trace_consistent and format_gate_pass
+        )
+        full_success = bool(
+            format_gate_pass
+            and tool_trace_consistent
+            and eligible_evidence
+            and eligible_answer_correct
+        )
+        if not tool_trace_consistent or not format_gate_pass:
+            reward = 0.0
+        else:
+            reward = (
+                float(think_format_score)
+                + float(answer_format_score)
+                + float(evidence_score) * float(eligible_evidence)
+                + float(answer_em_score) * float(eligible_answer_correct)
+                + float(joint_success_bonus) * float(full_success)
+            )
+    elif reward_profile == 'pure_em':
+        reward = float(score) if answer_correct else 0.0
+    else:
+        if reward_profile == 'official_v03' and float(retrieval_score) != 0.0:
+            raise ValueError(
+                "official_v03 requires retrieval_score=0; use "
+                "reward_profile='evidence_shaping' for the legacy hook"
+            )
+        active_retrieval_score = (
+            float(retrieval_score)
+            if reward_profile == 'evidence_shaping'
+            else 0.0
+        )
+        if answer is None:
+            if is_valid_format:
+                if retrieval_correct:
+                    reward = structure_format_score + active_retrieval_score
+                else:
+                    reward = structure_format_score
+            else:
+                reward = 0
+        else:
+            if answer_correct:
+                if is_valid_format:
+                    reward = score
+                else:
+                    reward = score - structure_format_score
+            elif is_valid_format:
+                if retrieval_correct:
+                    reward = structure_format_score + active_retrieval_score
+                else:
+                    reward = structure_format_score
+            else:
+                reward = final_format_score
+
+        reward = min(float(score), float(reward))
+    details = {
+        'reward_profile_mandatory_search': bool(
+            reward_profile == 'mandatory_search'
+        ),
+        'format_valid': bool(is_valid_format),
+        'think_format_valid': bool(think_format_valid),
+        'answer_format_valid': bool(answer_format_valid),
+        'answer_em': bool(answer_correct),
+        'has_executed_search': bool(actual_search_count > 0),
+        'execution_signal_available': bool(execution_signal_available),
+        'tool_trace_consistent': bool(tool_trace_consistent),
+        'hard_reward_gate_pass': bool(
+            reward_profile == 'mandatory_search'
+            and tool_trace_consistent
+            and is_valid_format
+            and think_format_valid
+            and answer_format_valid
+        ),
+        'answer_bearing_evidence': bool(retrieval_correct),
+        'trusted_environment_evidence': bool(trusted_retrieval_correct),
+        'evidence_bonus_applied': bool(
+            (
+                reward_profile == 'mandatory_search'
+                and tool_trace_consistent
+                and is_valid_format
+                and think_format_valid
+                and answer_format_valid
+                and retrieval_correct
+            )
+            or (
+                reward_profile == 'evidence_shaping'
+                and is_valid_format
+                and retrieval_correct
+                and not answer_correct
+                and float(retrieval_score) > 0
+            )
+        ),
+        'joint_success_bonus_applied': bool(
+            reward_profile == 'mandatory_search'
+            and is_valid_format
+            and tool_trace_consistent
             and retrieval_correct
-            and not answer_correct
-            and float(retrieval_score) > 0
+            and answer_correct
+            and think_format_valid
+            and answer_format_valid
         ),
     }
     if return_details:

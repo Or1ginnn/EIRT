@@ -29,9 +29,13 @@ Date: 2026-08-06
 
 Gate A/B historical results were measured with a Parallel Search Step900 checkpoint constrained to one query. They remain useful evidence that motivated EITR, but they are not clean Search-R1 replications. Reports now state this limitation explicitly.
 
-Gate C must compare two runs initialized from the same Qwen2.5-3B base model:
+Gate C must compare three runs initialized from the same Qwen2.5-3B base model:
 
-1. Original Search-R1 GRPO.
-2. The same Search-R1 GRPO with EITR enabled.
+1. `off`: Search-R1 GRPO under the selected shared reward profile.
+2. `probe_only`: the same GRPO plus matched probe/retrieval calls, without correction.
+3. `eitr`: the same GRPO and probe path with EITR correction enabled.
 
-All other data, prompt, reward, retriever, rollout, sampling, and optimizer settings must remain identical.
+Within every paired comparison, all other data, prompt, reward profile,
+retriever, rollout, sampling, and optimizer settings must remain identical.
+The current mandatory-search profile and the exact-v0.3 control are separate
+experiment families and must never be compared as if reward were unchanged.

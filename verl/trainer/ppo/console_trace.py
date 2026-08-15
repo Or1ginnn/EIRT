@@ -39,6 +39,7 @@ def print_training_trace_samples(
     responses = batch.batch["responses"]
     attention_mask = batch.batch["attention_mask"].bool()
     scores = batch.batch["token_level_scores"].sum(dim=-1)
+    executed_search_counts = batch.batch.get("executed_search_count")
     prompt_width = int(prompts.shape[-1])
     response_width = int(responses.shape[-1])
 
@@ -57,10 +58,16 @@ def print_training_trace_samples(
         data_source = data_sources[index] if data_sources is not None else "unknown"
         ground_truth = reward_models[index] if reward_models is not None else "unknown"
         score = float(scores[index].detach().cpu().item())
+        executed_search_count = (
+            int(executed_search_counts[index].detach().cpu().item())
+            if executed_search_counts is not None
+            else -1
+        )
 
         print(
             f"\n===== TRAIN TRACE outer_update={int(outer_update_step)} "
-            f"sample={index} data_source={data_source} reward={score:.6f} =====",
+            f"sample={index} data_source={data_source} reward={score:.6f} "
+            f"executed_search_count={executed_search_count} =====",
             flush=True,
         )
         print("[PROMPT]", flush=True)

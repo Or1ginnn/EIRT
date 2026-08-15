@@ -42,6 +42,7 @@ class _Batch:
             "responses": torch.tensor([[3, 4, 5, 6, 99]]),
             "attention_mask": torch.tensor([[0, 1, 1, 1, 1, 1, 1, 0]]),
             "token_level_scores": torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0]]),
+            "executed_search_count": torch.tensor([1]),
         }
         self.non_tensor_batch = {
             "data_source": np.array(["nq"], dtype=object),
@@ -68,6 +69,7 @@ class ConsoleTraceTest(unittest.TestCase):
         text = output.getvalue()
         self.assertIn("outer_update=7", text)
         self.assertIn("data_source=nq reward=1.000000", text)
+        self.assertIn("executed_search_count=1", text)
         self.assertIn("<PROMPT>question", text)
         self.assertNotIn("<PAD>", text)
         self.assertIn("<information>doc</information>", text)

@@ -76,14 +76,33 @@ EITR_SAME_BATCH_SCALE_DIAGNOSTIC="${EITR_SAME_BATCH_SCALE_DIAGNOSTIC:-false}"
 EITR_UPDATE_DIRECTION_DIAGNOSTIC="${EITR_UPDATE_DIRECTION_DIAGNOSTIC:-false}"
 EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT="${EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT:-false}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
-STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"
-FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"
-# Shared by off/probe_only/eitr so method comparisons never differ in reward.
-# Set RETRIEVAL_SCORE=0 explicitly only for the exact official-v0.3 control.
-RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0.1}"
+# Formal Phase 2 uses a real-environment search gate. Merely emitting search or
+# information tags cannot unlock reward. Set REWARD_PROFILE=official_v03 and
+# RETRIEVAL_SCORE=0 for the exact Search-R1 v0.3 control.
+REWARD_PROFILE="${REWARD_PROFILE:-mandatory_search}"
+if [[ "$REWARD_PROFILE" == official_v03 || "$REWARD_PROFILE" == evidence_shaping ]]; then
+    DEFAULT_STRUCTURE_FORMAT_SCORE=0.2
+    DEFAULT_FINAL_FORMAT_SCORE=0.1
+else
+    DEFAULT_STRUCTURE_FORMAT_SCORE=0
+    DEFAULT_FINAL_FORMAT_SCORE=0
+fi
+DEFAULT_RETRIEVAL_SCORE=0
+if [[ "$REWARD_PROFILE" == evidence_shaping ]]; then
+    DEFAULT_RETRIEVAL_SCORE=0.1
+fi
+STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-$DEFAULT_STRUCTURE_FORMAT_SCORE}"
+FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-$DEFAULT_FINAL_FORMAT_SCORE}"
+RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-$DEFAULT_RETRIEVAL_SCORE}"
+THINK_FORMAT_SCORE="${THINK_FORMAT_SCORE:-0.05}"
+ANSWER_FORMAT_SCORE="${ANSWER_FORMAT_SCORE:-0.05}"
+EVIDENCE_SCORE="${EVIDENCE_SCORE:-0.2}"
+ANSWER_EM_SCORE="${ANSWER_EM_SCORE:-0.7}"
+JOINT_SUCCESS_BONUS="${JOINT_SUCCESS_BONUS:-0.5}"
+REWARD_PROFILE_SLUG="${REWARD_PROFILE//_/-}"
 LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.285}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-eitr-nq-phase2-smoke}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${EITR_MODE}-nq-${REWARD_PROFILE_SLUG}-phase2-smoke}"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
 METRICS_LEVEL="${METRICS_LEVEL:-debug}"
 TERMINAL_TRACE_SAMPLES="${TERMINAL_TRACE_SAMPLES:-1}"
@@ -118,6 +137,14 @@ case "$EITR_MODE" in
     off|probe_only|eitr) ;;
     *)
         echo "EITR_MODE must be one of: off, probe_only, eitr; got: $EITR_MODE" >&2
+        exit 2
+        ;;
+esac
+
+case "$REWARD_PROFILE" in
+    pure_em|official_v03|evidence_shaping|mandatory_search) ;;
+    *)
+        echo "REWARD_PROFILE must be one of: pure_em, official_v03, evidence_shaping, mandatory_search; got: $REWARD_PROFILE" >&2
         exit 2
         ;;
 esac
@@ -196,6 +223,19 @@ if (( EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE != EITR_PROBE_MICRO_BATCH_SIZE )); the
 fi
 if (( EITR_PROBE_MICRO_BATCH_SIZE % EITR_PROBE_COUNT != 0 )); then
     echo "EITR_PROBE_MICRO_BATCH_SIZE must be divisible by EITR_PROBE_COUNT" >&2
+    exit 2
+fi
+
+# The hard reward verifies that every real search has a complete environment
+# observation. Keep enough trajectory room for four full search turns plus the
+# final answer opportunity; otherwise truncation could conservatively close
+# the hard gate even though the Retriever really ran.
+MIN_HARD_REWARD_TRAJECTORY_LENGTH=$((
+    4 * (MAX_RESPONSE_LENGTH + MAX_OBS_LENGTH) + MAX_RESPONSE_LENGTH
+))
+if [[ "$REWARD_PROFILE" == mandatory_search ]] && \
+   (( MAX_TRAJECTORY_LENGTH < MIN_HARD_REWARD_TRAJECTORY_LENGTH )); then
+    echo "mandatory_search requires MAX_TRAJECTORY_LENGTH >= $MIN_HARD_REWARD_TRAJECTORY_LENGTH; got: $MAX_TRAJECTORY_LENGTH" >&2
     exit 2
 fi
 
@@ -382,9 +422,10 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
     exit 0
 fi
 
-# Search-R1 v0.3 reward: answer EM plus trajectory/final-answer format shaping.
-# Validation remains pure answer EM because main_ppo_format intentionally
-# constructs its validation RewardManager without the training shaping scores.
+# Training uses the explicitly selected reward profile (mandatory_search by
+# default; official_v03 remains available as an exact control). Validation
+# remains pure answer EM because main_ppo_format intentionally constructs its
+# validation RewardManager without training-time shaping or search gating.
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     data.train_files="$TRAIN_DATA_DIR/train.parquet" \
     data.val_files="$VAL_DATA_DIR/test.parquet" \
@@ -477,6 +518,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     reward_model.structure_format_score="$STRUCTURE_FORMAT_SCORE" \
     reward_model.final_format_score="$FINAL_FORMAT_SCORE" \
     reward_model.retrieval_score="$RETRIEVAL_SCORE" \
+    reward_model.reward_profile="$REWARD_PROFILE" \
+    reward_model.think_format_score="$THINK_FORMAT_SCORE" \
+    reward_model.answer_format_score="$ANSWER_FORMAT_SCORE" \
+    reward_model.evidence_score="$EVIDENCE_SCORE" \
+    reward_model.answer_em_score="$ANSWER_EM_SCORE" \
+    reward_model.joint_success_bonus="$JOINT_SUCCESS_BONUS" \
     hydra.run.dir="$HYDRA_RUN_DIR" \
     hydra.job.chdir=false \
     max_turns=4 \

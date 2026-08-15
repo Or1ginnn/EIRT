@@ -151,7 +151,7 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
 
-    def test_smoke_uses_shared_v03_evidence_reward(self):
+    def test_smoke_uses_shared_mandatory_search_reward(self):
         runner = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -159,12 +159,26 @@ class TrackingFlushTest(unittest.TestCase):
             / "train_eitr_nq_gate_c_smoke.sh"
         ).read_text()
         self.assertIn("python3 -m verl.trainer.main_ppo_format", runner)
-        self.assertIn('STRUCTURE_FORMAT_SCORE="${STRUCTURE_FORMAT_SCORE:-0.2}"', runner)
-        self.assertIn('FINAL_FORMAT_SCORE="${FINAL_FORMAT_SCORE:-0.1}"', runner)
-        self.assertIn('RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0.1}"', runner)
+        self.assertIn('REWARD_PROFILE="${REWARD_PROFILE:-mandatory_search}"', runner)
+        self.assertIn('DEFAULT_STRUCTURE_FORMAT_SCORE=0.2', runner)
+        self.assertIn('DEFAULT_STRUCTURE_FORMAT_SCORE=0', runner)
+        self.assertIn('DEFAULT_RETRIEVAL_SCORE=0.1', runner)
+        self.assertIn('RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-$DEFAULT_RETRIEVAL_SCORE}"', runner)
+        self.assertIn('THINK_FORMAT_SCORE="${THINK_FORMAT_SCORE:-0.05}"', runner)
+        self.assertIn('ANSWER_FORMAT_SCORE="${ANSWER_FORMAT_SCORE:-0.05}"', runner)
+        self.assertIn('EVIDENCE_SCORE="${EVIDENCE_SCORE:-0.2}"', runner)
+        self.assertIn('ANSWER_EM_SCORE="${ANSWER_EM_SCORE:-0.7}"', runner)
+        self.assertIn('JOINT_SUCCESS_BONUS="${JOINT_SUCCESS_BONUS:-0.5}"', runner)
+        self.assertIn("MIN_HARD_REWARD_TRAJECTORY_LENGTH", runner)
         self.assertIn('reward_model.structure_format_score="$STRUCTURE_FORMAT_SCORE"', runner)
         self.assertIn('reward_model.final_format_score="$FINAL_FORMAT_SCORE"', runner)
         self.assertIn('reward_model.retrieval_score="$RETRIEVAL_SCORE"', runner)
+        self.assertIn('reward_model.reward_profile="$REWARD_PROFILE"', runner)
+        self.assertIn('reward_model.think_format_score="$THINK_FORMAT_SCORE"', runner)
+        self.assertIn('reward_model.answer_format_score="$ANSWER_FORMAT_SCORE"', runner)
+        self.assertIn('reward_model.evidence_score="$EVIDENCE_SCORE"', runner)
+        self.assertIn('reward_model.answer_em_score="$ANSWER_EM_SCORE"', runner)
+        self.assertIn('reward_model.joint_success_bonus="$JOINT_SUCCESS_BONUS"', runner)
         self.assertIn('ACTOR_LR="${ACTOR_LR:-5e-7}"', runner)
         self.assertIn(
             'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
@@ -199,6 +213,21 @@ class TrackingFlushTest(unittest.TestCase):
             runner,
         )
 
+    def test_official_v03_runners_select_exact_reward_profile(self):
+        script_root = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "nq_hotpotqa"
+            / "v0.3"
+        )
+        for script_name in ("train_grpo_format.sh", "train_ppo_format.sh"):
+            runner = (script_root / script_name).read_text()
+            self.assertIn(
+                "reward_model.reward_profile=official_v03",
+                runner,
+                script_name,
+            )
+
     def test_formal_run_uses_mixed_train_and_nq_validation(self):
         runner = (
             Path(__file__).resolve().parents[1]
@@ -223,8 +252,10 @@ class TrackingFlushTest(unittest.TestCase):
         self.assertIn('TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8000}"', runner)
         self.assertIn('LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.03575}"', runner)
         self.assertIn('PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"', runner)
-        self.assertIn('RETRIEVAL_SCORE="${RETRIEVAL_SCORE:-0.1}"', runner)
-        self.assertIn('v03-evidence-phase2-full', runner)
+        self.assertIn('REWARD_PROFILE="${REWARD_PROFILE:-mandatory_search}"', runner)
+        self.assertIn('JOINT_SUCCESS_BONUS="${JOINT_SUCCESS_BONUS:-0.5}"', runner)
+        self.assertIn('REWARD_PROFILE_SLUG="${REWARD_PROFILE//_/-}"', runner)
+        self.assertIn('${EITR_MODE}-nq-hotpotqa-${REWARD_PROFILE_SLUG}-phase2-full', runner)
         self.assertIn(
             'ACTOR_FSDP_PARAM_OFFLOAD="${ACTOR_FSDP_PARAM_OFFLOAD:-false}"',
             runner,
@@ -1207,6 +1238,45 @@ class EITRProbeBatchTest(unittest.TestCase):
 
 
 class SearchR1CompatibilityTest(unittest.TestCase):
+    def test_executed_search_count_is_materialized_as_batch_aligned_tensor(self):
+        captured = {}
+
+        class FakeDataProto:
+            @staticmethod
+            def from_dict(batch):
+                captured.update(batch)
+                return SimpleNamespace(batch=batch, meta_info={})
+
+        manager = object.__new__(LLMGenerationManager)
+        manager.tokenizer = SimpleNamespace(pad_token_id=0)
+        manager.tensor_fn = SimpleNamespace(
+            create_attention_mask=lambda values: values.ne(0).long(),
+            create_position_ids=lambda mask: (
+                torch.cumsum(mask, dim=-1) - 1
+            ).clamp_min(0),
+        )
+        left_side = {"input_ids": torch.tensor([[11, 12], [21, 22]])}
+        right_side = {
+            "responses": torch.tensor([[31, 32], [41, 0]]),
+            "responses_with_info_mask": torch.tensor([[31, 0], [41, 0]]),
+        }
+        original_data_proto = generation_module.DataProto
+        generation_module.DataProto = FakeDataProto
+        try:
+            output = manager._compose_final_output(
+                left_side,
+                right_side,
+                {"valid_search_stats": [0, 2]},
+            )
+        finally:
+            generation_module.DataProto = original_data_proto
+
+        self.assertEqual(
+            output.batch["executed_search_count"].tolist(),
+            [0, 2],
+        )
+        self.assertEqual(captured["executed_search_count"].dtype, torch.long)
+
     class _ContextSensitiveTokenizer:
         pad_token_id = 0
 

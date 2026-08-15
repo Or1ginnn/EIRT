@@ -11,8 +11,11 @@ PPO and GRPO constrain policy updates mainly in token space. For a search agent,
 - Clean base: official Search-R1 at commit `598e61b`.
 - Policy: original Qwen2.5-3B base model, not a Parallel Search or Finance checkpoint.
 - Agent format: original Search-R1 single-query `<search>...</search>` loop.
-- Reward: the original outcome-only answer reward.
-- Main comparison: standard Search-R1 GRPO versus Search-R1 GRPO with EITR.
+- Reward: an explicit shared profile. The formal runner currently uses a
+  mandatory real-search gate with a maximum reward of 1.5; exact Search-R1
+  v0.3 remains a separate control.
+- Main comparison: standard Search-R1 GRPO versus Search-R1 GRPO with EITR
+  under the same reward profile.
 
 The current repository contains the Gate C implementation and historical Gate A/B diagnostics. Gate C has not yet produced a clean-baseline training result.
 

@@ -285,8 +285,22 @@ def compute_data_metrics(batch, use_critic=True):
     if 'valid_action_stats' in batch.meta_info:
         metrics['env/number_of_valid_action'] = float(np.array(batch.meta_info['valid_action_stats'], dtype=np.int16).mean())
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
-    if 'valid_search_stats' in batch.meta_info:
-        executed_searches = np.array(batch.meta_info['valid_search_stats'], dtype=np.int16)
+    if 'executed_search_count' in batch.batch.keys():
+        executed_searches = (
+            batch.batch['executed_search_count']
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int16, copy=False)
+        )
+    elif 'valid_search_stats' in batch.meta_info:
+        executed_searches = np.array(
+            batch.meta_info['valid_search_stats'],
+            dtype=np.int16,
+        )
+    else:
+        executed_searches = None
+    if executed_searches is not None:
         # Backward-compatible alias plus a name that states the real semantics:
         # only retriever calls executed inside the environment loop are counted.
         metrics['env/number_of_valid_search'] = float(executed_searches.mean())

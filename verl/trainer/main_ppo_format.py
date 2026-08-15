@@ -33,13 +33,31 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, structure_format_score=0., final_format_score=0., retrieval_score=0., format_score=0.) -> None:
+    def __init__(self, tokenizer, num_examine, structure_format_score=0., final_format_score=0., retrieval_score=0., format_score=0.,
+                 reward_profile='pure_em', think_format_score=0.05,
+                 answer_format_score=0.05, evidence_score=0.2,
+                 answer_em_score=0.7, joint_success_bonus=0.5) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
         self.structure_format_score = structure_format_score
         self.final_format_score = final_format_score
         self.retrieval_score = retrieval_score
+        self.reward_profile = reward_profile
+        self.think_format_score = think_format_score
+        self.answer_format_score = answer_format_score
+        self.evidence_score = evidence_score
+        self.answer_em_score = answer_em_score
+        self.joint_success_bonus = joint_success_bonus
+        self.configured_max_score = (
+            float(think_format_score)
+            + float(answer_format_score)
+            + float(evidence_score)
+            + float(answer_em_score)
+            + float(joint_success_bonus)
+            if reward_profile == 'mandatory_search'
+            else 1.0
+        )
         self.last_metrics = {}
 
     def __call__(self, data: DataProto):
@@ -49,9 +67,28 @@ class RewardManager():
         # externally supplied reward-model score takes the early-return path.
         self.last_metrics = {}
 
+        # A learned RM score cannot silently bypass the mandatory environment
+        # gate. Combining both objectives would need an explicit definition.
+        if self.reward_profile == 'mandatory_search' and 'rm_scores' in data.batch.keys():
+            raise RuntimeError(
+                "mandatory_search is incompatible with precomputed rm_scores"
+            )
+
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if 'rm_scores' in data.batch.keys():
             return data.batch['rm_scores']
+
+        if (
+            self.reward_profile == 'mandatory_search'
+            and (
+                'executed_search_count' not in data.batch.keys()
+                or 'info_mask' not in data.batch.keys()
+            )
+        ):
+            raise RuntimeError(
+                "mandatory_search reward requires batch-aligned "
+                "executed_search_count and info_mask from the environment"
+            )
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
@@ -68,7 +105,9 @@ class RewardManager():
             prompt_length = prompt_ids.shape[-1]
 
             response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            valid_response_length = int(
+                data_item.batch['attention_mask'][prompt_length:].sum().item()
+            )
             valid_response_ids = response_ids[:valid_response_length]
 
             # Score only the generated trajectory.  The user prompt contains
@@ -77,8 +116,25 @@ class RewardManager():
             # validator uses it to delimit the generated turn.
             response_str = self.tokenizer.decode(valid_response_ids)
             sequences_str = f"<|im_start|>assistant\n{response_str}"
+            environment_observation_str = None
+            if 'info_mask' in data_item.batch.keys():
+                response_info_mask = data_item.batch['info_mask'][
+                    prompt_length:prompt_length + valid_response_length
+                ]
+                environment_observation_str = (
+                    qa_em_format.decode_environment_observation(
+                        self.tokenizer,
+                        valid_response_ids,
+                        response_info_mask,
+                    )
+                )
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            executed_search_count = (
+                int(data_item.batch['executed_search_count'].item())
+                if 'executed_search_count' in data_item.batch.keys()
+                else None
+            )
 
             # select rm_score
             data_source = data_item.non_tensor_batch['data_source']
@@ -91,6 +147,14 @@ class RewardManager():
                 final_format_score=self.final_format_score,
                 retrieval_score=self.retrieval_score,
                 format_score=self.format_score,
+                reward_profile=self.reward_profile,
+                executed_search_count=executed_search_count,
+                environment_observation_str=environment_observation_str,
+                think_format_score=self.think_format_score,
+                answer_format_score=self.answer_format_score,
+                evidence_score=self.evidence_score,
+                answer_em_score=self.answer_em_score,
+                joint_success_bonus=self.joint_success_bonus,
                 return_details=True,
             )
             reward_details.append(details)
@@ -113,11 +177,27 @@ class RewardManager():
             int(item['answer_bearing_evidence']) for item in reward_details
         )
         self.last_metrics = {
+            'reward/configured_max_score': self.configured_max_score,
+            'reward/mandatory_search_profile': float(
+                self.reward_profile == 'mandatory_search'
+            ),
             'reward/answer_em_rate': sum(
                 int(item['answer_em']) for item in reward_details
             ) / count,
             'reward/format_valid_rate': sum(
                 int(item['format_valid']) for item in reward_details
+            ) / count,
+            'reward/think_format_valid_rate': sum(
+                int(item['think_format_valid']) for item in reward_details
+            ) / count,
+            'reward/answer_format_valid_rate': sum(
+                int(item['answer_format_valid']) for item in reward_details
+            ) / count,
+            'reward/tool_trace_consistent_rate': sum(
+                int(item['tool_trace_consistent']) for item in reward_details
+            ) / count,
+            'reward/hard_reward_gate_pass_rate': sum(
+                int(item['hard_reward_gate_pass']) for item in reward_details
             ) / count,
             'reward/answer_bearing_evidence_rate': answer_bearing_count / count,
             'reward/answer_bearing_given_search': (
@@ -127,6 +207,10 @@ class RewardManager():
             ),
             'reward/evidence_bonus_applied_rate': sum(
                 int(item['evidence_bonus_applied']) for item in reward_details
+            ) / count,
+            'reward/joint_success_bonus_rate': sum(
+                int(item['joint_success_bonus_applied'])
+                for item in reward_details
             ) / count,
         }
 
@@ -219,7 +303,13 @@ def main_task(config):
     reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, 
                               structure_format_score=config.reward_model.structure_format_score, 
                               final_format_score=config.reward_model.final_format_score,
-                              retrieval_score=config.reward_model.retrieval_score)
+                              retrieval_score=config.reward_model.retrieval_score,
+                              reward_profile=config.reward_model.reward_profile,
+                              think_format_score=config.reward_model.think_format_score,
+                              answer_format_score=config.reward_model.answer_format_score,
+                              evidence_score=config.reward_model.evidence_score,
+                              answer_em_score=config.reward_model.answer_em_score,
+                              joint_success_bonus=config.reward_model.joint_success_bonus)
 
     # Note that we always use function-based RM for validation
     val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)

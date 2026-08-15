@@ -536,6 +536,25 @@ class LLMGenerationManager:
             final_output['attention_mask']
         )
         
+        # Keep the per-trajectory environment execution count inside the
+        # batch-aligned tensor payload.  ``meta_info`` is not reordered by
+        # sequence balancing, so it is only safe for aggregate metrics; the
+        # reward function needs this tensor to hard-gate each individual
+        # trajectory after balancing.
+        valid_search_stats = meta_info.get('valid_search_stats')
+        if valid_search_stats is not None:
+            if len(valid_search_stats) != final_output['responses'].shape[0]:
+                raise RuntimeError(
+                    'valid_search_stats must align with rollout rows: '
+                    f'{len(valid_search_stats)} != '
+                    f'{final_output["responses"].shape[0]}'
+                )
+            final_output['executed_search_count'] = torch.tensor(
+                valid_search_stats,
+                dtype=torch.long,
+                device=final_output['responses'].device,
+            )
+
         final_output = DataProto.from_dict(final_output)
         final_output.meta_info.update(meta_info)
         
