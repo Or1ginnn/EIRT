@@ -15,7 +15,10 @@
 Single Process Actor
 """
 
+import copy
 import itertools
+import json
+import os
 import time
 from contextlib import contextmanager
 from typing import Iterable, Tuple
@@ -50,6 +53,8 @@ from verl.trainer.ppo.eitr import (
     should_run_post_diagnostic,
     resolve_eitr_mode,
     validate_eitr_optimization_schedule,
+    v7_geometry_audit_enabled,
+    v7_geometry_statistics,
 )
 from verl.trainer.ppo.eitr_checkpointing import (
     deterministic_probe_checkpointing_mode,
@@ -119,6 +124,13 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_score_path_noop_direction_audit = (
             eitr_score_path_noop_direction_audit_enabled(self.eitr_config)
         )
+        self.v7_geometry_audit = v7_geometry_audit_enabled(self.eitr_config)
+        self.v7_primary_k = int(self.eitr_config.get('v7_primary_k', 4))
+        self.v7_reference_k = int(self.eitr_config.get('v7_reference_k', 16))
+        self.v7_accept_radius = float(
+            self.eitr_config.get('v7_accept_radius', 1e-3)
+        )
+        self.v7_artifact_path = self.eitr_config.get('v7_artifact_path', None)
         self.eitr_score_path_anchor_max_abs_logprob_diff = float(
             self.eitr_config.get(
                 'score_path_anchor_max_abs_logprob_diff', 1e-3
@@ -162,10 +174,13 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError('Update-direction diagnostic requires EITR mode')
         if self.eitr_score_path_noop_direction_audit and self.eitr_mode != 'eitr':
             raise ValueError('Score-path audit requires EITR mode')
+        if self.v7_geometry_audit and self.eitr_mode != 'probe_only':
+            raise ValueError('V7 geometry audit requires probe_only mode')
         if sum((
             bool(self.eitr_same_batch_scale_lrs),
             self.eitr_update_direction_diagnostic,
             self.eitr_score_path_noop_direction_audit,
+            self.v7_geometry_audit,
         )) > 1:
             raise ValueError('Only one EITR diagnostic may be enabled at once')
 
@@ -477,7 +492,7 @@ class DataParallelPPOActor(BasePPOActor):
             log_ratio_clip=float(self.eitr_config.get('log_ratio_clip', 10.0)),
         )
         js = estimates['js']
-        return {
+        result = {
             'loss': js.mean(),
             'current_seq_logp': current_seq_logp,
             'valid_state_count': int(js.numel()),
@@ -488,6 +503,40 @@ class DataParallelPPOActor(BasePPOActor):
             'log_ratio_abs_max': float(estimates['log_ratio_abs_max'].detach().max().item()),
             'log_ratio_clipfrac': float(estimates['log_ratio_clipfrac'].detach().mean().item()),
         }
+        if self.v7_geometry_audit:
+            primary_k = self.v7_primary_k
+            if probe_count != self.v7_reference_k:
+                raise RuntimeError(
+                    'V7 audit physical probe count changed after validation'
+                )
+            primary_estimates = induced_js_from_cached_effects(
+                current_seq_logp=current_seq_logp[state_valid, :primary_k],
+                old_seq_logp=data['eitr_probe_old_seq_logp'][state_slot][
+                    state_valid, :primary_k
+                ],
+                doc_probs=data['eitr_probe_doc_probs'][state_slot][
+                    state_valid, :primary_k
+                ],
+                probe_mask=probe_valid[state_valid, :primary_k],
+                log_ratio_clip=float(self.eitr_config.get('log_ratio_clip', 10.0)),
+            )
+            raw_log_ratio = (
+                current_seq_logp[state_valid]
+                - data['eitr_probe_old_seq_logp'][state_slot][state_valid]
+            ).abs()
+            valid_count = probe_valid[state_valid].double().sum(dim=-1).clamp_min(1.0)
+            token_drift = (
+                raw_log_ratio * probe_valid[state_valid].double()
+            ).sum(dim=-1) / valid_count
+            result.update({
+                'v7_env_k4': primary_estimates['js'].detach(),
+                'v7_env_reference': js.detach(),
+                'v7_token_drift': token_drift.detach(),
+                'v7_ess_k4': primary_estimates['ess'].detach(),
+                'v7_ess_reference': estimates['ess'].detach(),
+                'v7_valid_probe_count': probe_valid[state_valid].double().sum(dim=-1),
+            })
+        return result
 
     def _iter_eitr_state_chunks(self, mini_batch):
         """Yield fixed-state chunks while keeping all K probes of a state together."""
@@ -759,6 +808,182 @@ class DataParallelPPOActor(BasePPOActor):
         if distributed:
             torch.distributed.all_reduce(result_tensor, op=torch.distributed.ReduceOp.SUM)
         return result_tensor
+
+    @staticmethod
+    def _gather_variable_v7_vector(value, *, distributed):
+        """Gather a variable-length 1-D float64 vector through NCCL tensors."""
+        audit_device = torch.device('cuda', torch.cuda.current_device())
+        value = value.detach().double().flatten().to(audit_device)
+        local_count = torch.tensor(
+            [value.numel()], dtype=torch.long, device=value.device
+        )
+        if not distributed:
+            return value
+        world_size = torch.distributed.get_world_size()
+        counts = [torch.zeros_like(local_count) for _ in range(world_size)]
+        torch.distributed.all_gather(counts, local_count)
+        max_count = max(int(item.item()) for item in counts)
+        padded = torch.zeros(max_count, dtype=torch.float64, device=value.device)
+        if value.numel():
+            padded[:value.numel()] = value
+        gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, padded)
+        pieces = [
+            item[:int(count.item())]
+            for item, count in zip(gathered, counts)
+            if int(count.item()) > 0
+        ]
+        return torch.cat(pieces) if pieces else padded[:0]
+
+    @staticmethod
+    def _chunked_snapshot_delta_stats(snapshot, *, distributed):
+        """Measure a proposal without materializing a full 3B delta tensor."""
+        local_sq = 0.0
+        local_max = 0.0
+        local_changed = 0.0
+        local_total = 0.0
+        chunk_size = 1_048_576
+        for parameter, saved_parameter, _ in snapshot:
+            current = parameter.detach().reshape(-1)
+            saved = saved_parameter.reshape(-1)
+            for start in range(0, current.numel(), chunk_size):
+                end = min(start + chunk_size, current.numel())
+                delta = current[start:end].to(
+                    device='cpu', dtype=torch.float32, copy=True
+                ) - saved[start:end].float()
+                local_sq += float(delta.square().sum(dtype=torch.float64).item())
+                local_changed += float((delta != 0).sum().item())
+                local_total += float(delta.numel())
+                if delta.numel():
+                    local_max = max(local_max, float(delta.abs().max().item()))
+        sums = torch.tensor(
+            [local_sq, local_changed, local_total],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        maximum = torch.tensor(
+            local_max, dtype=torch.float64, device=torch.cuda.current_device()
+        )
+        if distributed:
+            torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
+        return {
+            'norm': float(sums[0].clamp_min(0).sqrt().item()),
+            'changed_fraction': float(sums[1].item() / max(sums[2].item(), 1.0)),
+            'max_abs': float(maximum.item()),
+        }
+
+    def _run_v7_geometry_audit(
+        self,
+        state_chunks,
+        temperature,
+        *,
+        distributed,
+        outer_update_step,
+    ):
+        """Score one temporary GRPO proposal twice and compare K=4 with K=16."""
+        local_first = {
+            'token': [], 'k4': [], 'reference': [],
+            'ess_k4': [], 'ess_reference': [], 'valid_probe_count': [],
+        }
+        local_repeat = []
+        for state_chunk in state_chunks:
+            result = self._compute_eitr_micro_batch(
+                self._eitr_chunk_to_cuda(state_chunk),
+                temperature,
+                track_model_grad=False,
+            )
+            if result is not None and result['valid_state_count'] > 0:
+                for key, result_key in (
+                    ('token', 'v7_token_drift'),
+                    ('k4', 'v7_env_k4'),
+                    ('reference', 'v7_env_reference'),
+                    ('ess_k4', 'v7_ess_k4'),
+                    ('ess_reference', 'v7_ess_reference'),
+                    ('valid_probe_count', 'v7_valid_probe_count'),
+                ):
+                    local_first[key].append(result[result_key].detach())
+            del result
+        # A second teacher-forced score of the identical cached states measures
+        # only numerical/model-mode jitter; no query generation or retrieval is repeated.
+        for state_chunk in state_chunks:
+            result = self._compute_eitr_micro_batch(
+                self._eitr_chunk_to_cuda(state_chunk),
+                temperature,
+                track_model_grad=False,
+            )
+            if result is not None and result['valid_state_count'] > 0:
+                local_repeat.append(result['v7_env_reference'].detach())
+            del result
+
+        def combine(items):
+            if items:
+                return torch.cat(items)
+            return torch.empty(
+                0,
+                dtype=torch.float64,
+                device=torch.device('cuda', torch.cuda.current_device()),
+            )
+
+        gathered = {
+            key: self._gather_variable_v7_vector(combine(value), distributed=distributed)
+            for key, value in local_first.items()
+        }
+        gathered['repeat'] = self._gather_variable_v7_vector(
+            combine(local_repeat), distributed=distributed
+        )
+        statistics = v7_geometry_statistics(
+            token_drift=gathered['token'],
+            env_drift_k4=gathered['k4'],
+            env_drift_reference=gathered['reference'],
+            env_drift_repeat=gathered['repeat'],
+            accept_radius=self.v7_accept_radius,
+        )
+        metrics = {
+            f'actor/v7_geometry_{key}': float(value)
+            for key, value in statistics.items()
+        }
+        metrics.update({
+            'actor/v7_geometry_audit': 1.0,
+            'actor/v7_geometry_ess_k4': float(gathered['ess_k4'].mean().item()),
+            'actor/v7_geometry_ess_reference': float(
+                gathered['ess_reference'].mean().item()
+            ),
+        })
+
+        return metrics, gathered
+
+    def _write_v7_geometry_artifact(
+        self, vectors, metrics, *, distributed, outer_update_step
+    ):
+        """Persist rank-global per-state values only after theta is restored."""
+        rank = torch.distributed.get_rank() if distributed else 0
+        if not self.v7_artifact_path or rank != 0:
+            return
+        artifact_path = os.path.realpath(os.path.expanduser(str(self.v7_artifact_path)))
+        parent = os.path.dirname(artifact_path)
+        if not parent:
+            raise RuntimeError('V7 artifact path must include a parent directory')
+        os.makedirs(parent, exist_ok=True)
+        record = {
+            'outer_update_step': int(outer_update_step),
+            'primary_k': self.v7_primary_k,
+            'reference_k': self.v7_reference_k,
+            'accept_radius': self.v7_accept_radius,
+            'statistics': {
+                key.removeprefix('actor/v7_geometry_'): float(value)
+                for key, value in metrics.items()
+                if key.startswith('actor/v7_geometry_')
+            },
+            'per_state': {
+                key: [float(item) for item in value.detach().cpu().tolist()]
+                for key, value in vectors.items()
+            },
+        }
+        with open(artifact_path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _audit_score_cached_eitr_drift(
         self,
@@ -1885,6 +2110,21 @@ class DataParallelPPOActor(BasePPOActor):
         eitr_correction_optimizer_step_count = 0
         audit_d_old = None
         audit_theta_old_checksum = None
+        v7_parameter_snapshot = None
+        v7_optimizer_state = None
+        v7_theta_old_checksum = None
+        if self.v7_geometry_audit:
+            if len(self.actor_optimizer.state) != 0:
+                raise RuntimeError(
+                    'V7 no-update geometry audit requires a fresh AdamW state at '
+                    'the start of every batch; use a lightweight checkpoint and '
+                    'do not resume optimizer state'
+                )
+            v7_parameter_snapshot = self._snapshot_eitr_local_state()
+            v7_optimizer_state = copy.deepcopy(self.actor_optimizer.state_dict())
+            v7_theta_old_checksum = self._snapshot_checksum(
+                v7_parameter_snapshot, distributed=distributed
+            )
         if self.eitr_score_path_noop_direction_audit:
             audit_global_active_state_count = torch.tensor(
                 float(batch['eitr_state_valid'].sum().item()),
@@ -2039,6 +2279,8 @@ class DataParallelPPOActor(BasePPOActor):
         same_batch_scale_diagnostic_ran = False
         update_direction_diagnostic_ran = False
         score_path_noop_direction_audit_ran = False
+        v7_geometry_audit_ran = False
+        v7_proposal_grpo_step_count = 0
         query_logprob_direction_sample = None
         eitr_effective_correction_lr = 0.0
         eitr_correction_skipped_weak_update = False
@@ -2069,7 +2311,88 @@ class DataParallelPPOActor(BasePPOActor):
                     op=torch.distributed.ReduceOp.SUM,
                 )
 
-            if self.eitr_score_path_noop_direction_audit:
+            if self.v7_geometry_audit:
+                v7_metrics = None
+                v7_vectors = None
+                proposal_delta = None
+                state_chunks = None
+                try:
+                    if global_active_state_count.item() <= 1:
+                        raise RuntimeError(
+                            'V7 geometry audit needs at least two higher-K eligible states'
+                        )
+                    state_chunks, compaction_metrics = (
+                        self._prepare_eitr_correction_state_chunks(
+                            dataloader, distributed=distributed
+                        )
+                    )
+                    append_to_dict(metrics, compaction_metrics)
+                    v7_metrics, v7_vectors = self._run_v7_geometry_audit(
+                        state_chunks,
+                        temperature,
+                        distributed=distributed,
+                        outer_update_step=int(data.meta_info.get('outer_update_step', 0)),
+                    )
+                    proposal_delta = self._chunked_snapshot_delta_stats(
+                        v7_parameter_snapshot, distributed=distributed
+                    )
+                    if (
+                        proposal_delta['norm'] <= 0
+                        or proposal_delta['changed_fraction'] <= 0
+                    ):
+                        raise RuntimeError('V7 geometry audit produced a zero GRPO proposal')
+                finally:
+                    # Phase 2 is a measurement, not training. Restore on both
+                    # success and failure so an artifact/logging error cannot
+                    # leave a proposal committed inside a live worker.
+                    self._restore_eitr_local_state(
+                        v7_parameter_snapshot, restore_gradients=False
+                    )
+                    self.actor_optimizer.load_state_dict(v7_optimizer_state)
+                    self.actor_optimizer.zero_grad()
+                restore_delta = self._chunked_snapshot_delta_stats(
+                    v7_parameter_snapshot, distributed=distributed
+                )
+                if restore_delta['max_abs'] != 0.0:
+                    raise RuntimeError('V7 geometry audit failed to restore theta_old exactly')
+                v7_metrics.update({
+                    'actor/v7_geometry_proposal_update_norm': proposal_delta['norm'],
+                    'actor/v7_geometry_proposal_changed_fraction': proposal_delta[
+                        'changed_fraction'
+                    ],
+                    'actor/v7_geometry_proposal_max_abs': proposal_delta['max_abs'],
+                    'actor/v7_geometry_theta_old_checksum_sum': v7_theta_old_checksum[0],
+                    'actor/v7_geometry_final_restore_max_abs': restore_delta['max_abs'],
+                    'actor/v7_geometry_optimizer_state_restored_empty': float(
+                        len(self.actor_optimizer.state) == 0
+                    ),
+                    'actor/v7_geometry_no_update_committed': 1.0,
+                })
+                append_to_dict(metrics, v7_metrics)
+                v7_proposal_grpo_step_count = grpo_optimizer_step_count
+                grpo_optimizer_step_count = 0
+                v7_geometry_audit_ran = True
+
+                self._write_v7_geometry_artifact(
+                    v7_vectors,
+                    v7_metrics,
+                    distributed=distributed,
+                    outer_update_step=int(data.meta_info.get('outer_update_step', 0)),
+                )
+
+                pass_index = self.ppo_epochs
+                rank = torch.distributed.get_rank() if distributed else 0
+                additive = rank_owned_global_additive_stats({
+                    'js_sum': float(v7_vectors['reference'].sum().item()),
+                    'state_count': float(v7_vectors['reference'].numel()),
+                    'probe_count': float(v7_vectors['valid_probe_count'].sum().item()),
+                    'ess_sum': float(v7_vectors['ess_reference'].sum().item()),
+                    'clipfrac_sum': 0.0,
+                    'active_micro_batch_count': float(len(state_chunks)),
+                }, distributed=distributed, rank=rank)
+                pass_stats[pass_index].update(additive)
+                del v7_vectors, v7_parameter_snapshot, v7_optimizer_state
+            elif self.eitr_score_path_noop_direction_audit:
                 if global_active_state_count.item() <= 0:
                     raise RuntimeError('Score-path audit found no valid EITR states')
                 if int(global_active_state_count.item()) != int(
@@ -2496,6 +2819,7 @@ class DataParallelPPOActor(BasePPOActor):
                 'actor/eitr_score_path_noop_direction_audit_ran': float(
                     score_path_noop_direction_audit_ran
                 ),
+                'actor/v7_geometry_audit_ran': float(v7_geometry_audit_ran),
                 'actor/eitr_loss_applied': float(
                     eitr_correction_optimizer_step_count > 0
                 ),
@@ -2530,6 +2854,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.eitr_optimizer_steps_completed += eitr_correction_optimizer_step_count
         append_to_dict(metrics, {
             'actor/grpo_optimizer_step_count': float(grpo_optimizer_step_count),
+            'actor/v7_geometry_proposal_grpo_step_count': float(
+                v7_proposal_grpo_step_count
+            ),
             'actor/eitr_correction_optimizer_step_count': float(
                 eitr_correction_optimizer_step_count
             ),

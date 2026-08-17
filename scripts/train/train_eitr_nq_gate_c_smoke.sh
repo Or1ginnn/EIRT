@@ -75,6 +75,12 @@ EITR_POST_DIAGNOSTIC_FREQ="${EITR_POST_DIAGNOSTIC_FREQ:-1}"
 EITR_SAME_BATCH_SCALE_DIAGNOSTIC="${EITR_SAME_BATCH_SCALE_DIAGNOSTIC:-false}"
 EITR_UPDATE_DIRECTION_DIAGNOSTIC="${EITR_UPDATE_DIRECTION_DIAGNOSTIC:-false}"
 EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT="${EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT:-false}"
+EITR_V7_GEOMETRY_AUDIT="${EITR_V7_GEOMETRY_AUDIT:-false}"
+EITR_V7_PRIMARY_K="${EITR_V7_PRIMARY_K:-4}"
+EITR_V7_REFERENCE_K="${EITR_V7_REFERENCE_K:-16}"
+EITR_V7_REFERENCE_MIN_VALID_PROBE_COUNT="${EITR_V7_REFERENCE_MIN_VALID_PROBE_COUNT:-12}"
+EITR_V7_ACCEPT_RADIUS="${EITR_V7_ACCEPT_RADIUS:-0.001}"
+EITR_V7_ARTIFACT_PATH="${EITR_V7_ARTIFACT_PATH:-}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
 # Formal Phase 2 uses a real-environment search gate. Merely emitting search or
 # information tags cannot unlock reward. Set REWARD_PROFILE=official_v03 and
@@ -103,6 +109,8 @@ REWARD_PROFILE_SLUG="${REWARD_PROFILE//_/-}"
 LR_WARMUP_STEPS_RATIO="${LR_WARMUP_STEPS_RATIO:-0.285}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${EITR_MODE}-nq-${REWARD_PROFILE_SLUG}-phase2-smoke}"
+EITR_V7_ARTIFACT_PATH="${EITR_V7_ARTIFACT_PATH:-$STORAGE_ROOT/evaluations/$EXPERIMENT_NAME/v7_geometry_batches.jsonl}"
+EITR_V7_ARTIFACT_DIR="$(dirname "$EITR_V7_ARTIFACT_PATH")"
 WANDB_PROJECT="${WANDB_PROJECT:-EITR-Search-Agent}"
 METRICS_LEVEL="${METRICS_LEVEL:-debug}"
 TERMINAL_TRACE_SAMPLES="${TERMINAL_TRACE_SAMPLES:-1}"
@@ -208,13 +216,38 @@ case "$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" in
         exit 2
         ;;
 esac
-if [[ $(printf '%s\n' "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" "$EITR_UPDATE_DIRECTION_DIAGNOSTIC" "$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" | grep -c '^true$') -gt 1 ]]; then
+case "$EITR_V7_GEOMETRY_AUDIT" in
+    true|false) ;;
+    *)
+        echo "EITR_V7_GEOMETRY_AUDIT must be true or false; got: $EITR_V7_GEOMETRY_AUDIT" >&2
+        exit 2
+        ;;
+esac
+if [[ $(printf '%s\n' "$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" "$EITR_UPDATE_DIRECTION_DIAGNOSTIC" "$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" "$EITR_V7_GEOMETRY_AUDIT" | grep -c '^true$') -gt 1 ]]; then
     echo "Only one EITR diagnostic may be enabled at once" >&2
     exit 2
 fi
 if [[ "$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" == true && "$METRICS_LEVEL" != debug ]]; then
     echo "EITR score-path audit requires METRICS_LEVEL=debug so all scientific diagnostics are persisted" >&2
     exit 2
+fi
+if [[ "$EITR_V7_GEOMETRY_AUDIT" == true ]]; then
+    if [[ "$EITR_MODE" != probe_only ]]; then
+        echo "V7 geometry audit requires EITR_MODE=probe_only" >&2
+        exit 2
+    fi
+    if (( EITR_PROBE_COUNT != EITR_V7_REFERENCE_K )); then
+        echo "V7 geometry audit requires EITR_PROBE_COUNT=EITR_V7_REFERENCE_K" >&2
+        exit 2
+    fi
+    if (( EITR_MIN_VALID_PROBE_COUNT != EITR_V7_REFERENCE_MIN_VALID_PROBE_COUNT )); then
+        echo "V7 geometry audit requires the reference minimum-valid K" >&2
+        exit 2
+    fi
+    if [[ "$METRICS_LEVEL" != debug ]]; then
+        echo "V7 geometry audit requires METRICS_LEVEL=debug" >&2
+        exit 2
+    fi
 fi
 
 if (( EITR_PROBE_LOGPROB_MICRO_BATCH_SIZE != EITR_PROBE_MICRO_BATCH_SIZE )); then
@@ -392,6 +425,14 @@ for writable_path in \
             ;;
     esac
 done
+resolved_v7_artifact_path="$(realpath -m "$EITR_V7_ARTIFACT_PATH")"
+case "$resolved_v7_artifact_path" in
+    "$STORAGE_ROOT"/*) ;;
+    *)
+        echo "Refusing V7 artifact outside STORAGE_ROOT=$STORAGE_ROOT: $resolved_v7_artifact_path" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p \
     "$RAY_TMPDIR" \
@@ -411,7 +452,8 @@ mkdir -p \
     "$WANDB_CACHE_DIR" \
     "$WANDB_CONFIG_DIR" \
     "$WANDB_DATA_DIR" \
-    "$TMPDIR"
+    "$TMPDIR" \
+    "$EITR_V7_ARTIFACT_DIR"
 
 if [[ "$CHECK_ONLY" == "true" ]]; then
     curl --fail --silent --show-error \
@@ -483,6 +525,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.eitr.same_batch_scale_diagnostic="$EITR_SAME_BATCH_SCALE_DIAGNOSTIC" \
     actor_rollout_ref.actor.eitr.update_direction_diagnostic="$EITR_UPDATE_DIRECTION_DIAGNOSTIC" \
     actor_rollout_ref.actor.eitr.score_path_noop_direction_audit="$EITR_SCORE_PATH_NOOP_DIRECTION_AUDIT" \
+    actor_rollout_ref.actor.eitr.v7_geometry_audit="$EITR_V7_GEOMETRY_AUDIT" \
+    actor_rollout_ref.actor.eitr.v7_primary_k="$EITR_V7_PRIMARY_K" \
+    actor_rollout_ref.actor.eitr.v7_reference_k="$EITR_V7_REFERENCE_K" \
+    actor_rollout_ref.actor.eitr.v7_reference_min_valid_probe_count="$EITR_V7_REFERENCE_MIN_VALID_PROBE_COUNT" \
+    actor_rollout_ref.actor.eitr.v7_accept_radius="$EITR_V7_ACCEPT_RADIUS" \
+    actor_rollout_ref.actor.eitr.v7_artifact_path="$EITR_V7_ARTIFACT_PATH" \
     actor_rollout_ref.actor.eitr.lambda_env="$EITR_LAMBDA_ENV" \
     actor_rollout_ref.actor.eitr.log_ratio_clip=10.0 \
     actor_rollout_ref.actor.ppo_epochs="$PPO_EPOCHS" \

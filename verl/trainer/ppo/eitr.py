@@ -87,6 +87,125 @@ def eitr_score_path_noop_direction_audit_enabled(config: Any) -> bool:
     return bool(enabled)
 
 
+def v7_geometry_audit_enabled(config: Any) -> bool:
+    """Whether to run the V7 post-GRPO geometry audit without committing it.
+
+    The audit deliberately lives under ``probe_only``: it may construct a
+    temporary ordinary-GRPO proposal, but it owns neither a second backward nor
+    a correction optimizer.
+    """
+    enabled = _config_value(config, "v7_geometry_audit", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() == "true"
+    return bool(enabled)
+
+
+def _average_tie_ranks(values: torch.Tensor) -> torch.Tensor:
+    """Return deterministic average ranks for a finite one-dimensional tensor."""
+    values = values.detach().double().flatten()
+    if values.numel() == 0:
+        return values
+    if not torch.isfinite(values).all():
+        raise ValueError("V7 geometry ranks require finite values")
+    order = torch.argsort(values, stable=True)
+    sorted_values = values[order]
+    sorted_ranks = torch.empty_like(sorted_values)
+    start = 0
+    while start < sorted_values.numel():
+        end = start + 1
+        while end < sorted_values.numel() and bool(
+            sorted_values[end] == sorted_values[start]
+        ):
+            end += 1
+        sorted_ranks[start:end] = 0.5 * (start + end - 1)
+        start = end
+    ranks = torch.empty_like(sorted_ranks)
+    ranks[order] = sorted_ranks
+    return ranks
+
+
+def spearman_rank_correlation(left: torch.Tensor, right: torch.Tensor) -> float:
+    """Spearman rho with average tie ranks; return 0 for a constant vector."""
+    left = left.detach().double().flatten()
+    right = right.detach().double().flatten()
+    if left.shape != right.shape or left.numel() < 2:
+        return 0.0
+    left_rank = _average_tie_ranks(left)
+    right_rank = _average_tie_ranks(right)
+    left_centered = left_rank - left_rank.mean()
+    right_centered = right_rank - right_rank.mean()
+    denominator = left_centered.square().sum().sqrt() * right_centered.square().sum().sqrt()
+    if float(denominator.item()) <= 0:
+        return 0.0
+    return float((left_centered * right_centered).sum().div(denominator).item())
+
+
+def v7_geometry_statistics(
+    *,
+    token_drift: torch.Tensor,
+    env_drift_k4: torch.Tensor,
+    env_drift_reference: torch.Tensor,
+    env_drift_repeat: torch.Tensor,
+    accept_radius: float,
+) -> Dict[str, float]:
+    """Summarize the pre-registered V7 Phase-2 estimator checks.
+
+    Inputs are per-state values gathered across all data-parallel ranks.  The
+    function does not select a radius from the observed batch; callers must
+    provide the frozen radius used for the decision-agreement check.
+    """
+    vectors = [
+        value.detach().double().flatten()
+        for value in (token_drift, env_drift_k4, env_drift_reference, env_drift_repeat)
+    ]
+    if not vectors or vectors[0].numel() < 2:
+        raise ValueError("V7 geometry audit requires at least two eligible states")
+    if any(value.shape != vectors[0].shape for value in vectors[1:]):
+        raise ValueError("V7 geometry vectors must have identical shapes")
+    if any(not torch.isfinite(value).all() for value in vectors):
+        raise ValueError("V7 geometry vectors must be finite")
+    accept_radius = float(accept_radius)
+    if not math.isfinite(accept_radius) or accept_radius <= 0:
+        raise ValueError("V7 accept radius must be finite and positive")
+
+    token, k4, reference, repeat = vectors
+    repeat_error = (repeat - reference).abs()
+    decision_agreement = ((k4 <= accept_radius) == (reference <= accept_radius)).double().mean()
+    token_median = token.median()
+    reference_median = reference.median()
+    high_token_low_env = (token > token_median) & (reference <= reference_median)
+    low_token_high_env = (token <= token_median) & (reference > reference_median)
+    mismatch = high_token_low_env | low_token_high_env
+
+    output: Dict[str, float] = {
+        "state_count": float(reference.numel()),
+        "token_env_spearman": spearman_rank_correlation(token, reference),
+        "k4_reference_spearman": spearman_rank_correlation(k4, reference),
+        "decision_agreement": float(decision_agreement.item()),
+        "accept_radius": accept_radius,
+        "k4_accept_rate": float((k4 <= accept_radius).double().mean().item()),
+        "reference_accept_rate": float((reference <= accept_radius).double().mean().item()),
+        "repeat_jitter_mean": float(repeat_error.mean().item()),
+        "repeat_jitter_max": float(repeat_error.max().item()),
+        "token_env_mismatch_rate": float(mismatch.double().mean().item()),
+        "high_token_low_env_rate": float(
+            high_token_low_env.double().mean().item()
+        ),
+        "low_token_high_env_rate": float(
+            low_token_high_env.double().mean().item()
+        ),
+    }
+    for name, value in (("token", token), ("k4", k4), ("reference", reference)):
+        quantiles = torch.quantile(
+            value, torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64, device=value.device)
+        )
+        output[f"{name}_mean"] = float(value.mean().item())
+        output[f"{name}_q10"] = float(quantiles[0].item())
+        output[f"{name}_q50"] = float(quantiles[1].item())
+        output[f"{name}_q90"] = float(quantiles[2].item())
+    return output
+
+
 def normalized_correction_step(
     *,
     grad_norm: float,
@@ -720,6 +839,13 @@ def validate_eitr_config(
     min_informative_state_rate = float(
         _config_value(config, "min_informative_state_rate", 0.0)
     )
+    v7_audit = v7_geometry_audit_enabled(config)
+    v7_primary_k = int(_config_value(config, "v7_primary_k", 4))
+    v7_reference_k = int(_config_value(config, "v7_reference_k", 16))
+    v7_reference_min_valid = int(
+        _config_value(config, "v7_reference_min_valid_probe_count", 12)
+    )
+    v7_accept_radius = float(_config_value(config, "v7_accept_radius", 1e-3))
 
     if probe_count < 2:
         raise ValueError("EITR requires probe_count >= 2")
@@ -753,6 +879,28 @@ def validate_eitr_config(
             "EITR probe_micro_batch_size must be divisible by probe_count so "
             "each scoring chunk contains complete same-state probe groups"
         )
+    if v7_audit:
+        if mode != "probe_only":
+            raise ValueError("V7 geometry audit requires eitr.mode=probe_only")
+        if probe_count != v7_reference_k:
+            raise ValueError(
+                "V7 geometry audit requires probe_count == v7_reference_k; got "
+                f"{probe_count} != {v7_reference_k}"
+            )
+        if v7_primary_k != 4:
+            raise ValueError("V7 Phase-2 primary estimator is pre-registered at K=4")
+        if not 2 <= v7_primary_k < v7_reference_min_valid <= v7_reference_k:
+            raise ValueError(
+                "V7 K settings require 2 <= primary_k < reference_min_valid <= reference_k"
+            )
+        if min_valid_probe_count != v7_reference_min_valid:
+            raise ValueError(
+                "V7 geometry audit requires min_valid_probe_count == "
+                "v7_reference_min_valid_probe_count so every reported state has a "
+                "usable higher-K reference"
+            )
+        if not math.isfinite(v7_accept_radius) or v7_accept_radius <= 0:
+            raise ValueError("V7 accept radius must be finite and positive")
     if min(
         max_query_tokens,
         max_action_tokens,

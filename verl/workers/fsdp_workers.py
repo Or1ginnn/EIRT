@@ -418,9 +418,20 @@ class ActorRolloutRefWorker(Worker):
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
-            self.actor_lr_scheduler.step()
+            # V7 Phase-2 constructs a temporary GRPO proposal and restores
+            # theta/AdamW before returning. Advancing the scheduler would still
+            # mutate the next audit batch, so the no-update contract includes
+            # the outer scheduler state.
+            v7_no_update_audit = bool(
+                getattr(self.actor, 'v7_geometry_audit', False)
+            )
+            if not v7_no_update_audit:
+                self.actor_lr_scheduler.step()
             metrics['actor/lr'] = lr_used
             metrics['actor/lr_next_outer_update'] = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/v7_geometry_scheduler_step_skipped'] = float(
+                v7_no_update_audit
+            )
             metrics['actor/batch_cpu_streaming'] = float(self._is_offload_batch)
             metrics['timing_s/actor_optimizer_load_before_grpo'] = float(
                 optimizer_load_seconds

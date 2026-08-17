@@ -78,6 +78,9 @@ eitr_loss_enabled_for_pass = EITR.eitr_loss_enabled_for_pass
 validate_eitr_optimization_schedule = EITR.validate_eitr_optimization_schedule
 validate_eitr_config = EITR.validate_eitr_config
 validate_sibling_group_layout = EITR.validate_sibling_group_layout
+v7_geometry_audit_enabled = EITR.v7_geometry_audit_enabled
+v7_geometry_statistics = EITR.v7_geometry_statistics
+spearman_rank_correlation = EITR.spearman_rank_correlation
 
 
 class TrackingFlushTest(unittest.TestCase):
@@ -2148,6 +2151,120 @@ class ScorePathNoopDirectionAuditTest(unittest.TestCase):
             count_guard,
         )
         self.assertLess(count_guard, count_increment)
+
+
+class V7GeometryAuditTest(unittest.TestCase):
+    def test_v7_geometry_statistics_recovers_rank_and_decision_agreement(self):
+        reference = torch.tensor([0.0002, 0.0006, 0.0014, 0.0020], dtype=torch.float64)
+        k4 = torch.tensor([0.0003, 0.0005, 0.0012, 0.0022], dtype=torch.float64)
+        token = torch.tensor([0.8, 0.1, 0.6, 0.2], dtype=torch.float64)
+        repeat = reference + torch.tensor([1e-8, -2e-8, 1e-8, 0.0])
+
+        metrics = v7_geometry_statistics(
+            token_drift=token,
+            env_drift_k4=k4,
+            env_drift_reference=reference,
+            env_drift_repeat=repeat,
+            accept_radius=1e-3,
+        )
+
+        self.assertAlmostEqual(metrics["k4_reference_spearman"], 1.0)
+        self.assertAlmostEqual(metrics["decision_agreement"], 1.0)
+        self.assertLess(metrics["repeat_jitter_max"], 3e-8)
+        self.assertLess(abs(metrics["token_env_spearman"]), 1.0)
+        self.assertEqual(metrics["state_count"], 4.0)
+
+    def test_spearman_uses_average_tie_ranks(self):
+        left = torch.tensor([1.0, 1.0, 2.0, 3.0])
+        right = torch.tensor([4.0, 4.0, 5.0, 6.0])
+        self.assertAlmostEqual(spearman_rank_correlation(left, right), 1.0)
+        self.assertEqual(
+            spearman_rank_correlation(torch.ones(4), torch.arange(4.0)), 0.0
+        )
+
+    def test_v7_validation_requires_probe_only_k16_and_reference_eligibility(self):
+        base = {
+            "mode": "probe_only",
+            "probe_count": 16,
+            "min_valid_probe_count": 12,
+            "probe_micro_batch_size": 16,
+            "probe_logprob_micro_batch_size": 16,
+            "max_query_tokens": 500,
+            "max_action_tokens": 500,
+            "max_probe_prompt_tokens": 8192,
+            "v7_geometry_audit": True,
+            "v7_primary_k": 4,
+            "v7_reference_k": 16,
+            "v7_reference_min_valid_probe_count": 12,
+            "v7_accept_radius": 1e-3,
+        }
+        validate_eitr_config(
+            base,
+            n_agent=5,
+            max_queries_per_turn=1,
+            rollout_n=1,
+            rollout_response_length=500,
+            max_prompt_length=8192,
+            rollout_max_model_len=8692,
+            rollout_top_p=1.0,
+            rollout_top_k=-1,
+        )
+        self.assertTrue(v7_geometry_audit_enabled(base))
+
+        for key, value in (
+            ("mode", "eitr"),
+            ("probe_count", 4),
+            ("min_valid_probe_count", 2),
+        ):
+            invalid = dict(base)
+            invalid[key] = value
+            with self.assertRaises(ValueError):
+                validate_eitr_config(
+                    invalid,
+                    n_agent=5,
+                    max_queries_per_turn=1,
+                    rollout_n=1,
+                    rollout_response_length=500,
+                    max_prompt_length=8192,
+                    rollout_max_model_len=8692,
+                    rollout_top_p=1.0,
+                    rollout_top_k=-1,
+                )
+
+    def test_v7_source_restores_model_optimizer_and_skips_scheduler(self):
+        root = Path(__file__).resolve().parents[1]
+        actor_source = (root / "verl/workers/actor/dp_actor.py").read_text()
+        worker_source = (root / "verl/workers/fsdp_workers.py").read_text()
+
+        snapshot = actor_source.index("v7_parameter_snapshot = self._snapshot_eitr_local_state()")
+        grpo = actor_source.index("grpo_update_start = time.perf_counter()")
+        score = actor_source.index("v7_metrics, v7_vectors = self._run_v7_geometry_audit")
+        restore = actor_source.index("self._restore_eitr_local_state(", score)
+        optimizer_restore = actor_source.index(
+            "self.actor_optimizer.load_state_dict(v7_optimizer_state)", restore
+        )
+        self.assertLess(snapshot, grpo)
+        self.assertLess(grpo, score)
+        self.assertLess(score, restore)
+        self.assertLess(restore, optimizer_restore)
+        self.assertIn("if not v7_no_update_audit:", worker_source)
+        self.assertIn("self.actor_lr_scheduler.step()", worker_source)
+
+    def test_v7_runner_is_no_update_k4_k16_protocol(self):
+        runner = (
+            Path(__file__).resolve().parents[1]
+            / "scripts/eval/run_v7_phase2_geometry_audit.sh"
+        ).read_text()
+        for expected in (
+            "export EITR_MODE=probe_only",
+            "export EITR_V7_GEOMETRY_AUDIT=true",
+            "export EITR_PROBE_COUNT=16",
+            "export EITR_V7_PRIMARY_K=4",
+            "export EITR_V7_REFERENCE_K=16",
+            "export SAVE_FREQ=-1",
+            "export SHUFFLE_TRAIN_DATALOADER=false",
+        ):
+            self.assertIn(expected, runner)
 
 
 if __name__ == "__main__":

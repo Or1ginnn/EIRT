@@ -96,6 +96,14 @@ actor_rollout_ref:
       update_direction_diagnostic: false  # one-shot +/- gradient audit only
       score_path_noop_direction_audit: false  # one-shot score-path audit only
       score_path_anchor_max_abs_logprob_diff: 1.0e-3
+      # V7 Phase-2 only: construct one ordinary GRPO proposal, measure its
+      # geometry, then restore theta/AdamW and skip the LR-scheduler step.
+      v7_geometry_audit: false
+      v7_primary_k: 4
+      v7_reference_k: 16
+      v7_reference_min_valid_probe_count: 12
+      v7_accept_radius: 1.0e-3
+      v7_artifact_path: null
       lambda_env: 0.1
       log_ratio_clip: 10.0
     # Number of ordinary GRPO passes. EITR correction_passes are separate and
