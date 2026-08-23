@@ -161,6 +161,17 @@ algorithm:
   state_masking:
     start_state_marker: "<information>"
     end_state_marker: "</information>"
+  ca_ecad:
+    # Phase 2 records grouped rollouts and exits without any optimizer step.
+    diagnostics_only: false
+    diagnostics_max_steps: 1
+    diagnostics_output_dir: null
+    min_calibration_prompts: 256
+    eta: 0.25
+    kappa: 1.0
+    alpha: 2.0
+    success_prior_rho: 0.01
+    mode_balance_gamma: 0.0
 
 trainer:
   total_epochs: 30

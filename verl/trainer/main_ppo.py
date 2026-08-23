@@ -148,10 +148,12 @@ def main_task(config):
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+    ca_ecad_diagnostics_only = bool(config.algorithm.ca_ecad.diagnostics_only)
+    if ca_ecad_diagnostics_only and config.reward_model.enable:
+        raise ValueError('CA-ECAD Phase 2 requires reward_model.enable=false')
+
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
-        Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
 
     global_pool_id = 'global_pool'
@@ -160,9 +162,15 @@ def main_task(config):
     }
     mapping = {
         Role.ActorRollout: global_pool_id,
-        Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+
+    # Phase 2 only generates and scores trajectories on the driver.  It does
+    # not compute log-probabilities, values, KL, advantages, or updates.
+    if not ca_ecad_diagnostics_only:
+        role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+        mapping[Role.Critic] = global_pool_id
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score

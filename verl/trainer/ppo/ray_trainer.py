@@ -41,6 +41,13 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+from search_r1.llm_agent.ca_ecad import (
+    compute_peer_diagnostics,
+    contiguous_policy_spans,
+    validate_segment_partition,
+    write_json,
+    write_jsonl,
+)
 
 WorkerType = Type[Worker]
 
@@ -452,6 +459,7 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
+            record_ca_ecad_trace=bool(self.config.algorithm.ca_ecad.diagnostics_only),
         )
 
         # Agent config preparation
@@ -651,6 +659,134 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _export_ca_ecad_phase2_batch(self, batch: DataProto, diagnostic_step: int):
+        """Persist one batch-aligned, no-update CA-ECAD diagnostic sample."""
+
+        required_batch_keys = {
+            'responses',
+            'attention_mask',
+            'info_mask',
+            'token_level_scores',
+            'ca_ecad_generation_turn_ids',
+            'ca_ecad_turn_action_codes',
+            'ca_ecad_policy_segment_ids',
+            'ca_ecad_search_count',
+        }
+        missing_batch_keys = sorted(required_batch_keys - set(batch.batch.keys()))
+        if missing_batch_keys:
+            raise RuntimeError(f'CA-ECAD diagnostic batch is missing tensors: {missing_batch_keys}')
+        required_non_tensor_keys = {'uid', 'ca_ecad_search_document_ids'}
+        missing_non_tensor_keys = sorted(required_non_tensor_keys - set(batch.non_tensor_batch.keys()))
+        if missing_non_tensor_keys:
+            raise RuntimeError(f'CA-ECAD diagnostic batch is missing row metadata: {missing_non_tensor_keys}')
+
+        output_dir = self.config.algorithm.ca_ecad.diagnostics_output_dir
+        if output_dir is None or not str(output_dir).strip():
+            raise ValueError('algorithm.ca_ecad.diagnostics_output_dir is required in diagnostics-only mode')
+        output_dir = os.path.abspath(os.path.expanduser(str(output_dir)))
+        rollout_path = os.path.join(output_dir, f'phase2_step_{diagnostic_step:06d}_rollouts.jsonl')
+        summary_path = os.path.join(output_dir, f'phase2_step_{diagnostic_step:06d}_summary.json')
+        if os.path.exists(rollout_path) or os.path.exists(summary_path):
+            raise FileExistsError(
+                f'refusing to overwrite an existing CA-ECAD diagnostic step: {diagnostic_step}'
+            )
+
+        responses = batch.batch['responses']
+        response_length = responses.shape[-1]
+        response_attention_mask = batch.batch['attention_mask'][:, -response_length:].bool()
+        policy_mask = batch.batch['info_mask'][:, -response_length:].bool()
+        generation_turn_ids = batch.batch['ca_ecad_generation_turn_ids']
+        action_codes = batch.batch['ca_ecad_turn_action_codes']
+        segment_ids = batch.batch['ca_ecad_policy_segment_ids']
+        search_counts = batch.batch['ca_ecad_search_count']
+        sequence_scores = batch.batch['token_level_scores'].sum(dim=-1)
+
+        row_count = responses.shape[0]
+        if len(batch.non_tensor_batch['uid']) != row_count or \
+                len(batch.non_tensor_batch['ca_ecad_search_document_ids']) != row_count:
+            raise RuntimeError('CA-ECAD tensor and non-tensor row counts diverged after balancing')
+
+        records = []
+        group_uids = []
+        rewards = []
+        histories = []
+        for row_index in range(row_count):
+            prompt_uid = str(batch.non_tensor_batch['uid'][row_index])
+            group_uid = f'{diagnostic_step}:{prompt_uid}'
+            reward = float(sequence_scores[row_index].detach().cpu().item())
+            if reward not in (0.0, 1.0):
+                raise ValueError(
+                    'CA-ECAD Phase 2 requires Search-R1 v0.1 binary normalized-EM rewards; '
+                    f'row {row_index} received {reward}'
+                )
+
+            history = batch.non_tensor_batch['ca_ecad_search_document_ids'][row_index]
+            if not isinstance(history, (list, tuple)):
+                raise TypeError(f'row {row_index} search history is not a list')
+            normalized_history = [list(turn) for turn in history]
+            search_count = int(search_counts[row_index].detach().cpu().item())
+            if search_count != len(normalized_history):
+                raise RuntimeError(
+                    f'row {row_index} has search_count={search_count} but {len(normalized_history)} ID turns'
+                )
+
+            row_policy_mask = policy_mask[row_index].detach().cpu().int().tolist()
+            row_segment_ids = segment_ids[row_index].detach().cpu().tolist()
+            validate_segment_partition(row_segment_ids, row_policy_mask, search_count)
+            observed_segments = {
+                int(segment_id)
+                for segment_id, is_policy in zip(row_segment_ids, row_policy_mask)
+                if bool(is_policy) and int(segment_id) > 0
+            }
+            expected_segments = set(range(1, search_count + 2))
+            missing_segments = sorted(expected_segments - observed_segments)
+            if missing_segments:
+                raise RuntimeError(
+                    f'row {row_index} lost CA-ECAD policy segments {missing_segments}; '
+                    'increase max_prompt_length rather than assigning partial credit'
+                )
+            row_generation_turn_ids = generation_turn_ids[row_index].detach().cpu().tolist()
+            row_action_codes = action_codes[row_index].detach().cpu().tolist()
+            valid_response_tokens = responses[row_index][response_attention_mask[row_index]].detach().cpu().tolist()
+            response_text = self.tokenizer.decode(valid_response_tokens, skip_special_tokens=False)
+
+            records.append({
+                'diagnostic_step': diagnostic_step,
+                'row_index_after_balance': row_index,
+                'prompt_uid': prompt_uid,
+                'group_uid': group_uid,
+                'reward': reward,
+                'search_count': search_count,
+                'ordered_search_document_ids': normalized_history,
+                'turn_action_codes': row_action_codes,
+                'generation_turn_ids': row_generation_turn_ids,
+                'policy_mask': row_policy_mask,
+                'policy_segment_ids': row_segment_ids,
+                'policy_segment_spans': contiguous_policy_spans(row_segment_ids, row_policy_mask),
+                'response_text': response_text,
+            })
+            group_uids.append(group_uid)
+            rewards.append(reward)
+            histories.append(normalized_history)
+
+        diagnostic_metrics = compute_peer_diagnostics(group_uids, rewards, histories)
+        diagnostic_metrics.update({
+            'ca_ecad/phase2/diagnostics_only': 1.0,
+            'ca_ecad/phase2/optimizer_step_count': 0.0,
+            'ca_ecad/phase2/reward_mean': sum(rewards) / len(rewards),
+            'ca_ecad/phase2/reward_max': max(rewards),
+            'ca_ecad/phase2/reward_min': min(rewards),
+        })
+        write_jsonl(rollout_path, records)
+        write_json(summary_path, {
+            'diagnostic_step': diagnostic_step,
+            'rollout_path': rollout_path,
+            'metrics': diagnostic_metrics,
+            'no_model_update': True,
+        })
+        print(f'CA-ECAD Phase-2 diagnostics written to {rollout_path}')
+        return diagnostic_metrics
+
     def fit(self):
         """
         The training loop of PPO.
@@ -659,10 +795,22 @@ class RayPPOTrainer(object):
         """
 
         logger = self.logger
+        ca_ecad_diagnostics_only = bool(self.config.algorithm.ca_ecad.diagnostics_only)
+        ca_ecad_diagnostics_max_steps = int(self.config.algorithm.ca_ecad.diagnostics_max_steps)
+        if ca_ecad_diagnostics_only:
+            if not self.config.do_search:
+                raise ValueError('CA-ECAD diagnostics require do_search=true')
+            if self.use_rm:
+                raise ValueError('CA-ECAD Phase 2 requires a rule-based binary outcome reward, not a learned RM')
+            if ca_ecad_diagnostics_max_steps < 1:
+                raise ValueError('algorithm.ca_ecad.diagnostics_max_steps must be positive')
+            if self.config.algorithm.ca_ecad.diagnostics_output_dir is None:
+                raise ValueError('algorithm.ca_ecad.diagnostics_output_dir is required')
         self.global_steps = 0
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        if not ca_ecad_diagnostics_only and self.val_reward_fn is not None and \
+                self.config.trainer.get('val_before_train', True):
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
             logger.log(data=val_metrics, step=self.global_steps)
@@ -683,6 +831,7 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
+            record_ca_ecad_trace=ca_ecad_diagnostics_only,
         )
 
         generation_manager = LLMGenerationManager(
@@ -692,6 +841,7 @@ class RayPPOTrainer(object):
         )
 
         # start training loop
+        ca_ecad_diagnostic_steps_completed = 0
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 print(f'epoch {epoch}, step {self.global_steps}')
@@ -735,9 +885,10 @@ class RayPPOTrainer(object):
                         for key in final_gen_batch_output.batch.keys():
                             final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
-                        with torch.no_grad():
-                            output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
-                            final_gen_batch_output = final_gen_batch_output.union(output)
+                        if not ca_ecad_diagnostics_only:
+                            with torch.no_grad():
+                                output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
+                                final_gen_batch_output = final_gen_batch_output.union(output)
 
                         # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                         #                                         dtype=object)
@@ -763,14 +914,14 @@ class RayPPOTrainer(object):
                         if key != 'old_log_probs':
                             batch.batch[key] = batch.batch[key].long()
 
-                    if self.use_reference_policy:
+                    if self.use_reference_policy and not ca_ecad_diagnostics_only:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
-                    if self.use_critic:
+                    if self.use_critic and not ca_ecad_diagnostics_only:
                         with _timer('values', timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
@@ -788,8 +939,16 @@ class RayPPOTrainer(object):
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
 
+                        if ca_ecad_diagnostics_only:
+                            metrics.update(self._export_ca_ecad_phase2_batch(
+                                batch=batch,
+                                diagnostic_step=ca_ecad_diagnostic_steps_completed + 1,
+                            ))
+
                         # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                        if ca_ecad_diagnostics_only:
+                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                        elif not self.config.actor_rollout_ref.actor.use_kl_loss:
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
                                                                  kl_penalty=self.config.algorithm.kl_penalty)
@@ -798,21 +957,23 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        if not ca_ecad_diagnostics_only:
+                            batch = compute_advantage(batch,
+                                                      adv_estimator=self.config.algorithm.adv_estimator,
+                                                      gamma=self.config.algorithm.gamma,
+                                                      lam=self.config.algorithm.lam,
+                                                      num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
-                    if self.use_critic:
+                    if self.use_critic and not ca_ecad_diagnostics_only:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if not ca_ecad_diagnostics_only and \
+                            self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
                             if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
@@ -822,16 +983,30 @@ class RayPPOTrainer(object):
                         metrics.update(actor_output_metrics)
 
                     # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                    if not ca_ecad_diagnostics_only and self.val_reward_fn is not None and \
+                        self.config.trainer.test_freq > 0 and \
                         self.global_steps % self.config.trainer.test_freq == 0:
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and \
+                    if not ca_ecad_diagnostics_only and self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
+
+                if ca_ecad_diagnostics_only:
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    logger.log(data=metrics, step=self.global_steps)
+                    ca_ecad_diagnostic_steps_completed += 1
+                    self.global_steps += 1
+                    if ca_ecad_diagnostic_steps_completed >= ca_ecad_diagnostics_max_steps:
+                        print(
+                            'CA-ECAD Phase-2 diagnostics complete: '
+                            f'{ca_ecad_diagnostic_steps_completed} batches, zero optimizer steps.'
+                        )
+                        return
+                    continue
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
