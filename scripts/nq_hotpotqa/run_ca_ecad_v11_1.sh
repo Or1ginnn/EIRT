@@ -22,6 +22,14 @@ PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-4}"
 LOGPROB_MICRO_BATCH_SIZE="${LOGPROB_MICRO_BATCH_SIZE:-8}"
 REF_LOGPROB_MICRO_BATCH_SIZE="${REF_LOGPROB_MICRO_BATCH_SIZE:-8}"
+# CA-ECAD keeps its batch-level peer statistics on the CPU already.  Do not
+# also force the actor's parameters, gradients, and AdamW state there: on a
+# shared server that can exhaust host RAM long before either training GPU is
+# full.  These switches remain overridable for genuinely GPU-constrained runs.
+ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-false}"
+ACTOR_GRAD_OFFLOAD="${ACTOR_GRAD_OFFLOAD:-false}"
+ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD:-false}"
+REF_PARAM_OFFLOAD="${REF_PARAM_OFFLOAD:-true}"
 ACTOR_LR="${ACTOR_LR:-5e-7}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
 SAVE_FREQ="${SAVE_FREQ:--1}"
@@ -50,6 +58,13 @@ if (( PPO_MINI_BATCH_SIZE < 1 || PPO_MICRO_BATCH_SIZE < 1 || PPO_MINI_BATCH_SIZE
   echo "PPO mini/micro batches must be positive and mini divisible by micro" >&2
   exit 2
 fi
+for setting in ACTOR_PARAM_OFFLOAD ACTOR_GRAD_OFFLOAD ACTOR_OPTIMIZER_OFFLOAD REF_PARAM_OFFLOAD; do
+  value="${!setting}"
+  if [[ "${value}" != "true" && "${value}" != "false" ]]; then
+    echo "${setting} must be true or false, got: ${value}" >&2
+    exit 2
+  fi
+done
 for path in "${BASE_MODEL}" "${INITIAL_SUCCESS_PRIOR_PATH}" "${TRAIN_FILE}" "${VAL_FILE}"; do
   if [[ -n "${path}" && ! -e "${path}" ]]; then
     echo "Required path does not exist: ${path}" >&2
@@ -148,9 +163,9 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size="${PPO_MICRO_BATCH_SIZE}" \
-  actor_rollout_ref.actor.fsdp_config.param_offload=true \
-  actor_rollout_ref.actor.fsdp_config.grad_offload=true \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+  actor_rollout_ref.actor.fsdp_config.param_offload="${ACTOR_PARAM_OFFLOAD}" \
+  actor_rollout_ref.actor.fsdp_config.grad_offload="${ACTOR_GRAD_OFFLOAD}" \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload="${ACTOR_OPTIMIZER_OFFLOAD}" \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.n=1 \
   actor_rollout_ref.rollout.n_agent="${N_AGENT}" \
@@ -159,7 +174,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size="${LOGPROB_MICRO_BATCH_SIZE}" \
   actor_rollout_ref.ref.log_prob_micro_batch_size="${REF_LOGPROB_MICRO_BATCH_SIZE}" \
-  actor_rollout_ref.ref.fsdp_config.param_offload=true \
+  actor_rollout_ref.ref.fsdp_config.param_offload="${REF_PARAM_OFFLOAD}" \
   actor_rollout_ref.actor.state_masking=true \
   reward_model.enable=false \
   trainer.logger="['wandb']" \
