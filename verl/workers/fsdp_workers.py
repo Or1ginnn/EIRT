@@ -365,6 +365,9 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
         data.batch = data.batch.cuda()
+        # This is the learning rate used by every AdamW mini-batch below.
+        # The scheduler is stepped only after update_policy returns.
+        actor_lr_used = float(self.actor_optimizer.param_groups[0]['lr'])
 
         log_gpu_memory_usage('Before update policy', logger=logger)
 
@@ -379,8 +382,13 @@ class ActorRolloutRefWorker(Worker):
             metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
             self.actor_lr_scheduler.step()
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics['actor/lr'] = lr
+            actor_lr_next = float(self.actor_lr_scheduler.get_last_lr()[0])
+            # Keep actor/lr as the actual rate used in this outer update for
+            # backward-compatible dashboards; expose the scheduled next rate
+            # separately so warmup is no longer visually one update ahead.
+            metrics['actor/lr'] = actor_lr_used
+            metrics['actor/lr_used'] = actor_lr_used
+            metrics['actor/lr_next'] = actor_lr_next
 
             log_gpu_memory_usage('After update policy', logger=logger)
 

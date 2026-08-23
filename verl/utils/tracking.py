@@ -35,6 +35,7 @@ class Tracking(object):
                 assert backend in self.supported_backend, f'{backend} is not supported'
 
         self.logger = {}
+        self._finished = False
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
@@ -61,12 +62,35 @@ class Tracking(object):
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def finish(self, exit_code: int = 0):
+        """Flush terminal tracker state exactly once.
+
+        W&B writes history asynchronously.  Explicitly finishing is therefore
+        required before the Ray driver exits, otherwise a short run can retain
+        its summary while silently losing its time-series history.
+        """
+        if self._finished:
+            return
+        self._finished = True
+
+        wandb_logger = self.logger.get('wandb')
+        if wandb_logger is not None:
+            wandb_logger.finish(exit_code=exit_code)
+
+        mlflow_logger = self.logger.get('mlflow')
+        if mlflow_logger is not None:
+            mlflow_logger.finish(exit_code=exit_code)
+
 
 class _MlflowLoggingAdapter:
 
     def log(self, data, step):
         import mlflow
         mlflow.log_metrics(metrics=data, step=step)
+
+    def finish(self, exit_code: int = 0):
+        import mlflow
+        mlflow.end_run(status='FINISHED' if exit_code == 0 else 'FAILED')
 
 
 def _compute_mlflow_params_from_objects(params) -> Dict[str, Any]:

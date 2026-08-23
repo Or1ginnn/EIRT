@@ -216,8 +216,13 @@ def main_task(config):
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn,
                             )
-    trainer.init_workers()
-    trainer.fit()
+    exit_code = 1
+    try:
+        trainer.init_workers()
+        trainer.fit()
+        exit_code = 0
+    finally:
+        trainer.logger.finish(exit_code=exit_code)
 
 
 if __name__ == '__main__':

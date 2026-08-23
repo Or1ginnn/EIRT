@@ -1103,8 +1103,9 @@ class RayPPOTrainer(object):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 print(f'epoch {epoch}, step {self.global_steps}')
-                metrics = {}
+                metrics = {'trainer/outer_update_step': float(self.global_steps)}
                 timing_raw = {}
+                validated_this_update = False
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
@@ -1257,6 +1258,7 @@ class RayPPOTrainer(object):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
+                        validated_this_update = True
 
                     if not ca_ecad_diagnostics_only and self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
@@ -1276,6 +1278,16 @@ class RayPPOTrainer(object):
                         return
                     continue
 
+                # The final validation belongs to the update that produced its
+                # parameters.  Keeping it in this metric payload avoids a
+                # synthetic `total_training_steps + 1` W&B point.
+                if self.global_steps >= self.total_training_steps and self.val_reward_fn is not None \
+                        and not validated_this_update:
+                    with _timer('testing', timing_raw):
+                        val_metrics = self._validate()
+                    pprint(f'Final validation metrics: {val_metrics}')
+                    metrics.update(val_metrics)
+
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
@@ -1286,12 +1298,6 @@ class RayPPOTrainer(object):
                 self.global_steps += 1
 
                 if self.global_steps >= self.total_training_steps:
-
-                    # perform validation after training
-                    if self.val_reward_fn is not None:
-                        val_metrics = self._validate()
-                        pprint(f'Final validation metrics: {val_metrics}')
-                        logger.log(data=val_metrics, step=self.global_steps)
                     return
     
     def _create_loss_mask(self, batch, metrics):
