@@ -18,6 +18,7 @@ from search_r1.llm_agent.ca_ecad import (
     compute_peer_diagnostics,
     contiguous_policy_spans,
     ordered_document_ids,
+    summarize_absolute_credit,
     top1_peer_key,
     validate_segment_partition,
     write_json,
@@ -167,6 +168,16 @@ class PeerDiagnosticsTest(unittest.TestCase):
         self.assertEqual(metrics['ca_ecad/phase2/all_zero_repeated_mode_group_count'], 1.0)
         self.assertEqual(metrics['ca_ecad/phase2/all_zero_repeated_mode_rate'], 1.0)
 
+    def test_mode_diversity_is_distinct_from_peer_support(self):
+        metrics = compute_peer_diagnostics(
+            group_uids=['q', 'q', 'q', 'q', 'q'],
+            rewards=[0.0, 0.0, 1.0, 0.0, 1.0],
+            search_histories=[[['A']], [['A']], [['A']], [['A']], [['B']]],
+        )
+        self.assertAlmostEqual(metrics['ca_ecad/phase2/distinct_top1_mode_mean/k_1'], 2.0)
+        self.assertAlmostEqual(metrics['ca_ecad/phase2/all_same_top1_mode_rate/k_1'], 0.0)
+        self.assertAlmostEqual(metrics['ca_ecad/phase2/multiple_top1_mode_rate/k_1'], 1.0)
+
     def test_missing_ids_are_reported_not_grouped(self):
         metrics = compute_peer_diagnostics(
             group_uids=['q', 'q'],
@@ -176,6 +187,15 @@ class PeerDiagnosticsTest(unittest.TestCase):
         self.assertEqual(metrics['ca_ecad/phase2/top1_document_id_presence_rate'], 0.0)
         self.assertEqual(metrics['ca_ecad/phase2/top1_peer_supported_turn_count'], 0.0)
         self.assertEqual(metrics['ca_ecad/phase2/all_document_id_presence_rate'], 0.5)
+
+
+class CreditMagnitudeTest(unittest.TestCase):
+
+    def test_absolute_credit_summary_does_not_cancel_signs(self):
+        summary = summarize_absolute_credit([-0.02, 0.03, -0.01, 0.00])
+        self.assertAlmostEqual(summary['mean_abs'], 0.015)
+        self.assertAlmostEqual(summary['rate_abs_gt_0_01'], 0.5)
+        self.assertAlmostEqual(summary['rate_abs_gt_0_05'], 0.0)
 
 
 class ArtifactWriterTest(unittest.TestCase):
@@ -224,6 +244,54 @@ class ArtifactWriterTest(unittest.TestCase):
             self.assertEqual(analysis['rollout_count'], 4)
             with open(os.path.join(directory, 'phase2_credit_records.jsonl'), 'r', encoding='utf-8') as handle:
                 self.assertEqual(len(handle.readlines()), 4)
+
+    def test_signal_analyzer_reports_credit_magnitude_and_mode_diversity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rollout_path = os.path.join(directory, 'phase2_step_000001_rollouts.jsonl')
+            state_path = os.path.join(directory, 'global_step_100.json')
+            write_jsonl(rollout_path, [
+                {
+                    'group_uid': '1:p1', 'reward': 0.0,
+                    'ordered_search_document_ids': [['A', 'x']],
+                    'policy_segment_spans': {'1': [[0, 2]], '2': [[2, 5]]},
+                },
+                {
+                    'group_uid': '1:p1', 'reward': 1.0,
+                    'ordered_search_document_ids': [['B', 'y']],
+                    'policy_segment_spans': {'1': [[0, 4]], '2': [[4, 5]]},
+                },
+            ])
+            write_json(state_path, {
+                'version': 1,
+                'success_prior': 0.5,
+                'hyperparameters': {
+                    'alpha': 2.0, 'eta': 0.25, 'kappa': 1.0,
+                    'success_prior_rho': 0.01, 'mode_balance_gamma': 0.0,
+                },
+            })
+            script = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                'scripts', 'diagnostics', 'analyze_ca_ecad_signal.py',
+            )
+            subprocess.run(
+                [
+                    sys.executable, script, '--input-dir', directory,
+                    '--prior-state-path', state_path,
+                ],
+                check=True, capture_output=True, text=True,
+            )
+            with open(os.path.join(directory, 'ca_ecad_signal_audit.json'), 'r', encoding='utf-8') as handle:
+                audit = json.load(handle)
+            self.assertEqual(audit['rollout_count'], 2)
+            self.assertGreater(audit['acquisition_by_search_round']['k_1']['mean_abs'], 0.0)
+            self.assertEqual(
+                audit['environment_mode_diversity_by_search_round']['k_1']['distinct_top1_mode_mean'], 2.0,
+            )
+            self.assertAlmostEqual(
+                audit['absolute_policy_signal_mass']['acquisition_share'] +
+                audit['absolute_policy_signal_mass']['utilization_share'],
+                1.0,
+            )
 
 
 if __name__ == '__main__':

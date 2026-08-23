@@ -33,6 +33,37 @@ def canonical_document_id(value: Any) -> Optional[str]:
     return text or None
 
 
+def summarize_absolute_credit(values: Sequence[float]) -> Dict[str, float]:
+    """Summarize credit magnitude without allowing opposite signs to cancel."""
+
+    magnitudes = [abs(float(value)) for value in values]
+    if not magnitudes:
+        return {
+            "count": 0.0,
+            "mean_abs": 0.0,
+            "std_abs": 0.0,
+            "p50_abs": 0.0,
+            "p90_abs": 0.0,
+            "rate_abs_gt_0_01": 0.0,
+            "rate_abs_gt_0_05": 0.0,
+        }
+    ordered = sorted(magnitudes)
+
+    def nearest(quantile: float) -> float:
+        return float(ordered[int(round((len(ordered) - 1) * quantile))])
+
+    mean = sum(magnitudes) / len(magnitudes)
+    return {
+        "count": float(len(magnitudes)),
+        "mean_abs": float(mean),
+        "std_abs": float(math.sqrt(sum((value - mean) ** 2 for value in magnitudes) / len(magnitudes))),
+        "p50_abs": nearest(0.50),
+        "p90_abs": nearest(0.90),
+        "rate_abs_gt_0_01": float(sum(value > 0.01 for value in magnitudes) / len(magnitudes)),
+        "rate_abs_gt_0_05": float(sum(value > 0.05 for value in magnitudes) / len(magnitudes)),
+    }
+
+
 def ordered_document_ids(retrieval_result: Sequence[Mapping[str, Any]]) -> Tuple[Optional[str], ...]:
     """Extract ranked corpus IDs without sorting or title fallback."""
 
@@ -428,6 +459,39 @@ def compute_peer_diagnostics(
         metrics[f"ca_ecad/phase2/valid_search_turn_count/k_{valid_search_turn}"] = float(count)
         metrics[f"ca_ecad/phase2/top1_peer_supported_turn_rate/k_{valid_search_turn}"] = (
             supported_count_by_k[valid_search_turn] / count if count else 0.0
+        )
+
+    # Peer support near G-1 can mean either useful agreement or a collapsed
+    # prompt group.  Log the prompt-level number of distinct Top-1 modes so
+    # that those cases are distinguishable online.
+    mode_count_by_turn: Dict[int, List[int]] = defaultdict(list)
+    for uid, members in groups.items():
+        max_turn_count = max((len(histories[index]) for index in members), default=0)
+        for zero_based_turn in range(max_turn_count):
+            top1_modes = {
+                canonical_document_id(histories[index][zero_based_turn][0])
+                for index in members
+                if len(histories[index]) > zero_based_turn and histories[index][zero_based_turn]
+            }
+            top1_modes.discard(None)
+            if top1_modes:
+                mode_count_by_turn[zero_based_turn + 1].append(len(top1_modes))
+    for valid_search_turn, counts in sorted(mode_count_by_turn.items()):
+        ordered_counts = sorted(counts)
+        metrics[f"ca_ecad/phase2/distinct_top1_mode_mean/k_{valid_search_turn}"] = (
+            sum(counts) / len(counts)
+        )
+        metrics[f"ca_ecad/phase2/distinct_top1_mode_p50/k_{valid_search_turn}"] = _nearest_rank(
+            ordered_counts, 0.50
+        )
+        metrics[f"ca_ecad/phase2/distinct_top1_mode_p90/k_{valid_search_turn}"] = _nearest_rank(
+            ordered_counts, 0.90
+        )
+        metrics[f"ca_ecad/phase2/all_same_top1_mode_rate/k_{valid_search_turn}"] = (
+            sum(count == 1 for count in counts) / len(counts)
+        )
+        metrics[f"ca_ecad/phase2/multiple_top1_mode_rate/k_{valid_search_turn}"] = (
+            sum(count > 1 for count in counts) / len(counts)
         )
     return metrics
 

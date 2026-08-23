@@ -46,6 +46,7 @@ from search_r1.llm_agent.ca_ecad import (
     compute_peer_diagnostics,
     contiguous_policy_spans,
     credit_values_by_segment,
+    summarize_absolute_credit,
     validate_segment_partition,
     write_json,
     write_jsonl,
@@ -820,7 +821,12 @@ class RayPPOTrainer(object):
         token_level_scores = batch.batch['token_level_scores']
         advantages = torch.zeros_like(token_level_scores, dtype=torch.float32)
         acquisition_values = []
+        acquisition_values_by_turn = defaultdict(list)
+        acquisition_token_count_by_turn = defaultdict(int)
+        acquisition_signal_mass_by_turn = defaultdict(float)
         utilization_values = []
+        utilization_token_count = 0
+        utilization_signal_mass = 0.0
         for row_index, record in enumerate(records):
             values = credit_values_by_segment(record)
             for segment_id, credit in values.items():
@@ -830,8 +836,16 @@ class RayPPOTrainer(object):
                         f'row {row_index} has no policy tokens for CA-ECAD segment {segment_id}'
                     )
                 advantages[row_index][token_mask] = float(credit)
+                token_count = int(token_mask.sum().item())
+                if segment_id <= len(record['turns']):
+                    acquisition_values_by_turn[segment_id].append(float(credit))
+                    acquisition_token_count_by_turn[segment_id] += token_count
+                    acquisition_signal_mass_by_turn[segment_id] += abs(float(credit)) * token_count
+                else:
+                    utilization_values.append(float(credit))
+                    utilization_token_count += token_count
+                    utilization_signal_mass += abs(float(credit)) * token_count
             acquisition_values.extend(turn['acquisition_advantage'] for turn in record['turns'])
-            utilization_values.append(record['utilization_advantage'])
 
         if bool((advantages.masked_select(~policy_mask) != 0).any().item()):
             raise RuntimeError('CA-ECAD attempted to assign credit to environment or padding tokens')
@@ -846,6 +860,8 @@ class RayPPOTrainer(object):
         policy_token_count = int(policy_mask.sum().item())
         nonzero_advantage_token_count = int(((advantages != 0) & policy_mask).sum().item())
         max_conservation_error = float(credit_result['metrics']['ca_ecad/phase2/max_conservation_error'])
+        acquisition_signal_mass = float(sum(acquisition_signal_mass_by_turn.values()))
+        total_signal_mass = acquisition_signal_mass + utilization_signal_mass
         metrics = {
             **peer_metrics,
             'ca_ecad/train/enabled': 1.0,
@@ -862,12 +878,37 @@ class RayPPOTrainer(object):
                 float(sum(value != 0.0 for value in acquisition_values) / len(acquisition_values))
                 if acquisition_values else 0.0
             ),
+            'ca_ecad/train/acquisition_absolute_token_signal_mass': acquisition_signal_mass,
+            'ca_ecad/train/utilization_absolute_token_signal_mass': utilization_signal_mass,
+            'ca_ecad/train/acquisition_signal_mass_share': (
+                acquisition_signal_mass / total_signal_mass if total_signal_mass else 0.0
+            ),
+            'ca_ecad/train/utilization_signal_mass_share': (
+                utilization_signal_mass / total_signal_mass if total_signal_mass else 0.0
+            ),
+            'ca_ecad/train/utilization_policy_token_count': float(utilization_token_count),
+            'ca_ecad/train/utilization_mean_abs_token_advantage': (
+                utilization_signal_mass / utilization_token_count if utilization_token_count else 0.0
+            ),
             'ca_ecad/train/policy_token_count': float(policy_token_count),
             'ca_ecad/train/nonzero_advantage_token_rate': (
                 nonzero_advantage_token_count / policy_token_count if policy_token_count else 0.0
             ),
             'ca_ecad/train/max_conservation_error': max_conservation_error,
         }
+        for suffix, value in summarize_absolute_credit(acquisition_values).items():
+            metrics[f'ca_ecad/train/acquisition_{suffix}'] = value
+        for suffix, value in summarize_absolute_credit(utilization_values).items():
+            metrics[f'ca_ecad/train/utilization_{suffix}'] = value
+        for turn, values in sorted(acquisition_values_by_turn.items()):
+            prefix = f'ca_ecad/train/acquisition/k_{turn}'
+            for suffix, value in summarize_absolute_credit(values).items():
+                metrics[f'{prefix}/{suffix}'] = value
+            token_count = acquisition_token_count_by_turn[turn]
+            signal_mass = acquisition_signal_mass_by_turn[turn]
+            metrics[f'{prefix}/policy_token_count'] = float(token_count)
+            metrics[f'{prefix}/absolute_token_signal_mass'] = signal_mass
+            metrics[f'{prefix}/mean_abs_token_advantage'] = signal_mass / token_count if token_count else 0.0
         if max_conservation_error > 1e-12:
             raise RuntimeError(f'CA-ECAD telescoping conservation failed: {max_conservation_error}')
         return batch, metrics, float(sum(rewards) / len(rewards))
