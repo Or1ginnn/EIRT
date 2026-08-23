@@ -42,8 +42,10 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 from search_r1.llm_agent.ca_ecad import (
+    compute_ca_ecad_credits,
     compute_peer_diagnostics,
     contiguous_policy_spans,
+    credit_values_by_segment,
     validate_segment_partition,
     write_json,
     write_jsonl,
@@ -642,6 +644,247 @@ class RayPPOTrainer(object):
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
+        if bool(self.config.algorithm.ca_ecad.enabled):
+            if not hasattr(self, 'ca_ecad_success_prior'):
+                raise RuntimeError('CA-ECAD Phase 3 checkpoint requested before its success prior was initialized')
+            state_path = os.path.join(
+                self.config.trainer.default_local_dir,
+                'ca_ecad',
+                f'global_step_{self.global_steps}.json',
+            )
+            write_json(state_path, {
+                'version': 1,
+                'global_step': int(self.global_steps),
+                'success_prior': float(self.ca_ecad_success_prior),
+                'hyperparameters': self._ca_ecad_hyperparameters(),
+                'initial_success_prior_source': getattr(self, 'ca_ecad_initial_success_prior_source', None),
+            })
+
+    def _ca_ecad_hyperparameters(self):
+        config = self.config.algorithm.ca_ecad
+        values = {
+            'alpha': float(config.alpha),
+            'eta': float(config.eta),
+            'kappa': float(config.kappa),
+            'success_prior_rho': float(config.success_prior_rho),
+            'mode_balance_gamma': float(config.mode_balance_gamma),
+        }
+        if values['alpha'] <= 0 or values['kappa'] <= 0 or not 0 <= values['eta'] <= 1:
+            raise ValueError('CA-ECAD requires alpha>0, kappa>0, and eta in [0, 1]')
+        if not 0 < values['success_prior_rho'] <= 1:
+            raise ValueError('CA-ECAD requires success_prior_rho in (0, 1]')
+        if values['mode_balance_gamma'] != 0.0:
+            raise ValueError('CA-ECAD V11.1 Phase 3 requires mode_balance_gamma=0')
+        return values
+
+    def _initialize_ca_ecad_phase3(self):
+        """Load the frozen Phase-2 prior or an explicitly saved Phase-3 state."""
+
+        config = self.config.algorithm.ca_ecad
+        initial_path = config.initial_success_prior_path
+        resume_path = config.resume_state_path
+        if initial_path is not None and resume_path is not None:
+            raise ValueError('set exactly one of initial_success_prior_path or resume_state_path')
+        source_path = resume_path or initial_path
+        if source_path is None or not str(source_path).strip():
+            raise ValueError(
+                'CA-ECAD Phase 3 requires algorithm.ca_ecad.initial_success_prior_path '
+                'from a passing Phase-2 analysis, or an explicit resume_state_path'
+            )
+        source_path = os.path.abspath(os.path.expanduser(str(source_path)))
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f'CA-ECAD state source does not exist: {source_path}')
+        with open(source_path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+
+        hyperparameters = self._ca_ecad_hyperparameters()
+        if resume_path is None:
+            if payload.get('ready_for_phase3_implementation') is not True:
+                raise ValueError('initial_success_prior_path must be a passing CA-ECAD Phase-2 analysis')
+            source_hyperparameters = payload.get('hyperparameters', {})
+            required = ('alpha', 'eta', 'kappa')
+        else:
+            if payload.get('version') != 1:
+                raise ValueError('unsupported CA-ECAD Phase-3 state version')
+            source_hyperparameters = payload.get('hyperparameters', {})
+            required = ('alpha', 'eta', 'kappa', 'success_prior_rho', 'mode_balance_gamma')
+
+        for name in required:
+            if name not in source_hyperparameters:
+                raise ValueError(f'CA-ECAD state source is missing hyperparameter {name}')
+            if float(source_hyperparameters[name]) != hyperparameters[name]:
+                raise ValueError(
+                    f'CA-ECAD state hyperparameter mismatch for {name}: '
+                    f'{source_hyperparameters[name]} != {hyperparameters[name]}'
+                )
+
+        success_prior = float(payload.get('success_prior'))
+        if not np.isfinite(success_prior) or not 0.0 <= success_prior <= 1.0:
+            raise ValueError('CA-ECAD success_prior must be finite and lie in [0, 1]')
+        self.ca_ecad_success_prior = success_prior
+        self.ca_ecad_initial_success_prior_source = source_path
+        print(
+            'CA-ECAD Phase-3 success prior initialized: '
+            f'{self.ca_ecad_success_prior:.8f} from {source_path}'
+        )
+
+    def _collect_ca_ecad_training_rows(self, batch: DataProto):
+        """Validate the balanced trace and return the row-aligned credit inputs."""
+
+        required_batch_keys = {
+            'responses',
+            'info_mask',
+            'token_level_scores',
+            'ca_ecad_generation_turn_ids',
+            'ca_ecad_turn_action_codes',
+            'ca_ecad_policy_segment_ids',
+            'ca_ecad_search_count',
+        }
+        missing_batch_keys = sorted(required_batch_keys - set(batch.batch.keys()))
+        if missing_batch_keys:
+            raise RuntimeError(f'CA-ECAD Phase 3 batch is missing tensors: {missing_batch_keys}')
+        required_non_tensor_keys = {'uid', 'ca_ecad_search_document_ids'}
+        missing_non_tensor_keys = sorted(required_non_tensor_keys - set(batch.non_tensor_batch.keys()))
+        if missing_non_tensor_keys:
+            raise RuntimeError(f'CA-ECAD Phase 3 batch is missing row metadata: {missing_non_tensor_keys}')
+
+        response_length = batch.batch['responses'].shape[-1]
+        policy_mask = batch.batch['info_mask'][:, -response_length:].bool()
+        segment_ids = batch.batch['ca_ecad_policy_segment_ids']
+        search_counts = batch.batch['ca_ecad_search_count']
+        sequence_scores = batch.batch['token_level_scores'].sum(dim=-1)
+        row_count = batch.batch['responses'].shape[0]
+        if len(batch.non_tensor_batch['uid']) != row_count or \
+                len(batch.non_tensor_batch['ca_ecad_search_document_ids']) != row_count:
+            raise RuntimeError('CA-ECAD tensors and non-tensor row metadata diverged after balancing')
+
+        group_uids = []
+        rewards = []
+        histories = []
+        for row_index in range(row_count):
+            raw_reward = float(sequence_scores[row_index].detach().cpu().item())
+            rounded_reward = round(raw_reward)
+            if rounded_reward not in (0, 1) or abs(raw_reward - rounded_reward) > 1e-6:
+                raise ValueError(
+                    'CA-ECAD Phase 3 requires Search-R1 v0.1 binary normalized-EM rewards; '
+                    f'row {row_index} received {raw_reward}'
+                )
+            history = batch.non_tensor_batch['ca_ecad_search_document_ids'][row_index]
+            if not isinstance(history, (list, tuple)):
+                raise TypeError(f'row {row_index} search history is not a list')
+            normalized_history = [list(turn) for turn in history]
+            search_count = int(search_counts[row_index].detach().cpu().item())
+            if search_count != len(normalized_history):
+                raise RuntimeError(
+                    f'row {row_index} has search_count={search_count} but {len(normalized_history)} ID turns'
+                )
+
+            row_policy_mask = policy_mask[row_index].detach().cpu().int().tolist()
+            row_segment_ids = segment_ids[row_index].detach().cpu().tolist()
+            validate_segment_partition(row_segment_ids, row_policy_mask, search_count)
+            observed_segments = {
+                int(segment_id)
+                for segment_id, is_policy in zip(row_segment_ids, row_policy_mask)
+                if bool(is_policy) and int(segment_id) > 0
+            }
+            expected_segments = set(range(1, search_count + 2))
+            missing_segments = sorted(expected_segments - observed_segments)
+            if missing_segments:
+                raise RuntimeError(
+                    f'row {row_index} lost CA-ECAD policy segments {missing_segments}; '
+                    'increase max_prompt_length rather than assigning partial credit'
+                )
+            group_uids.append(str(batch.non_tensor_batch['uid'][row_index]))
+            rewards.append(float(rounded_reward))
+            histories.append(normalized_history)
+
+        return group_uids, rewards, histories, segment_ids, policy_mask
+
+    def _apply_ca_ecad_advantages(self, batch: DataProto):
+        """Replace GRPO whitening with frozen CA-ECAD token credits for one batch."""
+
+        if not hasattr(self, 'ca_ecad_success_prior'):
+            raise RuntimeError('CA-ECAD Phase 3 advantages requested before prior initialization')
+        group_uids, rewards, histories, segment_ids, policy_mask = self._collect_ca_ecad_training_rows(batch)
+        hyperparameters = self._ca_ecad_hyperparameters()
+        credit_result = compute_ca_ecad_credits(
+            group_uids=group_uids,
+            rewards=rewards,
+            search_histories=histories,
+            success_prior=self.ca_ecad_success_prior,
+            alpha=hyperparameters['alpha'],
+            eta=hyperparameters['eta'],
+            kappa=hyperparameters['kappa'],
+        )
+        records = credit_result['records']
+        token_level_scores = batch.batch['token_level_scores']
+        advantages = torch.zeros_like(token_level_scores, dtype=torch.float32)
+        acquisition_values = []
+        utilization_values = []
+        for row_index, record in enumerate(records):
+            values = credit_values_by_segment(record)
+            for segment_id, credit in values.items():
+                token_mask = policy_mask[row_index] & (segment_ids[row_index] == segment_id)
+                if not bool(token_mask.any().item()):
+                    raise RuntimeError(
+                        f'row {row_index} has no policy tokens for CA-ECAD segment {segment_id}'
+                    )
+                advantages[row_index][token_mask] = float(credit)
+            acquisition_values.extend(turn['acquisition_advantage'] for turn in record['turns'])
+            utilization_values.append(record['utilization_advantage'])
+
+        if bool((advantages.masked_select(~policy_mask) != 0).any().item()):
+            raise RuntimeError('CA-ECAD attempted to assign credit to environment or padding tokens')
+        batch.batch['advantages'] = advantages
+        batch.batch['returns'] = advantages.clone()
+
+        peer_metrics = {
+            key.replace('ca_ecad/phase2/', 'ca_ecad/train/'): value
+            for key, value in credit_result['metrics'].items()
+            if key.startswith('ca_ecad/phase2/')
+        }
+        policy_token_count = int(policy_mask.sum().item())
+        nonzero_advantage_token_count = int(((advantages != 0) & policy_mask).sum().item())
+        max_conservation_error = float(credit_result['metrics']['ca_ecad/phase2/max_conservation_error'])
+        metrics = {
+            **peer_metrics,
+            'ca_ecad/train/enabled': 1.0,
+            'ca_ecad/train/advantages_replace_grpo_whitening': 1.0,
+            'ca_ecad/train/success_prior_before': float(self.ca_ecad_success_prior),
+            'ca_ecad/train/outcome_reward_mean': float(sum(rewards) / len(rewards)),
+            'ca_ecad/train/acquisition_credit_mean': (
+                float(sum(acquisition_values) / len(acquisition_values)) if acquisition_values else 0.0
+            ),
+            'ca_ecad/train/utilization_credit_mean': (
+                float(sum(utilization_values) / len(utilization_values)) if utilization_values else 0.0
+            ),
+            'ca_ecad/train/acquisition_credit_nonzero_rate': (
+                float(sum(value != 0.0 for value in acquisition_values) / len(acquisition_values))
+                if acquisition_values else 0.0
+            ),
+            'ca_ecad/train/policy_token_count': float(policy_token_count),
+            'ca_ecad/train/nonzero_advantage_token_rate': (
+                nonzero_advantage_token_count / policy_token_count if policy_token_count else 0.0
+            ),
+            'ca_ecad/train/max_conservation_error': max_conservation_error,
+        }
+        if max_conservation_error > 1e-12:
+            raise RuntimeError(f'CA-ECAD telescoping conservation failed: {max_conservation_error}')
+        return batch, metrics, float(sum(rewards) / len(rewards))
+
+    def _update_ca_ecad_success_prior(self, batch_success_mean: float):
+        """EMA-update the prior only after a completed actor optimizer update."""
+
+        if not 0.0 <= batch_success_mean <= 1.0:
+            raise ValueError('CA-ECAD batch success mean must lie in [0, 1]')
+        rho = self._ca_ecad_hyperparameters()['success_prior_rho']
+        before = float(self.ca_ecad_success_prior)
+        self.ca_ecad_success_prior = (1.0 - rho) * before + rho * batch_success_mean
+        return {
+            'ca_ecad/train/success_prior_after': float(self.ca_ecad_success_prior),
+            'ca_ecad/train/success_prior_ema_updated_after_actor': 1.0,
+        }
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -796,7 +1039,10 @@ class RayPPOTrainer(object):
 
         logger = self.logger
         ca_ecad_diagnostics_only = bool(self.config.algorithm.ca_ecad.diagnostics_only)
+        ca_ecad_enabled = bool(self.config.algorithm.ca_ecad.enabled)
         ca_ecad_diagnostics_max_steps = int(self.config.algorithm.ca_ecad.diagnostics_max_steps)
+        if ca_ecad_diagnostics_only and ca_ecad_enabled:
+            raise ValueError('CA-ECAD diagnostics_only and enabled cannot both be true')
         if ca_ecad_diagnostics_only:
             if not self.config.do_search:
                 raise ValueError('CA-ECAD diagnostics require do_search=true')
@@ -806,6 +1052,18 @@ class RayPPOTrainer(object):
                 raise ValueError('algorithm.ca_ecad.diagnostics_max_steps must be positive')
             if self.config.algorithm.ca_ecad.diagnostics_output_dir is None:
                 raise ValueError('algorithm.ca_ecad.diagnostics_output_dir is required')
+        if ca_ecad_enabled:
+            if not self.config.do_search:
+                raise ValueError('CA-ECAD Phase 3 requires do_search=true')
+            if self.use_rm:
+                raise ValueError('CA-ECAD Phase 3 requires a rule-based binary outcome reward, not a learned RM')
+            if self.config.algorithm.adv_estimator != 'grpo':
+                raise ValueError('CA-ECAD Phase 3 replaces only GRPO outcome whitening')
+            if not self.config.actor_rollout_ref.actor.state_masking:
+                raise ValueError('CA-ECAD Phase 3 requires actor.state_masking=true')
+            if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                raise ValueError('CA-ECAD Phase 3 requires actor.use_kl_loss=true')
+            self._initialize_ca_ecad_phase3()
         self.global_steps = 0
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -831,7 +1089,7 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
-            record_ca_ecad_trace=ca_ecad_diagnostics_only,
+            record_ca_ecad_trace=ca_ecad_diagnostics_only or ca_ecad_enabled,
         )
 
         generation_manager = LLMGenerationManager(
@@ -957,12 +1215,18 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
+                        ca_ecad_batch_success_mean = None
                         if not ca_ecad_diagnostics_only:
-                            batch = compute_advantage(batch,
-                                                      adv_estimator=self.config.algorithm.adv_estimator,
-                                                      gamma=self.config.algorithm.gamma,
-                                                      lam=self.config.algorithm.lam,
-                                                      num_repeat=self.config.actor_rollout_ref.rollout.n)
+                            if ca_ecad_enabled:
+                                batch, ca_ecad_metrics, ca_ecad_batch_success_mean = \
+                                    self._apply_ca_ecad_advantages(batch)
+                                metrics.update(ca_ecad_metrics)
+                            else:
+                                batch = compute_advantage(batch,
+                                                          adv_estimator=self.config.algorithm.adv_estimator,
+                                                          gamma=self.config.algorithm.gamma,
+                                                          lam=self.config.algorithm.lam,
+                                                          num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
                     if self.use_critic and not ca_ecad_diagnostics_only:
@@ -981,6 +1245,10 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                        if ca_ecad_enabled:
+                            if ca_ecad_batch_success_mean is None:
+                                raise RuntimeError('CA-ECAD actor update completed without a batch success statistic')
+                            metrics.update(self._update_ca_ecad_success_prior(ca_ecad_batch_success_mean))
 
                     # validate
                     if not ca_ecad_diagnostics_only and self.val_reward_fn is not None and \

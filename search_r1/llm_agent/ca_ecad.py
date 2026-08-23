@@ -1,8 +1,9 @@
-"""Pure-Python CA-ECAD Phase-2 diagnostics and credit construction.
+"""Pure-Python CA-ECAD diagnostics and Phase-3 credit construction.
 
 This module intentionally has no torch/ray dependency.  The online rollout
 path records batch-aligned traces; this module validates and analyzes those
-records without updating model parameters.
+records without updating model parameters, while Phase 3 reuses the same
+validated construction to create token-level policy advantages.
 """
 
 from __future__ import annotations
@@ -243,6 +244,43 @@ def compute_ca_ecad_credits(
     metrics["ca_ecad/phase2/max_conservation_error"] = max(conservation_errors, default=0.0)
     metrics["ca_ecad/phase2/success_prior"] = float(success_prior)
     return {"records": records, "metrics": metrics}
+
+
+def credit_values_by_segment(credit_record: Mapping[str, Any]) -> Dict[int, float]:
+    """Map a validated credit record onto its positive policy segment IDs.
+
+    Segment ``k`` owns the acquisition credit for valid search turn ``k``;
+    the final segment ``K + 1`` owns the utilization credit.  A no-search
+    rollout has only segment ``1``, which receives its outcome-minus-LOO
+    baseline.  Keeping this mapping pure and explicit prevents the online
+    trainer from silently assigning environment-observation tokens credit.
+    """
+
+    turns = credit_record.get("turns", [])
+    if not isinstance(turns, Sequence):
+        raise TypeError("credit record turns must be a sequence")
+
+    values: Dict[int, float] = {}
+    for expected_turn, turn in enumerate(turns, start=1):
+        if not isinstance(turn, Mapping):
+            raise TypeError("credit record turn must be a mapping")
+        valid_search_turn = int(turn.get("valid_search_turn", -1))
+        if valid_search_turn != expected_turn:
+            raise ValueError("credit record search turns must be contiguous and one-indexed")
+        value = float(turn.get("acquisition_advantage"))
+        if not math.isfinite(value):
+            raise ValueError("acquisition advantage must be finite")
+        values[expected_turn] = value
+
+    final_segment = len(turns) + 1
+    if turns:
+        utilization = float(credit_record.get("utilization_advantage"))
+    else:
+        utilization = float(credit_record.get("no_search_advantage"))
+    if not math.isfinite(utilization):
+        raise ValueError("utilization advantage must be finite")
+    values[final_segment] = utilization
+    return values
 
 
 def compute_peer_diagnostics(

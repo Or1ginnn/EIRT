@@ -167,6 +167,10 @@ algorithm:
     diagnostics_max_steps: 1
     diagnostics_output_dir: null
     min_calibration_prompts: 256
+    # Phase 3 replaces group-whitened GRPO advantages with CA-ECAD credits.
+    enabled: false
+    initial_success_prior_path: null
+    resume_state_path: null
     eta: 0.25
     kappa: 1.0
     alpha: 2.0

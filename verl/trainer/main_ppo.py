@@ -149,8 +149,22 @@ def main_task(config):
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
     ca_ecad_diagnostics_only = bool(config.algorithm.ca_ecad.diagnostics_only)
+    ca_ecad_enabled = bool(config.algorithm.ca_ecad.enabled)
+    if ca_ecad_diagnostics_only and ca_ecad_enabled:
+        raise ValueError('CA-ECAD diagnostics_only and enabled cannot both be true')
     if ca_ecad_diagnostics_only and config.reward_model.enable:
         raise ValueError('CA-ECAD Phase 2 requires reward_model.enable=false')
+    if ca_ecad_enabled:
+        if config.reward_model.enable:
+            raise ValueError('CA-ECAD Phase 3 requires reward_model.enable=false')
+        if not config.do_search:
+            raise ValueError('CA-ECAD Phase 3 requires do_search=true')
+        if config.algorithm.adv_estimator != 'grpo':
+            raise ValueError('CA-ECAD Phase 3 replaces only GRPO outcome whitening')
+        if not config.actor_rollout_ref.actor.use_kl_loss:
+            raise ValueError('CA-ECAD Phase 3 requires actor_rollout_ref.actor.use_kl_loss=true')
+        if not config.actor_rollout_ref.actor.state_masking:
+            raise ValueError('CA-ECAD Phase 3 requires actor_rollout_ref.actor.state_masking=true')
 
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),

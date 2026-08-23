@@ -13,6 +13,7 @@ from search_r1.llm_agent.ca_ecad import (
     INVALID_SEGMENT_ID,
     build_policy_segment_ids,
     canonical_document_id,
+    credit_values_by_segment,
     compute_ca_ecad_credits,
     compute_peer_diagnostics,
     contiguous_policy_spans,
@@ -110,6 +111,32 @@ class CreditConstructionTest(unittest.TestCase):
     def test_non_binary_reward_is_rejected(self):
         with self.assertRaises(ValueError):
             compute_ca_ecad_credits(['q'], [0.1], [[]], success_prior=0.5)
+
+    def test_credit_values_follow_token_segment_ownership(self):
+        result = compute_ca_ecad_credits(
+            group_uids=['q', 'q'],
+            rewards=[1.0, 0.0],
+            search_histories=[[['A'], ['B']], [['A'], ['C']]],
+            success_prior=0.4,
+        )
+        record = result['records'][0]
+        values = credit_values_by_segment(record)
+        self.assertEqual(set(values), {1, 2, 3})
+        self.assertAlmostEqual(
+            sum(values.values()),
+            record['reward'] - record['baseline'],
+        )
+
+    def test_no_search_credit_has_only_utilization_segment(self):
+        result = compute_ca_ecad_credits(
+            group_uids=['q', 'q'],
+            rewards=[0.0, 1.0],
+            search_histories=[[], []],
+            success_prior=0.5,
+        )
+        values = credit_values_by_segment(result['records'][0])
+        self.assertEqual(set(values), {1})
+        self.assertAlmostEqual(values[1], result['records'][0]['no_search_advantage'])
 
 
 class PeerDiagnosticsTest(unittest.TestCase):
